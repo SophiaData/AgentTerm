@@ -1,0 +1,46 @@
+{
+  "schema_version": 2,
+  "template_version": "2.0.0",
+  "project_name": "AgentTerm",
+  "project_type": "mixed",
+  "require_checks_when_code_exists": true,
+  "quality_checks": [
+    {
+      "category": "test",
+      "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_template_*.py", "-v"]
+    },
+    {
+      "category": "lint",
+      "argv": ["pnpm", "format:check"]
+    },
+    {
+      "category": "lint",
+      "argv": ["pnpm", "lint"]
+    },
+    {
+      "category": "typecheck",
+      "argv": ["pnpm", "typecheck"]
+    },
+    {
+      "category": "test",
+      "argv": ["pnpm", "test"]
+    },
+    {
+      "category": "lint",
+      "argv": ["cargo", "fmt", "--manifest-path", "src-tauri/Cargo.toml", "--", "--check"]
+    },
+    {
+      "category": "lint",
+      "argv": ["cargo", "clippy", "--manifest-path", "src-tauri/Cargo.toml", "--", "-D", "warnings"]
+    },
+    {
+      "category": "test",
+      "argv": ["cargo", "test", "--manifest-path", "src-tauri/Cargo.toml"]
+    },
+    {
+      "category": "build",
+      "argv": ["pnpm", "build"]
+    }
+  ],
+  "release_mode": "manual"
+}
