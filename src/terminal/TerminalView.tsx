@@ -94,9 +94,48 @@ export default function TerminalView({ session, onExit }: Props) {
       });
       resizeObserver.observe(hostRef.current);
 
+      // Ordering to avoid duplicate/missing output:
+      //  1. Register the exit listener FIRST, so a short-lived process that dies
+      //     before we take the snapshot still reports its final state.
+      //  2. Register the live-output listener, but buffer events instead of
+      //     writing them yet — they may overlap with the snapshot.
+      //  3. Take the snapshot, write it once.
+      //  4. Flush buffered live events that arrived after the snapshot was
+      //     requested, then switch to writing live events directly.
+      // This guarantees old snapshots and new output never double-write and
+      // never leave a gap.
+
+      // Guards against reporting the exit twice (e.g. the exit event arrives and
+      // the snapshot also says the process already ended).
+      let exitReported = false;
+      const reportExit = (id: string, reason: string) => {
+        if (exitReported) {
+          return;
+        }
+        exitReported = true;
+        onExitRef.current(id, reason);
+      };
+
+      unlistenExit = await listen<{ id: string; reason: string }>(
+        `session-exit-${session.id}`,
+        (event) => {
+          terminal.write(
+            `\r\n\x1b[33m[会话结束：${event.payload.reason}]\x1b[0m\r\n`,
+          );
+          reportExit(event.payload.id, event.payload.reason);
+        },
+      );
+
+      let replaying = true;
+      const pendingDuringReplay: string[] = [];
+
       unlistenOutput = await listen<string>(
         `session-output-${session.id}`,
         (event) => {
+          if (replaying) {
+            pendingDuringReplay.push(event.payload);
+            return;
+          }
           terminal.write(event.payload);
         },
       );
@@ -105,25 +144,30 @@ export default function TerminalView({ session, onExit }: Props) {
       // this, the first screen of a full-screen TUI (Claude Code, Codex) is
       // lost and the terminal looks blank even though the process is running.
       try {
-        const snapshot = await invoke<string>("session_snapshot", {
-          sessionId: session.id,
-        });
-        if (snapshot) {
-          terminal.write(snapshot);
+        const snapshot = await invoke<{ data: string; running: boolean }>(
+          "session_snapshot",
+          { sessionId: session.id },
+        );
+        if (snapshot.data) {
+          terminal.write(snapshot.data);
+        }
+        if (!snapshot.running) {
+          // The process already exited before this view appeared; show the final
+          // state instead of a stuck "running" indicator.
+          terminal.write("\r\n\x1b[33m[会话已结束]\x1b[0m\r\n");
+          reportExit(session.id, "进程已结束");
         }
       } catch {
         // The session may have already exited; the exit listener handles that.
+      } finally {
+        // Snapshot is on screen; now drain anything that arrived meanwhile, then
+        // let future events write straight through.
+        replaying = false;
+        for (const chunk of pendingDuringReplay) {
+          terminal.write(chunk);
+        }
+        pendingDuringReplay.length = 0;
       }
-
-      unlistenExit = await listen<{ id: string; reason: string }>(
-        `session-exit-${session.id}`,
-        (event) => {
-          terminal.write(
-            `\r\n\x1b[33m[会话结束：${event.payload.reason}]\x1b[0m\r\n`,
-          );
-          onExitRef.current(event.payload.id, event.payload.reason);
-        },
-      );
 
       if (disposed) {
         unlistenOutput();

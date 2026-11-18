@@ -14,6 +14,10 @@ pub struct Project {
 #[derive(Debug, Default)]
 pub struct ProjectStore {
     pub projects: Vec<Project>,
+    /// Where this store persists. `None` means "use the real user config path".
+    /// An explicit path lets tests isolate themselves completely, so running the
+    /// suite can never touch the developer's real project list.
+    path: Option<PathBuf>,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -25,18 +29,40 @@ fn config_path() -> Option<PathBuf> {
 }
 
 impl ProjectStore {
+    /// Load from the real user config path.
     pub fn load() -> Self {
-        let Some(path) = config_path() else {
-            return Self::default();
+        let mut store = Self {
+            projects: Vec::new(),
+            path: config_path(),
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self::default();
+        store.read_into_memory();
+        store
+    }
+
+    /// A store bound to an explicit file. Used by tests (and anywhere a private
+    /// location is wanted) so it never reads or writes the real user config.
+    #[cfg(test)]
+    pub fn with_path(path: PathBuf) -> Self {
+        let mut store = Self {
+            projects: Vec::new(),
+            path: Some(path),
+        };
+        store.read_into_memory();
+        store
+    }
+
+    fn read_into_memory(&mut self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
         };
         let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return Self::default();
+            return;
         };
 
-        let projects = data
+        self.projects = data
             .get("projects")
             .and_then(|value| value.as_array())
             .map(|items| {
@@ -56,12 +82,15 @@ impl ProjectStore {
                     .collect()
             })
             .unwrap_or_default();
+    }
 
-        Self { projects }
+    #[cfg(test)]
+    pub fn bound_path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let Some(path) = config_path() else {
+        let Some(path) = &self.path else {
             return Err("无法定位配置目录".to_string());
         };
         if let Some(parent) = path.parent() {
@@ -84,7 +113,7 @@ impl ProjectStore {
         // Write to a temp file then rename, so a crash never corrupts the list.
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| format!("无法写入配置：{e}"))?;
-        std::fs::rename(&tmp, &path).map_err(|e| format!("无法保存配置：{e}"))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("无法保存配置：{e}"))?;
         Ok(())
     }
 
@@ -138,6 +167,7 @@ pub fn canonical_project(raw: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::ProjectStore;
+    use std::path::PathBuf;
 
     fn temp_project(label: &str) -> String {
         let dir = std::env::temp_dir().join(format!(
@@ -152,9 +182,22 @@ mod tests {
         dir.to_string_lossy().into_owned()
     }
 
+    /// A store bound to a private temp file, never the real user config.
+    fn isolated_store(label: &str) -> ProjectStore {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-store-cfg-{label}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        ProjectStore::with_path(path)
+    }
+
     #[test]
     fn add_then_reject_duplicate() {
-        let mut store = ProjectStore::default();
+        let mut store = isolated_store("dup");
         let path = temp_project("dup");
         store.add(&path).unwrap();
         assert_eq!(store.projects.len(), 1);
@@ -163,7 +206,7 @@ mod tests {
 
     #[test]
     fn remove_keeps_folder_on_disk() {
-        let mut store = ProjectStore::default();
+        let mut store = isolated_store("keep");
         let path = temp_project("keep");
         store.add(&path).unwrap();
         let removed = store.remove(0).unwrap();
@@ -172,8 +215,44 @@ mod tests {
     }
 
     #[test]
+    fn save_and_reload_round_trips_through_bound_path() {
+        let label = "roundtrip";
+        let path = temp_project("roundtrip");
+        let bound = std::env::temp_dir().join(format!(
+            "agentterm-store-cfg-{label}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        {
+            let mut store = ProjectStore::with_path(bound.clone());
+            store.add(&path).unwrap();
+            store.save().unwrap();
+        }
+        let reloaded = ProjectStore::with_path(bound.clone());
+        assert_eq!(reloaded.projects.len(), 1);
+        assert!(reloaded.bound_path() == Some(bound.as_path()));
+        let _ = std::fs::remove_file(&bound);
+    }
+
+    #[test]
     fn missing_path_is_rejected() {
         let mut store = ProjectStore::default();
         assert!(store.add("/definitely/not/here/xyz").is_err());
+    }
+
+    #[test]
+    fn isolated_store_never_uses_real_config() {
+        // A bound store must point at the temp dir, never the user's real path.
+        let store = isolated_store("guard");
+        let bound = store.bound_path().expect("bound path");
+        assert!(bound.starts_with(std::env::temp_dir()));
+        let real = super::config_path();
+        if let Some(real) = real {
+            assert_ne!(bound, real.as_path());
+        }
+        let _ = PathBuf::from(bound);
     }
 }

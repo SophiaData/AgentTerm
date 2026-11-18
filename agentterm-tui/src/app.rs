@@ -35,7 +35,13 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let store = ProjectStore::load();
+        Self::from_store(ProjectStore::load())
+    }
+
+    /// Build an app around an explicitly provided store. `new` uses it with the
+    /// real store; tests pass a temp-bound store so the suite never touches the
+    /// real config.
+    pub fn from_store(store: ProjectStore) -> Self {
         let tools = tools::detect(&tools::search_dirs());
         let mut app = Self {
             store,
@@ -240,6 +246,7 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::{App, Prompt, Screen};
+    use crate::store::ProjectStore;
     use crossterm::event::KeyCode;
 
     fn temp_dir(label: &str) -> String {
@@ -255,8 +262,21 @@ mod tests {
         dir.to_string_lossy().into_owned()
     }
 
+    /// An app whose store lives in a private temp file, never the real config.
+    fn isolated_app(label: &str) -> App {
+        let cfg = std::env::temp_dir().join(format!(
+            "agentterm-app-cfg-{label}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        App::from_store(ProjectStore::with_path(cfg))
+    }
+
     fn app_with_project() -> App {
-        let mut app = App::new();
+        let mut app = isolated_app("solo");
         app.store.projects.clear();
         app.add_project_path(&temp_dir("solo"));
         app
@@ -264,8 +284,7 @@ mod tests {
 
     #[test]
     fn empty_state_starts_in_add_prompt() {
-        // Build a bare app without touching the user's real saved config.
-        let mut app = App::new();
+        let mut app = isolated_app("empty");
         app.store.projects.clear();
         app.prompt = Prompt::AddProject(String::new());
         assert!(matches!(app.prompt, Prompt::AddProject(_)));
