@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { sliceChunkAfter } from "./offsetStitch";
+import { advance } from "./offsetStitch";
 import type { SessionInfo } from "./types";
 
 type Props = {
@@ -137,11 +137,11 @@ export default function TerminalView({ session, onExit }: Props) {
           pendingBeforeSnapshot.push(payload);
           return;
         }
-        const tail = sliceChunkAfter(payload, writtenOffset);
-        if (tail) {
-          terminal.write(tail);
+        const result = advance(payload, writtenOffset);
+        if (result.text) {
+          terminal.write(result.text);
         }
-        writtenOffset = payload.endOffset;
+        writtenOffset = result.offset;
       };
 
       unlistenOutput = await listen<{ data: string; endOffset: number }>(
