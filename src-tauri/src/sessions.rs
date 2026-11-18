@@ -80,6 +80,11 @@ struct OutputBuffer {
 /// TUI to redraw after a tab switch, without unbounded memory growth.
 const MAX_BUFFER_CHARS: usize = 512 * 1024;
 
+/// Maximum time to wait for the PTY reader to finish after the child exits,
+/// before archiving anyway. Prevents a stuck "running" state when the PTY output
+/// end stays open (e.g. a descendant holds it) — see #12.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 struct PtySession {
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -147,6 +152,32 @@ pub fn spawn_pty(
         writer,
         reader,
     })
+}
+
+/// Wait until the reader signals it finished draining, or `timeout` elapses.
+/// Returns true if the reader finished within the deadline, false on timeout.
+/// Extracted so the timeout path (#12) can be unit-tested with a short deadline.
+fn wait_for_drain(
+    read_done: &(Mutex<bool>, std::sync::Condvar),
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let Ok(mut done) = read_done.0.lock() else {
+        return false;
+    };
+    while !*done {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let step = remaining.min(std::time::Duration::from_millis(500));
+        match read_done.1.wait_timeout(done, step) {
+            Ok((guard, _)) => done = guard,
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 pub struct SessionManager {
@@ -317,17 +348,12 @@ impl SessionManager {
                     // Wait for the reader thread to drain the PTY before
                     // archiving, so the archived snapshot includes the final
                     // output (e.g. an error printed right before exit) — #9.
-                    if let Ok(mut drained) = read_done_watcher.0.lock() {
-                        while !*drained {
-                            match read_done_watcher
-                                .1
-                                .wait_timeout(drained, std::time::Duration::from_millis(500))
-                            {
-                                Ok((guard, _)) => drained = guard,
-                                Err(_) => break,
-                            }
-                        }
-                    }
+                    // But cap the total wait: if the output end stays open (e.g.
+                    // a descendant process still holds the PTY), the reader may
+                    // never hit EOF. Without a deadline the session would hang
+                    // "running" forever (#12). After the deadline we archive what
+                    // we have and release the session anyway.
+                    let _drained = wait_for_drain(&read_done_watcher, DRAIN_TIMEOUT);
                     // Preserve the final buffer before releasing the session so a
                     // late-mounting view can replay it and see the exit state.
                     if let Ok(mut guard) = sessions.lock()
@@ -626,6 +652,36 @@ mod tests {
     fn snapshot_of_unknown_session_errors() {
         let manager = super::SessionManager::default();
         assert!(manager.snapshot("never-existed").is_err());
+    }
+
+    #[test]
+    fn wait_for_drain_returns_fast_when_reader_finishes() {
+        let signal = (std::sync::Mutex::new(true), std::sync::Condvar::new());
+        let start = std::time::Instant::now();
+        assert!(super::wait_for_drain(
+            &signal,
+            std::time::Duration::from_secs(5)
+        ));
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn wait_for_drain_times_out_when_output_stays_open() {
+        // Reader never signals done (output end stays open). The wait must end at
+        // the deadline instead of hanging forever (#12).
+        let signal = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+        let start = std::time::Instant::now();
+        let finished = super::wait_for_drain(&signal, std::time::Duration::from_millis(200));
+        let elapsed = start.elapsed();
+        assert!(!finished, "should report timeout");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "should wait at least the deadline, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "should not hang far past the deadline, got {elapsed:?}"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { byteLength, sliceChunkAfter } from "./offsetStitch";
+import { advance, byteLength, sliceChunkAfter } from "./offsetStitch";
 
 describe("sliceChunkAfter", () => {
   it("drops a chunk entirely inside the snapshot", () => {
@@ -62,5 +62,50 @@ describe("sliceChunkAfter", () => {
     const lateChunk = { data: "abc", endOffset: 3 };
     shown += sliceChunkAfter(lateChunk, written);
     expect(shown).toBe("abc");
+  });
+});
+
+describe("advance (shared offset state update)", () => {
+  // Regression for #11: replaying several already-covered cached events after a
+  // snapshot must not roll the offset back and re-display content.
+  it("does not re-display covered events and keeps offset monotonic (#11)", () => {
+    // Snapshot "abcdef" ends at offset 6.
+    let shown = "abcdef";
+    let offset = 6;
+
+    const steps: {
+      chunk: { data: string; endOffset: number };
+      expectOffset: number;
+    }[] = [
+      { chunk: { data: "abc", endOffset: 3 }, expectOffset: 6 }, // fully covered
+      { chunk: { data: "def", endOffset: 6 }, expectOffset: 6 }, // fully covered
+      { chunk: { data: "ghi", endOffset: 9 }, expectOffset: 9 }, // new
+    ];
+
+    for (const step of steps) {
+      const result = advance(step.chunk, offset);
+      shown += result.text;
+      offset = result.offset;
+      expect(offset).toBe(step.expectOffset);
+    }
+
+    expect(shown).toBe("abcdefghi");
+  });
+
+  it("a late duplicate never appends and never lowers the offset", () => {
+    const offset = 6;
+    const result = advance({ data: "def", endOffset: 6 }, offset);
+    expect(result.text).toBe("");
+    expect(result.offset).toBe(6);
+    // Offset cannot go backwards even if an older event arrives.
+    const older = advance({ data: "abc", endOffset: 3 }, result.offset);
+    expect(older.text).toBe("");
+    expect(older.offset).toBe(6);
+  });
+
+  it("writes a straddling chunk tail and advances to its end offset", () => {
+    const result = advance({ data: "helloworld", endOffset: 10 }, 5);
+    expect(result.text).toBe("world");
+    expect(result.offset).toBe(10);
   });
 });

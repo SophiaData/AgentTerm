@@ -40,3 +40,22 @@ export function sliceChunkAfter(
   const bytes = encoder.encode(chunk.data);
   return new TextDecoder().decode(bytes.subarray(skip));
 }
+
+/**
+ * The one place that decides what to write for a chunk and how far the offset
+ * advances. Both the React view and the tests call this, so the offset can never
+ * be rolled back in one place and not the other.
+ *
+ * Invariant: the returned `offset` is monotonic non-decreasing. A chunk that is
+ * fully covered by what we've already written contributes "" and must NOT pull
+ * the offset backwards (that was bug #11: dropping an old event reassigned the
+ * offset to that event's smaller endOffset and let a later event re-display).
+ */
+export function advance(
+  chunk: OffsetChunk,
+  writtenOffset: number,
+): { text: string; offset: number } {
+  const text = sliceChunkAfter(chunk, writtenOffset);
+  const offset = Math.max(writtenOffset, chunk.endOffset);
+  return { text, offset };
+}
