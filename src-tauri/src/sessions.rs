@@ -42,6 +42,16 @@ pub struct SessionExit {
     pub reason: String,
 }
 
+/// Snapshot of a session's output plus whether it is still running. Lets a view
+/// that mounts after the process exited still show the final screen and know it
+/// is not "running" anymore.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    pub data: String,
+    pub running: bool,
+}
+
 /// Upper bound for replayable scrollback per session. Enough for a full-screen
 /// TUI to redraw after a tab switch, without unbounded memory growth.
 const MAX_BUFFER_CHARS: usize = 512 * 1024;
@@ -116,12 +126,17 @@ pub fn spawn_pty(
 
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+    /// Last output of sessions that have already exited, keyed by session id.
+    /// Kept so a view that mounts *after* the process died can still replay the
+    /// final screen and learn the process is gone (instead of seeing "running").
+    finished: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Default for SessionManager {
     fn default() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            finished: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -196,6 +211,7 @@ impl SessionManager {
         self.lock()?.insert(session_id.to_string(), session);
 
         let sessions = Arc::clone(&self.sessions);
+        let finished_buffers = Arc::clone(&self.finished);
         let output_id = session_id.to_string();
         let exit_id = session_id.to_string();
         let app_output = app.clone();
@@ -251,7 +267,15 @@ impl SessionManager {
 
                 if let Some(status) = finished {
                     let reason = format!("{status}");
-                    let _ = sessions.lock().map(|mut guard| guard.remove(&exit_id));
+                    // Preserve the final buffer before releasing the session so a
+                    // late-mounting view can replay it and see the exit state.
+                    if let Ok(mut guard) = sessions.lock()
+                        && let Some(session) = guard.remove(&exit_id)
+                        && let Ok(buffer) = session.buffer.lock()
+                        && let Ok(mut done) = finished_buffers.lock()
+                    {
+                        done.insert(exit_id.clone(), buffer.clone());
+                    }
                     break reason;
                 }
 
@@ -270,16 +294,34 @@ impl SessionManager {
         Ok(info)
     }
 
-    pub fn snapshot(&self, session_id: &str) -> Result<String, String> {
-        let sessions = self.lock()?;
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| "会话不存在或已结束".to_string())?;
-        session
-            .buffer
+    pub fn snapshot(&self, session_id: &str) -> Result<SessionSnapshot, String> {
+        // Running session: return what we have so far, still running.
+        {
+            let sessions = self.lock()?;
+            if let Some(session) = sessions.get(session_id) {
+                let data = session
+                    .buffer
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .map_err(|_| "无法读取会话输出".to_string())?;
+                return Ok(SessionSnapshot {
+                    data,
+                    running: true,
+                });
+            }
+        }
+        // Already-finished session: replay its final buffer, not running.
+        let finished = self
+            .finished
             .lock()
-            .map(|guard| guard.clone())
-            .map_err(|_| "无法读取会话输出".to_string())
+            .map_err(|_| "无法读取会话状态".to_string())?;
+        match finished.get(session_id) {
+            Some(data) => Ok(SessionSnapshot {
+                data: data.clone(),
+                running: false,
+            }),
+            None => Err("会话不存在或已结束".to_string()),
+        }
     }
 
     pub fn write(&self, session_id: &str, data: &str) -> Result<(), String> {
@@ -312,6 +354,10 @@ impl SessionManager {
 
     pub fn stop(&self, session_id: &str) -> Result<(), String> {
         let session = self.lock()?.remove(session_id);
+        // Drop any finished-buffer leftover for this id so it cannot accumulate.
+        if let Ok(mut done) = self.finished.lock() {
+            done.remove(session_id);
+        }
 
         match session {
             Some(mut session) => {
@@ -359,7 +405,7 @@ pub fn start_session(
 pub fn session_snapshot(
     state: tauri::State<'_, SessionManager>,
     session_id: String,
-) -> Result<String, String> {
+) -> Result<SessionSnapshot, String> {
     state.snapshot(&session_id)
 }
 
@@ -494,5 +540,27 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&first_dir);
         let _ = std::fs::remove_dir_all(&second_dir);
+    }
+
+    #[test]
+    fn snapshot_of_finished_session_reports_not_running() {
+        // A view that mounts after the process died must still get the final
+        // screen and learn the process is gone.
+        let manager = super::SessionManager::default();
+        manager
+            .finished
+            .lock()
+            .unwrap()
+            .insert("gone".to_string(), "final output".to_string());
+
+        let snapshot = manager.snapshot("gone").unwrap();
+        assert_eq!(snapshot.data, "final output");
+        assert!(!snapshot.running);
+    }
+
+    #[test]
+    fn snapshot_of_unknown_session_errors() {
+        let manager = super::SessionManager::default();
+        assert!(manager.snapshot("never-existed").is_err());
     }
 }
