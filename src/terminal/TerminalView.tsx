@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { sliceChunkAfter } from "./offsetStitch";
 import type { SessionInfo } from "./types";
 
 type Props = {
@@ -94,16 +95,14 @@ export default function TerminalView({ session, onExit }: Props) {
       });
       resizeObserver.observe(hostRef.current);
 
-      // Ordering to avoid duplicate/missing output:
-      //  1. Register the exit listener FIRST, so a short-lived process that dies
-      //     before we take the snapshot still reports its final state.
-      //  2. Register the live-output listener, but buffer events instead of
-      //     writing them yet — they may overlap with the snapshot.
-      //  3. Take the snapshot, write it once.
-      //  4. Flush buffered live events that arrived after the snapshot was
-      //     requested, then switch to writing live events directly.
-      // This guarantees old snapshots and new output never double-write and
-      // never leave a gap.
+      // Output stitching via a shared byte offset:
+      //  - The backend tags every live chunk with `endOffset` (bytes emitted so
+      //    far) and the snapshot with the offset of its last byte.
+      //  - We write the snapshot, remember how many bytes it covered, then write
+      //    each live chunk only for the bytes beyond that point. Overlap is
+      //    dropped; anything after the snapshot is written in full and in order.
+      // This replaces the old "buffer then flush" approach, which could not tell
+      // whether a buffered chunk was already inside the snapshot (#8).
 
       // Guards against reporting the exit twice (e.g. the exit event arrives and
       // the snapshot also says the process already ended).
@@ -126,31 +125,49 @@ export default function TerminalView({ session, onExit }: Props) {
         },
       );
 
-      let replaying = true;
-      const pendingDuringReplay: string[] = [];
+      // Bytes already handed to the terminal. Starts at -1 meaning "unknown yet"
+      // (before the snapshot arrives); we only compare offsets after that.
+      let writtenOffset = -1;
+      // Live chunks that arrived before the snapshot, held until we know the
+      // snapshot's end offset so we can trim precisely.
+      const pendingBeforeSnapshot: { data: string; endOffset: number }[] = [];
 
-      unlistenOutput = await listen<string>(
+      const handleChunk = (payload: { data: string; endOffset: number }) => {
+        if (writtenOffset < 0) {
+          pendingBeforeSnapshot.push(payload);
+          return;
+        }
+        const tail = sliceChunkAfter(payload, writtenOffset);
+        if (tail) {
+          terminal.write(tail);
+        }
+        writtenOffset = payload.endOffset;
+      };
+
+      unlistenOutput = await listen<{ data: string; endOffset: number }>(
         `session-output-${session.id}`,
-        (event) => {
-          if (replaying) {
-            pendingDuringReplay.push(event.payload);
-            return;
-          }
-          terminal.write(event.payload);
-        },
+        (event) => handleChunk(event.payload),
       );
 
       // Replay everything the PTY produced before this view mounted. Without
       // this, the first screen of a full-screen TUI (Claude Code, Codex) is
       // lost and the terminal looks blank even though the process is running.
       try {
-        const snapshot = await invoke<{ data: string; running: boolean }>(
-          "session_snapshot",
-          { sessionId: session.id },
-        );
+        const snapshot = await invoke<{
+          data: string;
+          offset: number;
+          running: boolean;
+        }>("session_snapshot", { sessionId: session.id });
         if (snapshot.data) {
           terminal.write(snapshot.data);
         }
+        writtenOffset = snapshot.offset;
+        // Now reconcile chunks that raced in before the snapshot: write only
+        // their bytes beyond the snapshot's end.
+        for (const chunk of pendingBeforeSnapshot) {
+          handleChunk(chunk);
+        }
+        pendingBeforeSnapshot.length = 0;
         if (!snapshot.running) {
           // The process already exited before this view appeared; show the final
           // state instead of a stuck "running" indicator.
@@ -159,14 +176,12 @@ export default function TerminalView({ session, onExit }: Props) {
         }
       } catch {
         // The session may have already exited; the exit listener handles that.
-      } finally {
-        // Snapshot is on screen; now drain anything that arrived meanwhile, then
-        // let future events write straight through.
-        replaying = false;
-        for (const chunk of pendingDuringReplay) {
-          terminal.write(chunk);
+        // Let any buffered chunks through now that we know there is no snapshot.
+        writtenOffset = 0;
+        for (const chunk of pendingBeforeSnapshot) {
+          handleChunk(chunk);
         }
-        pendingDuringReplay.length = 0;
+        pendingBeforeSnapshot.length = 0;
       }
 
       if (disposed) {
