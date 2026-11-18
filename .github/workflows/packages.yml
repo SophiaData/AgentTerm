@@ -1,4 +1,4 @@
-name: Build desktop packages
+name: Build packages
 
 on:
   workflow_dispatch: {}
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  package:
+  desktop:
     strategy:
       fail-fast: false
       matrix:
@@ -37,8 +37,36 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build platform package
+      - name: Build desktop package
         uses: tauri-apps/tauri-action@v1
         with:
           args: ${{ matrix.args }}
           uploadWorkflowArtifacts: true
+
+  tui:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            artifact: agentterm-macos-arm64
+            binary: agentterm
+          - platform: windows-latest
+            artifact: agentterm-windows-x64
+            binary: agentterm.exe
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build tiny TUI binary
+        run: cargo build --release --manifest-path agentterm-tui/Cargo.toml
+
+      - name: Upload TUI binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: agentterm-tui/target/release/${{ matrix.binary }}
+          if-no-files-found: error
