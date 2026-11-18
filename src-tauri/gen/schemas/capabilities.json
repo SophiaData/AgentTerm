@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"AgentTerm main window permissions","local":true,"windows":["main"],"permissions":["dialog:allow-open"]}}

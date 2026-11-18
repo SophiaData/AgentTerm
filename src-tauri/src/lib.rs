@@ -1,3 +1,4 @@
+mod projects;
 mod tools;
 mod tray;
 
@@ -7,7 +8,14 @@ pub const PRODUCT_NAME: &str = "AgentTerm";
 
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![tools::detect_tools])
+        .plugin(tauri_plugin_dialog::init())
+        .manage(projects::ProjectStore::default())
+        .invoke_handler(tauri::generate_handler![
+            tools::detect_tools,
+            projects::list_projects,
+            projects::add_project,
+            projects::remove_project
+        ])
         .setup(|app| {
             tray::install_tray(app)?;
 
