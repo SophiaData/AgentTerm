@@ -87,6 +87,11 @@ const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct PtySession {
     master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Foreground process group of the PTY, captured while the child is alive.
+    /// Used to terminate descendants that keep the PTY open after the child
+    /// exits, so the reader thread can reach EOF and release its handle (#15).
+    #[cfg(unix)]
+    pgid: Option<libc::pid_t>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn std::io::Write + Send>,
     /// Everything the PTY has emitted so far (with its monotonic offset). The
@@ -294,6 +299,30 @@ fn pump_reader(
     }
 }
 
+/// Forcefully terminate the child's whole process group. Used only on the
+/// drain-timeout path, when a descendant still holds the PTY output end and the
+/// reader cannot reach EOF (#15). The child is its own session leader (portable-pty
+/// calls setsid), so a negative pid targets only that terminal's processes.
+#[cfg(unix)]
+fn kill_process_group(pgid: Option<libc::pid_t>) {
+    if let Some(pgid) = pgid
+        && pgid > 1
+    {
+        // Safety: never signal our own process group.
+        let own_pgid = unsafe { libc::getpgrp() };
+        if pgid == own_pgid {
+            return;
+        }
+        // SIGKILL cannot be caught, so descendants cannot keep the PTY open.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: Option<i32>) {}
+
 /// Terminate a child, distinguishing "already exited" from "termination failed".
 /// Extracted so the failure path can be exercised with a fake child (#17).
 fn terminate_child(child: &mut dyn portable_pty::Child) -> Result<(), String> {
@@ -407,8 +436,12 @@ impl SessionManager {
             project_path: project_dir.display().to_string(),
         };
 
+        #[cfg(unix)]
+        let pgid = master.process_group_leader();
         let session = PtySession {
             master,
+            #[cfg(unix)]
+            pgid,
             child,
             writer,
             buffer: Arc::new(Mutex::new(OutputBuffer::default())),
@@ -481,7 +514,20 @@ impl SessionManager {
                     // never hit EOF. Without a deadline the session would hang
                     // "running" forever (#12). After the deadline we archive what
                     // we have and release the session anyway.
-                    let _drained = wait_for_drain(&read_done_watcher, DRAIN_TIMEOUT);
+                    let drained = wait_for_drain(&read_done_watcher, DRAIN_TIMEOUT);
+                    if !drained {
+                        // The output end stayed open past the deadline: kill the
+                        // process group so the reader unblocks and releases its
+                        // PTY handle, instead of leaking it (#15).
+                        #[cfg(unix)]
+                        if let Ok(guard) = sessions.lock()
+                            && let Some(session) = guard.get(&exit_id)
+                        {
+                            let pgid = session.pgid;
+                            drop(guard);
+                            kill_process_group(pgid);
+                        }
+                    }
                     // Mark archived BEFORE releasing the session: the reader
                     // checks this flag and stops emitting, so late output from a
                     // descendant cannot reach a finished session (#15).
@@ -793,6 +839,8 @@ mod tests {
             id.to_string(),
             super::PtySession {
                 master: Box::new(FakeMaster),
+                #[cfg(unix)]
+                pgid: None,
                 child: Box::new(FakeChild {
                     exited: false,
                     kill_fails,
@@ -868,6 +916,59 @@ mod tests {
         };
         assert!(super::terminate_child(&mut child).is_ok());
         assert_eq!(child.kill_calls, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_group_terminates_the_whole_tree() {
+        // #15 mechanism: a session leader with a child in the same process group
+        // (the shape portable-pty creates with setsid). Killing the group must
+        // take down both, so nothing keeps the PTY open after the lead exits.
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30 & wait");
+        // New session: child becomes its own process-group leader.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn session leader");
+        let pgid = child.id() as libc::pid_t;
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Find the grandchild (the `sleep`) and confirm it is alive.
+        let output = std::process::Command::new("pgrep")
+            .args(["-P", &child.id().to_string()])
+            .output()
+            .expect("pgrep");
+        let grandchild = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<libc::pid_t>().ok())
+            .expect("expected a grandchild process");
+        assert_eq!(unsafe { libc::kill(grandchild, 0) }, 0, "grandchild alive");
+
+        super::kill_process_group(Some(pgid));
+
+        // Both the leader and the grandchild must be gone.
+        let status = child.wait().expect("wait leader");
+        assert!(!status.success(), "leader must be killed, not exit cleanly");
+
+        let mut gone = false;
+        for _ in 0..60 {
+            if unsafe { libc::kill(grandchild, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(gone, "process group kill must terminate the grandchild");
     }
 
     #[test]
