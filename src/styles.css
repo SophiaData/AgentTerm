@@ -252,6 +252,16 @@ h2 {
   color: #ff7b72;
 }
 
+.session-close-error {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid #ff7b72;
+  border-radius: 8px;
+  color: #ff7b72;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
 .projects {
   margin-top: 32px;
 }

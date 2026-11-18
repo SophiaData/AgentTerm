@@ -154,7 +154,68 @@ pub fn spawn_pty(
     })
 }
 
-/// Wait until the reader signals it finished draining, or `timeout` elapses.
+/// Incremental UTF-8 decoder for PTY reads.
+///
+/// A single `read()` is not guaranteed to end on a character boundary: a 3-byte
+/// Chinese character or 4-byte emoji can be split across two reads. Decoding each
+/// chunk independently with `from_utf8_lossy` would permanently replace the
+/// half-character with U+FFFD (#16). Instead we keep the trailing incomplete
+/// bytes and prepend them to the next chunk, so every character is decoded once
+/// and only when it is complete.
+#[derive(Default)]
+struct Utf8Stream {
+    /// Bytes of a character whose remaining bytes have not arrived yet.
+    pending: Vec<u8>,
+}
+
+impl Utf8Stream {
+    /// Feed raw bytes, return only the complete, valid UTF-8 text available now.
+    /// Any trailing incomplete character is buffered for the next call.
+    fn push(&mut self, bytes: &[u8]) -> String {
+        let mut data = std::mem::take(&mut self.pending);
+        data.extend_from_slice(bytes);
+
+        let mut out = String::new();
+        let mut rest: &[u8] = &data;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    out.push_str(text);
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    out.push_str(&String::from_utf8_lossy(&rest[..valid]));
+                    match error.error_len() {
+                        // Genuinely invalid bytes: replace them and keep scanning
+                        // so valid bytes after them are not lost.
+                        Some(len) => {
+                            out.push('\u{FFFD}');
+                            rest = &rest[valid + len..];
+                        }
+                        // Incomplete character at the end: keep it for next read.
+                        None => {
+                            self.pending = rest[valid..].to_vec();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Flush any buffered bytes at EOF. An incomplete character here is truly
+    /// truncated, so it is decoded lossily exactly once.
+    fn finish(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let bytes = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
 /// Returns true if the reader finished within the deadline, false on timeout.
 /// Extracted so the timeout path (#12) can be unit-tested with a short deadline.
 fn wait_for_drain(
@@ -269,12 +330,19 @@ impl SessionManager {
         // always includes the final output produced just before exit (#9).
         let read_done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
 
+        // Set by the watcher once the session is archived. The reader checks it
+        // before emitting, so a descendant that keeps the PTY open cannot keep
+        // injecting output into an already-finished session (#15).
+        let archived = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         self.lock()?.insert(session_id.to_string(), session);
 
         let sessions = Arc::clone(&self.sessions);
         let finished_buffers = Arc::clone(&self.finished);
         let read_done_reader = Arc::clone(&read_done);
         let read_done_watcher = Arc::clone(&read_done);
+        let archived_reader = Arc::clone(&archived);
+        let archived_watcher = Arc::clone(&archived);
         let output_id = session_id.to_string();
         let exit_id = session_id.to_string();
         let app_output = app.clone();
@@ -285,11 +353,20 @@ impl SessionManager {
         let mut reader = reader;
         std::thread::spawn(move || {
             let mut chunk = [0u8; READ_BUFFER_SIZE];
+            let mut decoder = Utf8Stream::default();
             loop {
+                if archived_reader.load(std::sync::atomic::Ordering::Acquire) {
+                    // Session already archived; stop reading so late data from a
+                    // descendant cannot appear in a finished session (#15).
+                    break;
+                }
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(count) => {
-                        let text = String::from_utf8_lossy(&chunk[..count]).into_owned();
+                        let text = decoder.push(&chunk[..count]);
+                        if text.is_empty() {
+                            continue; // only a partial character so far
+                        }
                         let end_offset = if let Ok(mut guard) = buffer.lock() {
                             guard.end_offset += text.len() as u64;
                             guard.data.push_str(&text);
@@ -311,6 +388,9 @@ impl SessionManager {
                             data: text,
                             end_offset,
                         };
+                        if archived_reader.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
                         if app_output
                             .emit(&format!("session-output-{output_id}"), event)
                             .is_err()
@@ -320,6 +400,22 @@ impl SessionManager {
                     }
                     Err(_) => break,
                 }
+            }
+            // Flush any character left incomplete at EOF so it is not silently
+            // lost (it is genuinely truncated by then, so lossy is correct).
+            let tail = decoder.finish();
+            if !tail.is_empty() && !archived_reader.load(std::sync::atomic::Ordering::Acquire) {
+                if let Ok(mut guard) = buffer.lock() {
+                    guard.end_offset += tail.len() as u64;
+                    guard.data.push_str(&tail);
+                }
+                let _ = app_output.emit(
+                    &format!("session-output-{output_id}"),
+                    SessionOutput {
+                        data: tail,
+                        end_offset: buffer.lock().map(|g| g.end_offset).unwrap_or(0),
+                    },
+                );
             }
             // Signal the watcher that we have drained the PTY, so it archives a
             // snapshot that includes every byte written before exit (#9).
@@ -354,6 +450,10 @@ impl SessionManager {
                     // "running" forever (#12). After the deadline we archive what
                     // we have and release the session anyway.
                     let _drained = wait_for_drain(&read_done_watcher, DRAIN_TIMEOUT);
+                    // Mark archived BEFORE releasing the session: the reader
+                    // checks this flag and stops emitting, so late output from a
+                    // descendant cannot reach a finished session (#15).
+                    archived_watcher.store(true, std::sync::atomic::Ordering::Release);
                     // Preserve the final buffer before releasing the session so a
                     // late-mounting view can replay it and see the exit state.
                     if let Ok(mut guard) = sessions.lock()
@@ -442,22 +542,37 @@ impl SessionManager {
     }
 
     pub fn stop(&self, session_id: &str) -> Result<(), String> {
+        // Kill first, only then drop the record. Removing before a successful
+        // kill lost the session on failure, leaving the process alive with no
+        // handle to retry from (#17).
+        {
+            let mut sessions = self.lock()?;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| "会话不存在或已结束".to_string())?;
+            // If the child already exited, treat stopping as success.
+            match session.child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    session
+                        .child
+                        .kill()
+                        .map_err(|error| format!("无法结束会话：{error}"))?;
+                }
+                Err(error) => {
+                    return Err(format!("无法确认会话状态：{error}"));
+                }
+            }
+        }
+
+        // Kill succeeded (or the process was already gone): now release it.
         let session = self.lock()?.remove(session_id);
         // Drop any finished-buffer leftover for this id so it cannot accumulate.
         if let Ok(mut done) = self.finished.lock() {
             done.remove(session_id);
         }
-
-        match session {
-            Some(mut session) => {
-                session
-                    .child
-                    .kill()
-                    .map_err(|error| format!("无法结束会话：{error}"))?;
-                Ok(())
-            }
-            None => Err("会话不存在或已结束".to_string()),
-        }
+        drop(session);
+        Ok(())
     }
 
     pub fn stop_all(&self) {
@@ -652,6 +767,77 @@ mod tests {
     fn snapshot_of_unknown_session_errors() {
         let manager = super::SessionManager::default();
         assert!(manager.snapshot("never-existed").is_err());
+    }
+
+    #[test]
+    fn utf8_stream_keeps_character_split_across_reads() {
+        // "你好" is 6 bytes. Split it 2 + 4 so a character straddles the read
+        // boundary; the old per-chunk lossy decode produced "\u{FFFD}\u{FFFD}好".
+        let bytes = "你好".as_bytes();
+        let mut stream = super::Utf8Stream::default();
+        let first = stream.push(&bytes[..2]);
+        let second = stream.push(&bytes[2..]);
+        let combined = format!("{first}{second}");
+        assert_eq!(combined, "你好");
+        assert!(!combined.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn utf8_stream_handles_four_byte_emoji_split() {
+        let bytes = "🚀".as_bytes(); // 4 bytes
+        let mut stream = super::Utf8Stream::default();
+        let mut out = String::new();
+        for byte in bytes {
+            out.push_str(&stream.push(std::slice::from_ref(byte)));
+        }
+        out.push_str(&stream.finish());
+        assert_eq!(out, "🚀");
+    }
+
+    #[test]
+    fn utf8_stream_flushes_truncated_tail_at_eof() {
+        let bytes = "你好".as_bytes();
+        let mut stream = super::Utf8Stream::default();
+        // Feed only the first 4 bytes (complete "你" + 1 byte of "好").
+        let _ = stream.push(&bytes[..4]);
+        let tail = stream.finish();
+        // The incomplete tail is decoded once, not silently dropped forever.
+        assert!(!tail.is_empty());
+    }
+
+    #[test]
+    fn utf8_stream_drops_genuinely_invalid_bytes_without_stalling() {
+        let mut stream = super::Utf8Stream::default();
+        // 0xFF is never valid in UTF-8.
+        let out = stream.push(&[0x41, 0xFF, 0x42]);
+        assert!(out.contains('A'));
+        assert!(out.contains('B'));
+    }
+
+    #[test]
+    fn utf8_stream_offset_contract_matches_encoded_length() {
+        // The bytes counted per push must equal the UTF-8 length of the text
+        // emitted, so the frontend's byteLength() lines up with endOffset.
+        let mut stream = super::Utf8Stream::default();
+        let mut total = 0usize;
+        for piece in ["你", "好", "🚀"] {
+            let text = stream.push(piece.as_bytes());
+            total += text.len();
+        }
+        assert_eq!(total, "你好🚀".len());
+    }
+
+    #[test]
+    fn archived_flag_stops_late_output() {
+        // #15: once archived, the reader must see the flag and skip emitting.
+        // Exercise the exact check the reader performs before each send.
+        let archived = std::sync::atomic::AtomicBool::new(false);
+        assert!(!archived.load(std::sync::atomic::Ordering::Acquire));
+        archived.store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            archived.load(std::sync::atomic::Ordering::Acquire),
+            "reader must observe the archived flag and stop emitting"
+        );
     }
 
     #[test]

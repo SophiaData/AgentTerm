@@ -18,6 +18,7 @@ export function useLauncher() {
   const [session, setSession] = useState<ActiveSession | null>(null);
   const [busy, setBusy] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [closeError, setCloseError] = useState<string | null>(null);
 
   const start = useCallback(async (project: Project, tool: ToolStatus) => {
     setBusy(true);
@@ -55,19 +56,30 @@ export function useLauncher() {
     }
 
     setBusy(true);
+    setCloseError(null);
     try {
       if (session.running) {
         const { invoke } = await import("@tauri-apps/api/core");
         await invoke("stop_session", { sessionId: session.info.id });
       }
-    } catch {
-      // The session may already have exited on its own; closing the view is
-      // still the correct outcome either way.
-    } finally {
+      // Only leave the view once the backend actually released the session.
       setSession(null);
+    } catch (error) {
+      // Keep the session open so the user can see the failure and retry, rather
+      // than silently dropping a session whose process may still be running (#17).
+      setCloseError(`无法关闭会话：${errorMessage(error)}。请重试。`);
+    } finally {
       setBusy(false);
     }
   }, [session]);
 
-  return { session, busy, startError, start, close, handleExit };
+  return {
+    session,
+    busy,
+    startError,
+    closeError,
+    start,
+    close,
+    handleExit,
+  };
 }

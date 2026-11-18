@@ -6,6 +6,7 @@ type Props = {
   running: boolean;
   exitReason: string | null;
   busy: boolean;
+  closeError?: string | null;
   onClose: () => void;
   onExit: (id: string, reason: string) => void;
 };
@@ -15,6 +16,7 @@ export default function SessionPanel({
   running,
   exitReason,
   busy,
+  closeError,
   onClose,
   onExit,
 }: Props) {
@@ -40,6 +42,11 @@ export default function SessionPanel({
           关闭会话
         </button>
       </div>
+      {closeError ? (
+        <p className="session-close-error" role="alert">
+          {closeError}
+        </p>
+      ) : null}
       <TerminalView session={session} onExit={onExit} />
     </section>
   );

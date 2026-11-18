@@ -26,6 +26,7 @@ export default function App() {
           running={launcher.session.running}
           exitReason={launcher.session.exitReason}
           busy={launcher.busy}
+          closeError={launcher.closeError}
           onClose={launcher.close}
           onExit={launcher.handleExit}
         />
