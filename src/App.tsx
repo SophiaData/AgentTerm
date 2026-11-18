@@ -14,8 +14,9 @@ export default function App() {
         <p className="eyebrow">PROJECT FOUNDATION</p>
         <h1 id="foundation-title">一个入口，管理你的 AI 终端。</h1>
         <p className="description">
-          工程底座已就绪。下一步将加入菜单栏与托盘入口，再接入 Claude
-          Code、Codex 和 Agy。
+          菜单栏与托盘入口已就绪。关闭窗口只会收起
+          AgentTerm；需要完全退出时，请使用托盘菜单中的「退出
+          AgentTerm」。下一步将接入 Claude Code、Codex 和 Agy。
         </p>
         <div className="target-list" aria-label="支持的平台">
           {SUPPORTED_TARGETS.map((target) => (

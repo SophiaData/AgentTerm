@@ -8,7 +8,7 @@ describe("AgentTerm application shell", () => {
     const html = renderToStaticMarkup(<App />);
 
     expect(html).toContain(PRODUCT_NAME);
-    expect(html).toContain("工程底座已就绪");
+    expect(html).toContain("菜单栏与托盘入口已就绪");
   });
 
   it("declares exactly the macOS arm64 and Windows x64 targets", () => {
