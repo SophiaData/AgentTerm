@@ -1,4 +1,5 @@
 mod projects;
+mod sessions;
 mod tools;
 mod tray;
 
@@ -10,11 +11,16 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(projects::ProjectStore::default())
+        .manage(sessions::SessionManager::default())
         .invoke_handler(tauri::generate_handler![
             tools::detect_tools,
             projects::list_projects,
             projects::add_project,
-            projects::remove_project
+            projects::remove_project,
+            sessions::start_session,
+            sessions::write_session_input,
+            sessions::resize_session,
+            sessions::stop_session
         ])
         .setup(|app| {
             tray::install_tray(app)?;
@@ -34,8 +40,13 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("AgentTerm should start");
+        .build(tauri::generate_context!())
+        .expect("AgentTerm should build")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                app.state::<sessions::SessionManager>().stop_all();
+            }
+        });
 }
 
 #[cfg(test)]

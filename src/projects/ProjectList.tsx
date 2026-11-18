@@ -1,26 +1,39 @@
+import { useState } from "react";
 import type { Project } from "./types";
+import type { ToolStatus } from "../tools/types";
 
 type Props = {
   projects: Project[];
+  tools: ToolStatus[];
   busy: boolean;
   error: string | null;
+  startError: string | null;
   pendingRemoval: Project | null;
   onAdd: () => void;
   onRequestRemove: (id: string) => void;
   onCancelRemove: () => void;
   onConfirmRemove: () => void;
+  onStart: (project: Project, tool: ToolStatus) => void;
 };
 
 export default function ProjectList({
   projects,
+  tools,
   busy,
   error,
+  startError,
   pendingRemoval,
   onAdd,
   onRequestRemove,
   onCancelRemove,
   onConfirmRemove,
+  onStart,
 }: Props) {
+  const [launcherFor, setLauncherFor] = useState<string | null>(null);
+  const installedTools = tools.filter(
+    (tool) => tool.state.kind === "installed",
+  );
+
   return (
     <section className="projects" aria-labelledby="projects-title">
       <div className="tools-header">
@@ -38,6 +51,11 @@ export default function ProjectList({
       {error ? (
         <p className="tools-error" role="alert">
           {error}
+        </p>
+      ) : null}
+      {startError ? (
+        <p className="tools-error" role="alert">
+          {startError}
         </p>
       ) : null}
 
@@ -78,15 +96,60 @@ export default function ProjectList({
                     取消
                   </button>
                 </div>
-              ) : (
-                <button
-                  type="button"
-                  className="ghost-button"
-                  onClick={() => onRequestRemove(project.id)}
-                  disabled={busy}
+              ) : launcherFor === project.id ? (
+                <div
+                  className="project-confirm"
+                  role="group"
+                  aria-label="选择工具"
                 >
-                  移除
-                </button>
+                  {installedTools.length === 0 ? (
+                    <span className="project-confirm-text">
+                      没有已安装的 AI 工具
+                    </span>
+                  ) : (
+                    installedTools.map((tool) => (
+                      <button
+                        type="button"
+                        className="refresh-button"
+                        key={tool.id}
+                        onClick={() => {
+                          setLauncherFor(null);
+                          onStart(project, tool);
+                        }}
+                        disabled={busy}
+                      >
+                        {tool.name}
+                      </button>
+                    ))
+                  )}
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => setLauncherFor(null)}
+                    disabled={busy}
+                  >
+                    取消
+                  </button>
+                </div>
+              ) : (
+                <div className="project-confirm">
+                  <button
+                    type="button"
+                    className="refresh-button"
+                    onClick={() => setLauncherFor(project.id)}
+                    disabled={busy}
+                  >
+                    启动
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => onRequestRemove(project.id)}
+                    disabled={busy}
+                  >
+                    移除
+                  </button>
+                </div>
               )}
             </li>
           ))}
