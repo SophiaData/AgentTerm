@@ -75,10 +75,9 @@ pub fn install_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
                     button_state: MouseButtonState::Up,
                     ..
                 }
-            ) {
-                if let Err(error) = show_main_window(tray.app_handle()) {
-                    eprintln!("Unable to open AgentTerm from tray: {error}");
-                }
+            ) && let Err(error) = show_main_window(tray.app_handle())
+            {
+                eprintln!("Unable to open AgentTerm from tray: {error}");
             }
         })
         .build(app)?;

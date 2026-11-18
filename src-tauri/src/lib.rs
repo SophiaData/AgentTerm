@@ -1,3 +1,4 @@
+mod tools;
 mod tray;
 
 use tauri::{Manager, WindowEvent};
@@ -6,6 +7,7 @@ pub const PRODUCT_NAME: &str = "AgentTerm";
 
 pub fn run() {
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![tools::detect_tools])
         .setup(|app| {
             tray::install_tray(app)?;
 

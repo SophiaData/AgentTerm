@@ -4,16 +4,16 @@
 
 ## 技术栈
 
-| 层       | 选型                                                       | 一句话理由                                                     |
-| -------- | ---------------------------------------------------------- | -------------------------------------------------------------- |
-| 桌面外壳 | Tauri 2（CLI 2.12.5）                                      | 使用系统 WebView，安装包较轻，支持 macOS 菜单栏与 Windows 托盘 |
-| 终端后端 | Rust + portable-pty 0.9.0                                  | 跨平台管理真实 PTY，支持交互输入、输出、缩放和退出             |
-| 前端     | React 19.3.1 + TypeScript 6.0.3 + Vite 8.3.8               | 类型明确、生态成熟，适合项目列表与多标签界面                   |
-| 终端显示 | @xterm/xterm 6.0.0 + @xterm/addon-fit 0.11.0               | 成熟呈现 ANSI 输出并适配窗口尺寸                               |
-| 数据     | 应用数据目录中的 JSON 文件                                 | 只保存项目与设置，无需数据库或云服务                           |
-| 测试     | Vitest 5.1.0 + Rust `cargo test` + Python `unittest`       | 分别覆盖前端、终端后端和模板治理契约                           |
-| 质量     | ESLint 10 + Prettier 3.10.1 + `cargo fmt` + `cargo clippy` | 统一静态检查，减少跨语言回归                                   |
-| 构建发布 | GitHub Actions + `tauri-apps/tauri-action@v1`              | 手动触发/打标签后构建 macOS arm64 与 Windows x64 安装包        |
+| 层       | 选型                                                            | 一句话理由                                                     |
+| -------- | --------------------------------------------------------------- | -------------------------------------------------------------- |
+| 桌面外壳 | Tauri 2（Rust 2.12.6 / CLI 2.12.5 / API 2.12.5，需 Rust ≥1.90） | 使用系统 WebView，安装包较轻，支持 macOS 菜单栏与 Windows 托盘 |
+| 终端后端 | Rust + portable-pty 0.9.0                                       | 跨平台管理真实 PTY，支持交互输入、输出、缩放和退出             |
+| 前端     | React 19.3.1 + TypeScript 6.0.3 + Vite 8.3.8                    | 类型明确、生态成熟，适合项目列表与多标签界面                   |
+| 终端显示 | @xterm/xterm 6.0.0 + @xterm/addon-fit 0.11.0                    | 成熟呈现 ANSI 输出并适配窗口尺寸                               |
+| 数据     | 应用数据目录中的 JSON 文件                                      | 只保存项目与设置，无需数据库或云服务                           |
+| 测试     | Vitest 5.1.0 + Rust `cargo test` + Python `unittest`            | 分别覆盖前端、终端后端和模板治理契约                           |
+| 质量     | ESLint 10 + Prettier 3.10.1 + `cargo fmt` + `cargo clippy`      | 统一静态检查，减少跨语言回归                                   |
+| 构建发布 | GitHub Actions + `tauri-apps/tauri-action@v1`                   | 手动触发/打标签后构建 macOS arm64 与 Windows x64 安装包        |
 
 ## 硬约束（动架构、加依赖前逐条核对）
 
@@ -41,7 +41,8 @@
 | `@xterm/xterm` 6.0.0               | 终端显示               | 专门解决终端转义与交互，避免自研        | #4              |
 | `@xterm/addon-fit` 0.11.0          | 终端尺寸适配           | 保持显示尺寸与 PTY 一致                 | #4              |
 | `portable-pty` 0.9.0               | 启动并管理终端进程     | 同一抽象覆盖 Unix PTY 与 Windows ConPTY | #4              |
-| `serde` / `serde_json`             | 类型化数据与 JSON 读写 | 与 Rust 数据模型直接对应                | #6              |
+| `serde` / `serde_json`             | 类型化数据与 JSON 读写 | 与 Rust 数据模型直接对应                | #2 / #6         |
+| `@tauri-apps/api` 2.12.5           | 前端调用后端命令       | Tauri 官方接口，版本与 CLI 对齐         | #2              |
 
 ## 决策记录（ADR-lite：只记「为什么」，防止日后翻案无据）
 

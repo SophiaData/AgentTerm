@@ -4,11 +4,12 @@ import App from "./App";
 import { isSupportedTarget, PRODUCT_NAME, SUPPORTED_TARGETS } from "./meta";
 
 describe("AgentTerm application shell", () => {
-  it("renders the product foundation screen", () => {
+  it("renders the product shell and starts tool detection", () => {
     const html = renderToStaticMarkup(<App />);
 
     expect(html).toContain(PRODUCT_NAME);
-    expect(html).toContain("菜单栏与托盘入口已就绪");
+    expect(html).toContain("AI 工具");
+    expect(html).toContain("正在检测");
   });
 
   it("declares exactly the macOS arm64 and Windows x64 targets", () => {

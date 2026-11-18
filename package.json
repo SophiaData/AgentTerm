@@ -20,6 +20,7 @@
     "format:check": "prettier --check README.md CLAUDE.md CHANGELOG.md docs src index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json"
   },
   "dependencies": {
+    "@tauri-apps/api": "2.12.5",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
