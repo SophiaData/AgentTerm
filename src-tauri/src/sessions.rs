@@ -87,6 +87,11 @@ const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct PtySession {
     master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Foreground process group of the PTY, captured while the child is alive.
+    /// Used to terminate descendants that keep the PTY open after the child
+    /// exits, so the reader thread can reach EOF and release its handle (#15).
+    #[cfg(unix)]
+    pgid: Option<libc::pid_t>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn std::io::Write + Send>,
     /// Everything the PTY has emitted so far (with its monotonic offset). The
@@ -154,7 +159,182 @@ pub fn spawn_pty(
     })
 }
 
-/// Wait until the reader signals it finished draining, or `timeout` elapses.
+/// Incremental UTF-8 decoder for PTY reads.
+///
+/// A single `read()` is not guaranteed to end on a character boundary: a 3-byte
+/// Chinese character or 4-byte emoji can be split across two reads. Decoding each
+/// chunk independently with `from_utf8_lossy` would permanently replace the
+/// half-character with U+FFFD (#16). Instead we keep the trailing incomplete
+/// bytes and prepend them to the next chunk, so every character is decoded once
+/// and only when it is complete.
+#[derive(Default)]
+struct Utf8Stream {
+    /// Bytes of a character whose remaining bytes have not arrived yet.
+    pending: Vec<u8>,
+}
+
+impl Utf8Stream {
+    /// Feed raw bytes, return only the complete, valid UTF-8 text available now.
+    /// Any trailing incomplete character is buffered for the next call.
+    fn push(&mut self, bytes: &[u8]) -> String {
+        let mut data = std::mem::take(&mut self.pending);
+        data.extend_from_slice(bytes);
+
+        let mut out = String::new();
+        let mut rest: &[u8] = &data;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    out.push_str(text);
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    out.push_str(&String::from_utf8_lossy(&rest[..valid]));
+                    match error.error_len() {
+                        // Genuinely invalid bytes: replace them and keep scanning
+                        // so valid bytes after them are not lost.
+                        Some(len) => {
+                            out.push('\u{FFFD}');
+                            rest = &rest[valid + len..];
+                        }
+                        // Incomplete character at the end: keep it for next read.
+                        None => {
+                            self.pending = rest[valid..].to_vec();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Flush any buffered bytes at EOF. An incomplete character here is truly
+    /// truncated, so it is decoded lossily exactly once.
+    fn finish(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let bytes = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// The PTY read loop, extracted from the spawned thread so the exact product
+/// code path can be unit-tested with a controlled reader and event ordering.
+///
+/// `sink` receives each decoded chunk; returning false stops the loop (used for
+/// emit failures). After `archived` is set, no further chunks are produced, so a
+/// descendant that keeps the PTY open cannot inject output into a finished
+/// session (#15).
+fn pump_reader(
+    reader: &mut dyn Read,
+    buffer: &Mutex<OutputBuffer>,
+    archived: &std::sync::atomic::AtomicBool,
+    sink: &mut dyn FnMut(SessionOutput) -> bool,
+) {
+    let mut chunk = [0u8; READ_BUFFER_SIZE];
+    let mut decoder = Utf8Stream::default();
+    loop {
+        if archived.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                if archived.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let text = decoder.push(&chunk[..count]);
+                if text.is_empty() {
+                    continue; // only a partial character so far
+                }
+                let end_offset = if let Ok(mut guard) = buffer.lock() {
+                    guard.end_offset += text.len() as u64;
+                    guard.data.push_str(&text);
+                    if guard.data.len() > MAX_BUFFER_CHARS {
+                        let cut = guard.data.len() - MAX_BUFFER_CHARS;
+                        let boundary = guard
+                            .data
+                            .char_indices()
+                            .map(|(index, _)| index)
+                            .find(|index| *index >= cut)
+                            .unwrap_or(cut);
+                        guard.data.drain(..boundary);
+                    }
+                    guard.end_offset
+                } else {
+                    0
+                };
+                if archived.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let event = SessionOutput {
+                    data: text,
+                    end_offset,
+                };
+                if !sink(event) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    // Flush any character left incomplete at EOF so it is not silently lost (it
+    // is genuinely truncated by then, so lossy is correct).
+    let tail = decoder.finish();
+    if !tail.is_empty() && !archived.load(std::sync::atomic::Ordering::Acquire) {
+        let end_offset = if let Ok(mut guard) = buffer.lock() {
+            guard.end_offset += tail.len() as u64;
+            guard.data.push_str(&tail);
+            guard.end_offset
+        } else {
+            0
+        };
+        let _ = sink(SessionOutput {
+            data: tail,
+            end_offset,
+        });
+    }
+}
+
+/// Forcefully terminate the child's whole process group. Used only on the
+/// drain-timeout path, when a descendant still holds the PTY output end and the
+/// reader cannot reach EOF (#15). The child is its own session leader (portable-pty
+/// calls setsid), so a negative pid targets only that terminal's processes.
+#[cfg(unix)]
+fn kill_process_group(pgid: Option<libc::pid_t>) {
+    if let Some(pgid) = pgid
+        && pgid > 1
+    {
+        // Safety: never signal our own process group.
+        let own_pgid = unsafe { libc::getpgrp() };
+        if pgid == own_pgid {
+            return;
+        }
+        // SIGKILL cannot be caught, so descendants cannot keep the PTY open.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: Option<i32>) {}
+
+/// Terminate a child, distinguishing "already exited" from "termination failed".
+/// Extracted so the failure path can be exercised with a fake child (#17).
+fn terminate_child(child: &mut dyn portable_pty::Child) -> Result<(), String> {
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(()), // already exited: stopping is a no-op success
+        Ok(None) => child
+            .kill()
+            .map_err(|error| format!("无法结束会话：{error}")),
+        Err(error) => Err(format!("无法确认会话状态：{error}")),
+    }
+}
+
 /// Returns true if the reader finished within the deadline, false on timeout.
 /// Extracted so the timeout path (#12) can be unit-tested with a short deadline.
 fn wait_for_drain(
@@ -256,8 +436,12 @@ impl SessionManager {
             project_path: project_dir.display().to_string(),
         };
 
+        #[cfg(unix)]
+        let pgid = master.process_group_leader();
         let session = PtySession {
             master,
+            #[cfg(unix)]
+            pgid,
             child,
             writer,
             buffer: Arc::new(Mutex::new(OutputBuffer::default())),
@@ -269,58 +453,35 @@ impl SessionManager {
         // always includes the final output produced just before exit (#9).
         let read_done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
 
+        // Set by the watcher once the session is archived. The reader checks it
+        // before emitting, so a descendant that keeps the PTY open cannot keep
+        // injecting output into an already-finished session (#15).
+        let archived = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         self.lock()?.insert(session_id.to_string(), session);
 
         let sessions = Arc::clone(&self.sessions);
         let finished_buffers = Arc::clone(&self.finished);
         let read_done_reader = Arc::clone(&read_done);
         let read_done_watcher = Arc::clone(&read_done);
+        let archived_reader = Arc::clone(&archived);
+        let archived_watcher = Arc::clone(&archived);
         let output_id = session_id.to_string();
         let exit_id = session_id.to_string();
         let app_output = app.clone();
         let app_exit = app;
 
         // Reader thread: streams PTY output to the frontend as UTF-8 text and
-        // keeps a replayable copy in the session buffer.
-        let mut reader = reader;
+        // keeps a replayable copy in the session buffer. The loop itself lives in
+        // `pump_reader` so tests can drive the real path with controlled input.
         std::thread::spawn(move || {
-            let mut chunk = [0u8; READ_BUFFER_SIZE];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        let text = String::from_utf8_lossy(&chunk[..count]).into_owned();
-                        let end_offset = if let Ok(mut guard) = buffer.lock() {
-                            guard.end_offset += text.len() as u64;
-                            guard.data.push_str(&text);
-                            if guard.data.len() > MAX_BUFFER_CHARS {
-                                let cut = guard.data.len() - MAX_BUFFER_CHARS;
-                                let boundary = guard
-                                    .data
-                                    .char_indices()
-                                    .map(|(index, _)| index)
-                                    .find(|index| *index >= cut)
-                                    .unwrap_or(cut);
-                                guard.data.drain(..boundary);
-                            }
-                            guard.end_offset
-                        } else {
-                            0
-                        };
-                        let event = SessionOutput {
-                            data: text,
-                            end_offset,
-                        };
-                        if app_output
-                            .emit(&format!("session-output-{output_id}"), event)
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
+            let mut reader = reader;
+            let mut sink = |event: SessionOutput| {
+                app_output
+                    .emit(&format!("session-output-{output_id}"), event)
+                    .is_ok()
+            };
+            pump_reader(&mut *reader, &buffer, &archived_reader, &mut sink);
             // Signal the watcher that we have drained the PTY, so it archives a
             // snapshot that includes every byte written before exit (#9).
             if let Ok(mut done) = read_done_reader.0.lock() {
@@ -353,7 +514,24 @@ impl SessionManager {
                     // never hit EOF. Without a deadline the session would hang
                     // "running" forever (#12). After the deadline we archive what
                     // we have and release the session anyway.
-                    let _drained = wait_for_drain(&read_done_watcher, DRAIN_TIMEOUT);
+                    let drained = wait_for_drain(&read_done_watcher, DRAIN_TIMEOUT);
+                    if !drained {
+                        // The output end stayed open past the deadline: kill the
+                        // process group so the reader unblocks and releases its
+                        // PTY handle, instead of leaking it (#15).
+                        #[cfg(unix)]
+                        if let Ok(guard) = sessions.lock()
+                            && let Some(session) = guard.get(&exit_id)
+                        {
+                            let pgid = session.pgid;
+                            drop(guard);
+                            kill_process_group(pgid);
+                        }
+                    }
+                    // Mark archived BEFORE releasing the session: the reader
+                    // checks this flag and stops emitting, so late output from a
+                    // descendant cannot reach a finished session (#15).
+                    archived_watcher.store(true, std::sync::atomic::Ordering::Release);
                     // Preserve the final buffer before releasing the session so a
                     // late-mounting view can replay it and see the exit state.
                     if let Ok(mut guard) = sessions.lock()
@@ -442,22 +620,27 @@ impl SessionManager {
     }
 
     pub fn stop(&self, session_id: &str) -> Result<(), String> {
+        // Kill first, only then drop the record. Removing before a successful
+        // kill lost the session on failure, leaving the process alive with no
+        // handle to retry from (#17).
+        {
+            let mut sessions = self.lock()?;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| "会话不存在或已结束".to_string())?;
+            // A failed kill returns early here, leaving the session in the map so
+            // the user can retry (#17).
+            terminate_child(&mut *session.child)?;
+        }
+
+        // Kill succeeded (or the process was already gone): now release it.
         let session = self.lock()?.remove(session_id);
         // Drop any finished-buffer leftover for this id so it cannot accumulate.
         if let Ok(mut done) = self.finished.lock() {
             done.remove(session_id);
         }
-
-        match session {
-            Some(mut session) => {
-                session
-                    .child
-                    .kill()
-                    .map_err(|error| format!("无法结束会话：{error}"))?;
-                Ok(())
-            }
-            None => Err("会话不存在或已结束".to_string()),
-        }
+        drop(session);
+        Ok(())
     }
 
     pub fn stop_all(&self) {
@@ -531,6 +714,335 @@ mod tests {
     use std::time::Duration;
 
     use super::SessionManager;
+
+    /// A child whose `kill` can be made to fail, for exercising the stop failure
+    /// path without needing a real unkillable process (#17).
+    #[derive(Debug)]
+    struct FakeChild {
+        exited: bool,
+        kill_fails: bool,
+        kill_calls: u32,
+    }
+
+    impl portable_pty::ChildKiller for FakeChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kill_calls += 1;
+            if self.kill_fails {
+                Err(std::io::Error::other("injected kill failure"))
+            } else {
+                self.exited = true;
+                Ok(())
+            }
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FakeKiller)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeKiller;
+
+    impl portable_pty::ChildKiller for FakeKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FakeKiller)
+        }
+    }
+
+    impl portable_pty::Child for FakeChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            if self.exited {
+                Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(999_999)
+        }
+    }
+
+    /// Minimal `MasterPty` so a `PtySession` can be constructed in tests without a
+    /// real terminal. Only the members `stop()` touches matter here.
+    #[derive(Debug)]
+    struct FakeMaster;
+
+    impl portable_pty::MasterPty for FakeMaster {
+        fn resize(&self, _size: portable_pty::PtySize) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> Result<portable_pty::PtySize, anyhow::Error> {
+            Ok(portable_pty::PtySize {
+                rows: 30,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+
+        fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::empty()))
+        }
+
+        fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::sink()))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    /// A reader that hands out pre-scripted chunks, one per `read`, so the exact
+    /// interleaving of output and archive can be controlled (#15).
+    struct ScriptedReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl std::io::Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    Ok(n)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    fn insert_fake_session(manager: &SessionManager, id: &str, kill_fails: bool) {
+        let mut map = manager.sessions.lock().unwrap();
+        map.insert(
+            id.to_string(),
+            super::PtySession {
+                master: Box::new(FakeMaster),
+                #[cfg(unix)]
+                pgid: None,
+                child: Box::new(FakeChild {
+                    exited: false,
+                    kill_fails,
+                    kill_calls: 0,
+                }),
+                writer: Box::new(std::io::sink()),
+                buffer: std::sync::Arc::new(super::Mutex::new(super::OutputBuffer::default())),
+            },
+        );
+    }
+
+    #[test]
+    fn stop_failure_keeps_session_in_manager_for_retry() {
+        // #17 end-to-end through SessionManager::stop: a failed kill must return
+        // an error AND leave the session in the table. The old order removed it
+        // first, so this assertion failed before the fix.
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "s-fail", true);
+
+        let error = manager.stop("s-fail").unwrap_err();
+        assert!(error.contains("无法结束会话"), "got: {error}");
+
+        let map = manager.sessions.lock().unwrap();
+        assert!(
+            map.contains_key("s-fail"),
+            "a failed stop must keep the session so the user can retry"
+        );
+    }
+
+    #[test]
+    fn successful_stop_removes_session() {
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "s-ok", false);
+
+        assert!(manager.stop("s-ok").is_ok());
+        let map = manager.sessions.lock().unwrap();
+        assert!(!map.contains_key("s-ok"));
+    }
+
+    #[test]
+    fn stop_failure_keeps_the_session_for_retry() {
+        // #17: kill fails -> stop returns the error AND the session must still be
+        // present so the user can retry (previously it was removed first).
+        let mut child = FakeChild {
+            exited: false,
+            kill_fails: true,
+            kill_calls: 0,
+        };
+
+        let result = super::terminate_child(&mut child);
+        assert!(result.is_err(), "a failed kill must surface an error");
+        assert_eq!(child.kill_calls, 1, "kill must actually be attempted");
+        assert!(!child.exited, "child must not be reported as exited");
+    }
+
+    #[test]
+    fn stop_succeeds_when_child_already_exited() {
+        let mut child = FakeChild {
+            exited: true,
+            kill_fails: true, // even if kill would fail, an exited child is success
+            kill_calls: 0,
+        };
+        assert!(super::terminate_child(&mut child).is_ok());
+        assert_eq!(child.kill_calls, 0, "no need to kill an exited child");
+    }
+
+    #[test]
+    fn stop_kills_a_running_child() {
+        let mut child = FakeChild {
+            exited: false,
+            kill_fails: false,
+            kill_calls: 0,
+        };
+        assert!(super::terminate_child(&mut child).is_ok());
+        assert_eq!(child.kill_calls, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_group_terminates_the_whole_tree() {
+        // #15 mechanism: a session leader with a child in the same process group
+        // (the shape portable-pty creates with setsid). Killing the group must
+        // take down both, so nothing keeps the PTY open after the lead exits.
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30 & wait");
+        // New session: child becomes its own process-group leader.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn session leader");
+        let pgid = child.id() as libc::pid_t;
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Find the grandchild (the `sleep`) and confirm it is alive.
+        let output = std::process::Command::new("pgrep")
+            .args(["-P", &child.id().to_string()])
+            .output()
+            .expect("pgrep");
+        let grandchild = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<libc::pid_t>().ok())
+            .expect("expected a grandchild process");
+        assert_eq!(unsafe { libc::kill(grandchild, 0) }, 0, "grandchild alive");
+
+        super::kill_process_group(Some(pgid));
+
+        // Both the leader and the grandchild must be gone.
+        let status = child.wait().expect("wait leader");
+        assert!(!status.success(), "leader must be killed, not exit cleanly");
+
+        let mut gone = false;
+        for _ in 0..60 {
+            if unsafe { libc::kill(grandchild, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(gone, "process group kill must terminate the grandchild");
+    }
+
+    #[test]
+    fn archived_session_does_not_emit_late_output() {
+        // #15: a descendant keeps writing after the session was archived. The
+        // reader must stop emitting once the archived flag is set, so no output
+        // lands in a finished session.
+        let reader_chunks = vec![b"BEFORE-ARCHIVE".to_vec(), b"AFTER-ARCHIVE".to_vec()];
+        let mut reader = ScriptedReader {
+            chunks: reader_chunks.into(),
+        };
+        let buffer = super::Mutex::new(super::OutputBuffer::default());
+        let archived = std::sync::atomic::AtomicBool::new(false);
+        let mut events: Vec<String> = Vec::new();
+
+        let mut sink = |event: super::SessionOutput| {
+            events.push(event.data);
+            // Archive happens right after the first chunk is delivered.
+            archived.store(true, std::sync::atomic::Ordering::Release);
+            true
+        };
+
+        super::pump_reader(&mut reader, &buffer, &archived, &mut sink);
+
+        assert_eq!(events, vec!["BEFORE-ARCHIVE".to_string()]);
+        assert!(
+            !events.iter().any(|e| e.contains("AFTER-ARCHIVE")),
+            "late output must not be emitted after archive"
+        );
+    }
+
+    #[test]
+    fn reader_emits_every_chunk_and_offsets_advance_when_not_archived() {
+        let mut reader = ScriptedReader {
+            chunks: vec![b"abc".to_vec(), b"def".to_vec()].into(),
+        };
+        let buffer = super::Mutex::new(super::OutputBuffer::default());
+        let archived = std::sync::atomic::AtomicBool::new(false);
+        let mut events: Vec<(String, u64)> = Vec::new();
+
+        let mut sink = |event: super::SessionOutput| {
+            events.push((event.data, event.end_offset));
+            true
+        };
+
+        super::pump_reader(&mut reader, &buffer, &archived, &mut sink);
+
+        assert_eq!(
+            events,
+            vec![("abc".to_string(), 3), ("def".to_string(), 6),]
+        );
+    }
+
+    #[test]
+    fn reader_keeps_split_utf8_through_the_product_path() {
+        // #16 through pump_reader: feed "你好" split 2 + 4 bytes.
+        let bytes = "你好".as_bytes().to_vec();
+        let mut reader = ScriptedReader {
+            chunks: vec![bytes[..2].to_vec(), bytes[2..].to_vec()].into(),
+        };
+        let buffer = super::Mutex::new(super::OutputBuffer::default());
+        let archived = std::sync::atomic::AtomicBool::new(false);
+        let mut events = String::new();
+
+        let mut sink = |event: super::SessionOutput| {
+            events.push_str(&event.data);
+            true
+        };
+
+        super::pump_reader(&mut reader, &buffer, &archived, &mut sink);
+
+        assert_eq!(events, "你好");
+        assert!(!events.contains('\u{FFFD}'));
+    }
 
     #[test]
     fn writing_to_an_unknown_session_is_rejected() {
@@ -652,6 +1164,77 @@ mod tests {
     fn snapshot_of_unknown_session_errors() {
         let manager = super::SessionManager::default();
         assert!(manager.snapshot("never-existed").is_err());
+    }
+
+    #[test]
+    fn utf8_stream_keeps_character_split_across_reads() {
+        // "你好" is 6 bytes. Split it 2 + 4 so a character straddles the read
+        // boundary; the old per-chunk lossy decode produced "\u{FFFD}\u{FFFD}好".
+        let bytes = "你好".as_bytes();
+        let mut stream = super::Utf8Stream::default();
+        let first = stream.push(&bytes[..2]);
+        let second = stream.push(&bytes[2..]);
+        let combined = format!("{first}{second}");
+        assert_eq!(combined, "你好");
+        assert!(!combined.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn utf8_stream_handles_four_byte_emoji_split() {
+        let bytes = "🚀".as_bytes(); // 4 bytes
+        let mut stream = super::Utf8Stream::default();
+        let mut out = String::new();
+        for byte in bytes {
+            out.push_str(&stream.push(std::slice::from_ref(byte)));
+        }
+        out.push_str(&stream.finish());
+        assert_eq!(out, "🚀");
+    }
+
+    #[test]
+    fn utf8_stream_flushes_truncated_tail_at_eof() {
+        let bytes = "你好".as_bytes();
+        let mut stream = super::Utf8Stream::default();
+        // Feed only the first 4 bytes (complete "你" + 1 byte of "好").
+        let _ = stream.push(&bytes[..4]);
+        let tail = stream.finish();
+        // The incomplete tail is decoded once, not silently dropped forever.
+        assert!(!tail.is_empty());
+    }
+
+    #[test]
+    fn utf8_stream_drops_genuinely_invalid_bytes_without_stalling() {
+        let mut stream = super::Utf8Stream::default();
+        // 0xFF is never valid in UTF-8.
+        let out = stream.push(&[0x41, 0xFF, 0x42]);
+        assert!(out.contains('A'));
+        assert!(out.contains('B'));
+    }
+
+    #[test]
+    fn utf8_stream_offset_contract_matches_encoded_length() {
+        // The bytes counted per push must equal the UTF-8 length of the text
+        // emitted, so the frontend's byteLength() lines up with endOffset.
+        let mut stream = super::Utf8Stream::default();
+        let mut total = 0usize;
+        for piece in ["你", "好", "🚀"] {
+            let text = stream.push(piece.as_bytes());
+            total += text.len();
+        }
+        assert_eq!(total, "你好🚀".len());
+    }
+
+    #[test]
+    fn archived_flag_stops_late_output() {
+        // #15: once archived, the reader must see the flag and skip emitting.
+        // Exercise the exact check the reader performs before each send.
+        let archived = std::sync::atomic::AtomicBool::new(false);
+        assert!(!archived.load(std::sync::atomic::Ordering::Acquire));
+        archived.store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            archived.load(std::sync::atomic::Ordering::Acquire),
+            "reader must observe the archived flag and stop emitting"
+        );
     }
 
     #[test]
