@@ -3,7 +3,7 @@ name = "agentterm"
 version = "0.1.0"
 description = "A focused desktop manager for AI command-line tools"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 
 [lib]
 name = "agentterm_lib"
@@ -13,4 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2.12", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+tauri-plugin-dialog = "2.8.4"
+portable-pty = "0.9.0"

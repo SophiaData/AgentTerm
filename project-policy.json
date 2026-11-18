@@ -40,6 +40,22 @@
     {
       "category": "build",
       "argv": ["pnpm", "build"]
+    },
+    {
+      "category": "lint",
+      "argv": ["cargo", "fmt", "--manifest-path", "agentterm-tui/Cargo.toml", "--", "--check"]
+    },
+    {
+      "category": "lint",
+      "argv": ["cargo", "clippy", "--manifest-path", "agentterm-tui/Cargo.toml", "--all-targets", "--", "-D", "warnings"]
+    },
+    {
+      "category": "test",
+      "argv": ["cargo", "test", "--manifest-path", "agentterm-tui/Cargo.toml"]
+    },
+    {
+      "category": "build",
+      "argv": ["cargo", "build", "--release", "--manifest-path", "agentterm-tui/Cargo.toml"]
     }
   ],
   "release_mode": "manual"
