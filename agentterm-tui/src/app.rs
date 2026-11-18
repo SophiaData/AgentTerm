@@ -56,7 +56,10 @@ impl App {
         };
         app.status = app.default_status();
 
-        if app.store.projects.is_empty() {
+        if let Some(error) = app.store.load_error() {
+            app.error = Some(error.to_string());
+            app.status = "项目配置读取失败，原文件未修改".to_string();
+        } else if app.store.projects.is_empty() {
             app.prompt = Prompt::AddProject(String::new());
         }
         app
@@ -84,6 +87,10 @@ impl App {
         use crossterm::event::KeyCode;
 
         self.error = None;
+        if let Some(error) = self.store.load_error() {
+            self.error = Some(error.to_string());
+            return matches!(code, KeyCode::Char('q') | KeyCode::Esc);
+        }
 
         if let Prompt::AddProject(buffer) = &mut self.prompt {
             match code {
@@ -94,8 +101,12 @@ impl App {
                         Ok(()) => {
                             let index = self.store.projects.len().saturating_sub(1);
                             self.project_cursor = index;
-                            let _ = self.store.save();
-                            self.status = "已添加项目".to_string();
+                            match self.store.save() {
+                                Ok(()) => self.status = "已添加项目".to_string(),
+                                Err(error) => {
+                                    self.set_error(format!("项目仅在当前会话中，保存失败：{error}"))
+                                }
+                            }
                         }
                         Err(message) => self.set_error(message),
                     }
@@ -121,7 +132,9 @@ impl App {
                         if self.project_cursor >= self.store.projects.len() {
                             self.project_cursor = self.store.projects.len().saturating_sub(1);
                         }
-                        let _ = self.store.save();
+                        if let Err(error) = self.store.save() {
+                            self.set_error(format!("项目移除未写入配置：{error}"));
+                        }
                     }
                     self.prompt = Prompt::None;
                 }
@@ -225,7 +238,9 @@ impl App {
         let request = launch::plan(binary, &project_path);
 
         self.store.set_last_tool(self.project_cursor, &tool_id);
-        let _ = self.store.save();
+        if let Err(error) = self.store.save() {
+            self.set_error(format!("仍将启动工具，但最近使用记录未保存：{error}"));
+        }
         self.pending_launch = Some(request);
     }
 
@@ -280,6 +295,27 @@ mod tests {
         app.store.projects.clear();
         app.add_project_path(&temp_dir("solo"));
         app
+    }
+
+    #[test]
+    fn damaged_config_is_visible_and_blocked_from_tui_mutation() {
+        let folder = temp_dir("damaged-config");
+        let path = std::path::PathBuf::from(folder).join("projects.json");
+        std::fs::write(&path, "{invalid JSON").unwrap();
+        let mut app = App::from_store(ProjectStore::with_path(path.clone()));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|message| message.contains("损坏"))
+        );
+        assert!(matches!(app.prompt, Prompt::None));
+        app.handle_key(KeyCode::Char('a'));
+        assert!(
+            matches!(app.prompt, Prompt::None),
+            "invalid config must not offer add"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{invalid JSON");
+        assert!(app.handle_key(KeyCode::Char('q')), "user can exit safely");
     }
 
     #[test]

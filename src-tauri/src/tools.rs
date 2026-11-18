@@ -90,23 +90,34 @@ pub fn resolve_binary(binaries: &[&str], dirs: &[PathBuf]) -> ResolveResult {
     }
 }
 
-fn candidate_file_names(binary: &str) -> Vec<String> {
-    let mut names = vec![binary.to_string()];
-
-    if cfg!(windows) {
-        let extensions =
-            env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM;.PS1".to_string());
-        for extension in extensions
-            .split(';')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
+/// Only enumerate suffixes the native Windows launcher can actually start.
+/// In particular, PATHEXT may contain .PS1, but the launcher intentionally
+/// refuses PowerShell scripts. Reporting them as installed would be misleading.
+fn windows_candidate_file_names(binary: &str, extensions: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for extension in extensions.split(';').map(str::trim) {
+        if ![".exe", ".com", ".cmd", ".bat"]
+            .iter()
+            .any(|allowed| extension.eq_ignore_ascii_case(allowed))
         {
-            names.push(format!("{binary}{}", extension.to_ascii_lowercase()));
+            continue;
+        }
+        let lower = extension.to_ascii_lowercase();
+        names.push(format!("{binary}{lower}"));
+        if lower != extension {
             names.push(format!("{binary}{extension}"));
         }
     }
-
     names
+}
+
+fn candidate_file_names(binary: &str) -> Vec<String> {
+    if cfg!(windows) {
+        let extensions = env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string());
+        windows_candidate_file_names(binary, &extensions)
+    } else {
+        vec![binary.to_string()]
+    }
 }
 
 #[cfg(unix)]
@@ -310,7 +321,7 @@ pub fn detect_tools() -> Vec<ToolStatus> {
 mod tests {
     use super::{
         ResolveResult, TOOL_DEFINITIONS, ToolState, detect_all, detect_tool, parse_version,
-        resolve_binary,
+        resolve_binary, windows_candidate_file_names,
     };
     use std::path::PathBuf;
 
@@ -352,6 +363,27 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
             .expect("permissions should be set");
         path
+    }
+
+    #[test]
+    fn windows_detection_only_lists_native_launchable_extensions() {
+        let names = windows_candidate_file_names("claude", ".PS1;.EXE;.CMD;.BAT;.COM;.JS;.VBS");
+        assert_eq!(
+            names,
+            vec![
+                "claude.exe",
+                "claude.EXE",
+                "claude.cmd",
+                "claude.CMD",
+                "claude.bat",
+                "claude.BAT",
+                "claude.com",
+                "claude.COM",
+            ]
+        );
+        assert!(!names.iter().any(|name| name.ends_with(".ps1")));
+        assert!(!names.contains(&"claude".to_string()));
+        assert!(windows_candidate_file_names("claude", ".PS1;.JS").is_empty());
     }
 
     #[test]

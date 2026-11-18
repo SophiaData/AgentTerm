@@ -1,4 +1,8 @@
+mod launcher;
 mod projects;
+// Legacy PTY is intentionally retained for its regression tests and exit
+// cleanup during the native-terminal migration, but is not exposed via IPC.
+#[allow(dead_code)]
 mod sessions;
 mod tools;
 mod tray;
@@ -17,11 +21,7 @@ pub fn run() {
             projects::list_projects,
             projects::add_project,
             projects::remove_project,
-            sessions::start_session,
-            sessions::session_snapshot,
-            sessions::write_session_input,
-            sessions::resize_session,
-            sessions::stop_session
+            launcher::launch_native_tool
         ])
         .setup(|app| {
             tray::install_tray(app)?;
