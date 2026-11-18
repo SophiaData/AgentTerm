@@ -44,7 +44,6 @@ export default function TerminalView({ session, onExit }: Props) {
       const fit = new FitAddon();
       terminal.loadAddon(fit);
       terminal.open(hostRef.current);
-      fit.fit();
 
       terminal.onData((data) => {
         void invoke("write_session_input", {
@@ -53,21 +52,47 @@ export default function TerminalView({ session, onExit }: Props) {
         }).catch(() => {});
       });
 
+      // Only push a size to the PTY once the container has a real layout.
+      // A premature fit() on an unlaid-out element yields absurd row counts
+      // (e.g. 964 rows) and makes full-screen TUIs like Claude Code render blank.
       const proposeResize = () => {
         if (disposed) {
           return;
         }
+        const host = hostRef.current;
+        if (!host || host.clientHeight < 120 || host.clientWidth < 200) {
+          return;
+        }
         fit.fit();
+        const rows = terminal.rows;
+        const cols = terminal.cols;
+        if (!Number.isFinite(rows) || !Number.isFinite(cols)) {
+          return;
+        }
+        if (rows < 4 || rows > 300 || cols < 20 || cols > 500) {
+          return;
+        }
         void invoke("resize_session", {
           sessionId: session.id,
-          rows: terminal.rows,
-          cols: terminal.cols,
+          rows,
+          cols,
         }).catch(() => {});
       };
 
-      resizeObserver = new ResizeObserver(proposeResize);
+      // Wait two animation frames so the flex layout has settled before the
+      // first measurement.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(proposeResize);
+      });
+
+      let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+      resizeObserver = new ResizeObserver(() => {
+        if (resizeTimer) {
+          clearTimeout(resizeTimer);
+        }
+        resizeTimer = setTimeout(proposeResize, 60);
+      });
       resizeObserver.observe(hostRef.current);
-      proposeResize();
 
       unlistenOutput = await listen<string>(
         `session-output-${session.id}`,
@@ -75,6 +100,20 @@ export default function TerminalView({ session, onExit }: Props) {
           terminal.write(event.payload);
         },
       );
+
+      // Replay everything the PTY produced before this view mounted. Without
+      // this, the first screen of a full-screen TUI (Claude Code, Codex) is
+      // lost and the terminal looks blank even though the process is running.
+      try {
+        const snapshot = await invoke<string>("session_snapshot", {
+          sessionId: session.id,
+        });
+        if (snapshot) {
+          terminal.write(snapshot);
+        }
+      } catch {
+        // The session may have already exited; the exit listener handles that.
+      }
 
       unlistenExit = await listen<{ id: string; reason: string }>(
         `session-exit-${session.id}`,
@@ -98,6 +137,9 @@ export default function TerminalView({ session, onExit }: Props) {
         unlistenOutput?.();
         unlistenExit?.();
         resizeObserver?.disconnect();
+        if (resizeTimer) {
+          clearTimeout(resizeTimer);
+        }
         terminal.dispose();
       };
     }

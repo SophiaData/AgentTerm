@@ -18,6 +18,7 @@ pub fn run() {
             projects::add_project,
             projects::remove_project,
             sessions::start_session,
+            sessions::session_snapshot,
             sessions::write_session_input,
             sessions::resize_session,
             sessions::stop_session

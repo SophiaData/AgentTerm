@@ -39,11 +39,12 @@ a {
 
 .app-shell {
   width: min(100%, 880px);
-  min-height: 100vh;
+  height: 100vh;
   margin: 0 auto;
   padding: 32px;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .brand {
@@ -375,7 +376,8 @@ h2 {
 }
 
 .terminal-host {
-  min-height: 420px;
+  height: 100%;
+  min-height: 360px;
   flex: 1;
   overflow: hidden;
   border: 1px solid var(--color-border);

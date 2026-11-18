@@ -10,6 +10,22 @@ use crate::tools::{ResolveResult, TOOL_DEFINITIONS, candidate_search_dirs, resol
 
 const READ_BUFFER_SIZE: usize = 8192;
 
+/// Environment variables that point child tools at an unrelated parent
+/// terminal (multiplexers) or at a server port. Inheriting them makes tools
+/// like Claude Code attach to the wrong pane or try to bind a taken port.
+const ENV_BLOCKLIST: &[&str] = &[
+    "PORT",
+    "ELECTRON_RENDERER_PORT",
+    "ELECTRON_RUN_AS_NODE",
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "WINDOW",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_PANE_ID",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
@@ -26,10 +42,76 @@ pub struct SessionExit {
     pub reason: String,
 }
 
+/// Upper bound for replayable scrollback per session. Enough for a full-screen
+/// TUI to redraw after a tab switch, without unbounded memory growth.
+const MAX_BUFFER_CHARS: usize = 512 * 1024;
+
 struct PtySession {
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn std::io::Write + Send>,
+    /// Everything the PTY has emitted so far. The frontend replays this when a
+    /// terminal view mounts, so output produced before the listener attached
+    /// (e.g. Claude Code's first screen) is never lost.
+    buffer: Arc<Mutex<String>>,
+}
+
+/// A freshly spawned PTY with all handles still separated, so the caller can
+/// decide what happens with the reader (event loop or direct test assertions).
+pub struct SpawnedPty {
+    pub master: Box<dyn portable_pty::MasterPty + Send>,
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub writer: Box<dyn std::io::Write + Send>,
+    pub reader: Box<dyn Read + Send>,
+}
+
+pub fn spawn_pty(
+    binary: &std::path::Path,
+    cwd: &std::path::Path,
+    rows: u16,
+    cols: u16,
+) -> Result<SpawnedPty, String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: rows.max(1),
+            cols: cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| format!("无法创建终端：{error}"))?;
+
+    let mut command = CommandBuilder::new(binary);
+    command.cwd(cwd.as_os_str());
+    for (key, _) in std::env::vars() {
+        if ENV_BLOCKLIST.contains(&key.as_str()) {
+            command.env_remove(&key);
+        }
+    }
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| format!("无法启动终端进程：{error}"))?;
+    drop(pair.slave);
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| format!("无法读取终端输出：{error}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| format!("无法写入终端：{error}"))?;
+
+    Ok(SpawnedPty {
+        master: pair.master,
+        child,
+        writer,
+        reader,
+    })
 }
 
 pub struct SessionManager {
@@ -88,34 +170,13 @@ impl SessionManager {
             }
         }
 
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: rows.max(1),
-                cols: cols.max(1),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|error| format!("无法创建终端：{error}"))?;
-
-        let mut command = CommandBuilder::new(&binary);
-        command.cwd(project_dir.as_os_str());
-        command.env("TERM", "xterm-256color");
-
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| format!("无法启动 {}：{error}", tool.name))?;
-        drop(pair.slave);
-
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| format!("无法读取终端输出：{error}"))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|error| format!("无法写入终端：{error}"))?;
+        let spawned = spawn_pty(&binary, &project_dir, rows, cols)?;
+        let SpawnedPty {
+            master,
+            child,
+            writer,
+            reader,
+        } = spawned;
 
         let info = SessionInfo {
             id: session_id.to_string(),
@@ -125,10 +186,12 @@ impl SessionManager {
         };
 
         let session = PtySession {
-            master: pair.master,
+            master,
             child,
             writer,
+            buffer: Arc::new(Mutex::new(String::new())),
         };
+        let buffer = Arc::clone(&session.buffer);
 
         self.lock()?.insert(session_id.to_string(), session);
 
@@ -138,14 +201,28 @@ impl SessionManager {
         let app_output = app.clone();
         let app_exit = app;
 
-        // Reader thread: streams PTY output to the frontend as UTF-8 text.
+        // Reader thread: streams PTY output to the frontend as UTF-8 text and
+        // keeps a replayable copy in the session buffer.
+        let mut reader = reader;
         std::thread::spawn(move || {
-            let mut buffer = [0u8; READ_BUFFER_SIZE];
+            let mut chunk = [0u8; READ_BUFFER_SIZE];
             loop {
-                match reader.read(&mut buffer) {
+                match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(count) => {
-                        let text = String::from_utf8_lossy(&buffer[..count]).into_owned();
+                        let text = String::from_utf8_lossy(&chunk[..count]).into_owned();
+                        if let Ok(mut guard) = buffer.lock() {
+                            guard.push_str(&text);
+                            if guard.len() > MAX_BUFFER_CHARS {
+                                let cut = guard.len() - MAX_BUFFER_CHARS;
+                                let boundary = guard
+                                    .char_indices()
+                                    .map(|(index, _)| index)
+                                    .find(|index| *index >= cut)
+                                    .unwrap_or(cut);
+                                guard.drain(..boundary);
+                            }
+                        }
                         if app_output
                             .emit(&format!("session-output-{output_id}"), text)
                             .is_err()
@@ -191,6 +268,18 @@ impl SessionManager {
         });
 
         Ok(info)
+    }
+
+    pub fn snapshot(&self, session_id: &str) -> Result<String, String> {
+        let sessions = self.lock()?;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| "会话不存在或已结束".to_string())?;
+        session
+            .buffer
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| "无法读取会话输出".to_string())
     }
 
     pub fn write(&self, session_id: &str, data: &str) -> Result<(), String> {
@@ -267,6 +356,14 @@ pub fn start_session(
 }
 
 #[tauri::command]
+pub fn session_snapshot(
+    state: tauri::State<'_, SessionManager>,
+    session_id: String,
+) -> Result<String, String> {
+    state.snapshot(&session_id)
+}
+
+#[tauri::command]
 pub fn write_session_input(
     state: tauri::State<'_, SessionManager>,
     session_id: String,
@@ -295,6 +392,9 @@ pub fn stop_session(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::time::Duration;
+
     use super::SessionManager;
 
     #[test]
@@ -323,5 +423,76 @@ mod tests {
         let manager = SessionManager::default();
 
         assert_eq!(manager.stop("missing").unwrap_err(), "会话不存在或已结束");
+    }
+
+    #[cfg(unix)]
+    fn read_until(reader: &mut dyn Read, needle: &str, limit: Duration) -> String {
+        let deadline = std::time::Instant::now() + limit;
+        let mut collected = String::new();
+        let mut chunk = [0u8; 512];
+
+        while !collected.contains(needle) && std::time::Instant::now() < deadline {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => collected.push_str(&String::from_utf8_lossy(&chunk[..count])),
+                Err(_) => break,
+            }
+        }
+
+        collected
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn buffer_keeps_output_for_replay() {
+        use super::spawn_pty;
+        use std::io::Write;
+        use std::path::Path;
+
+        let dir = std::env::temp_dir().join("agentterm-buffer-test");
+        std::fs::create_dir_all(&dir).expect("dir should be created");
+
+        let mut pty = spawn_pty(Path::new("/bin/cat"), &dir, 30, 120).unwrap();
+        pty.writer.write_all(b"replay-me\r").unwrap();
+        pty.writer.flush().unwrap();
+
+        let out = read_until(&mut *pty.reader, "replay-me", Duration::from_secs(5));
+        assert!(out.contains("replay-me"), "echoed: {out:?}");
+
+        pty.child.kill().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_concurrent_ptys_stay_independent() {
+        use super::spawn_pty;
+        use std::io::Write;
+        use std::path::Path;
+
+        let first_dir = std::env::temp_dir().join("agentterm-pty-a");
+        let second_dir = std::env::temp_dir().join("agentterm-pty-b");
+        std::fs::create_dir_all(&first_dir).expect("dir a should be created");
+        std::fs::create_dir_all(&second_dir).expect("dir b should be created");
+
+        let mut first = spawn_pty(Path::new("/bin/cat"), &first_dir, 24, 80).unwrap();
+        let mut second = spawn_pty(Path::new("/bin/cat"), &second_dir, 24, 80).unwrap();
+
+        first.writer.write_all(b"alpha\r").unwrap();
+        first.writer.flush().unwrap();
+        second.writer.write_all(b"beta\r").unwrap();
+        second.writer.flush().unwrap();
+
+        let first_out = read_until(&mut first.reader, "alpha", Duration::from_secs(5));
+        let second_out = read_until(&mut second.reader, "beta", Duration::from_secs(5));
+
+        assert!(first_out.contains("alpha"), "first echo: {first_out:?}");
+        assert!(second_out.contains("beta"), "second echo: {second_out:?}");
+
+        first.child.kill().unwrap();
+        second.child.kill().unwrap();
+
+        let _ = std::fs::remove_dir_all(&first_dir);
+        let _ = std::fs::remove_dir_all(&second_dir);
     }
 }
