@@ -4,6 +4,8 @@ Applies to GPT, Claude Code, Codex, DSH and other coding assistants working on t
 
 - Read `docs/architecture.md`, `docs/development.md` and `docs/testing.md` before substantive changes.
 - Follow the project plan and acceptance criteria; inspect source and tests before editing.
+- The lead advances only one main task at a time, including while a delegated step is running. Dispatch, implementation and independent review are sequential for the initial workbench; follow `docs/workflow.md`.
+- The planned workbench has an application-wide single-main-task limit across projects and windows. It is not implemented yet; task ownership, recovery and evidence rules are defined in `docs/architecture.md`.
 - Prefer existing components and public interfaces. Keep changes scoped; avoid speculative refactors.
 - Do not record credentials, tokens, cookies, or local environment secrets in code, logs or PRs.
 - Work on a topic branch/worktree. Preserve unrelated changes.
