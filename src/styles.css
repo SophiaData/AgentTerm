@@ -126,6 +126,157 @@ h1 {
   font-size: 12px;
 }
 
+.app-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 20px;
+  flex-shrink: 0;
+}
+.app-tabs [aria-current="page"] {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+.workbench,
+.launcher-content {
+  min-height: 0;
+  overflow-y: auto;
+  flex: 1;
+  padding: 24px 4px 16px 0;
+}
+.workbench h1 {
+  font-size: clamp(24px, 4vw, 36px);
+  letter-spacing: -0.03em;
+}
+.workbench .eyebrow {
+  margin-bottom: 10px;
+}
+.task-card,
+.task-form {
+  margin-top: 24px;
+  padding: 20px;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  background: var(--color-surface);
+}
+.task-card h3 {
+  margin: 24px 0 12px;
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+.task-id,
+.task-path,
+.task-artifacts small {
+  overflow-wrap: anywhere;
+  color: var(--color-muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+.task-facts {
+  display: grid;
+  grid-template-columns: 80px minmax(0, 1fr);
+  gap: 12px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.task-facts dt,
+.task-assignee,
+.workbench-empty {
+  color: var(--color-muted);
+}
+.task-facts dd {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.task-steps {
+  padding-left: 24px;
+}
+.task-steps li {
+  margin: 16px 0;
+}
+.task-assignee {
+  margin-left: 12px;
+  font-size: 12px;
+}
+.task-attempt {
+  margin: 12px 0;
+  padding: 12px;
+  border-left: 2px solid var(--color-border);
+}
+.task-attempt small {
+  display: block;
+  margin: 8px 0;
+  color: var(--color-muted);
+}
+.task-summary {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.task-form,
+.artifact-form {
+  display: grid;
+  gap: 16px;
+}
+.task-form label,
+.artifact-form label {
+  display: grid;
+  gap: 8px;
+  font-size: 14px;
+}
+.task-form input,
+.task-form select,
+.task-form textarea,
+.artifact-form input {
+  width: 100%;
+  min-height: 40px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font: inherit;
+}
+.task-form textarea {
+  resize: vertical;
+}
+.task-form small,
+.artifact-form small {
+  color: var(--color-muted);
+  line-height: 1.6;
+}
+.task-artifacts {
+  padding: 0;
+  list-style: none;
+}
+.task-artifacts li {
+  display: grid;
+  gap: 8px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+.task-artifacts .badge {
+  margin-left: 10px;
+}
+.task-artifacts button {
+  justify-self: start;
+}
+.artifact-form {
+  margin: 20px 0;
+}
+.artifact-preview pre {
+  max-height: 420px;
+  overflow: auto;
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-background);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .tools {
   margin-top: 32px;
 }

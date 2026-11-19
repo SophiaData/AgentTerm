@@ -55,6 +55,40 @@ Windows batch wrappers (deliberately rejected), task UI, persisted report artifa
 safe recovery/release or production tools. The native API is not exposed to the
 renderer until those runtime permissions are accepted; #10 remains pending acceptance.
 
+## Task workbench and artifacts (feature 11)
+
+Run the repository `pnpm check`. Focused checks are
+`cargo test --manifest-path src-tauri/Cargo.toml task_document`,
+`cargo test --manifest-path src-tauri/Cargo.toml task_commands`,
+`cargo test --manifest-path src-tauri/Cargo.toml task_relay` and
+`pnpm test -- src/taskWorkbench.test.tsx src/App.test.tsx`.
+
+Backend coverage includes persistent plan reopen, immutable metadata, current
+task/owner/version checks, invalid input before occupancy, duplicate/conflicting/
+out-of-order events, checksum/truncation/schema failure, locked journals, existing
+directories only, relative artifact boundaries, symlink rejection, byte/content
+limits, version changes and stale preview refusal. Recorded relay tests persist
+both stages and prove document failure before spawn or before handoff prevents
+the next process. No real AI service, production SQL or project file write is used.
+
+Frontend tests cover distinct main-task/attempt states, goal/owner/scope/version
+display, duplicate/out-of-order event reduction, late snapshot/request rejection,
+recovery-only viewing, missing-plan state, reservation-only cancellation, and
+escaping report/file text. Static React rendering is not desktop interaction.
+Record actual complete test counts and CI commit in the PR.
+
+Manual acceptance after the stacked PRs are merged: open the task workbench, add
+an existing project through the projects tab, explicitly initialize the local
+ledger, reserve one task with an existing output directory, reference a small
+existing SQL/report file and preview it. Change that disposable file externally,
+refresh, and confirm the old version is refused before registering the new one.
+Try another task while occupied; it must not claim a second slot. Cancel only an
+undispatched reservation. No real CLI launch is available yet.
+
+Not verified by unit/CI tests: macOS/Windows live WebView and file picker interaction,
+real CLI permissions and accounts, historical-task browsing, automatic refresh,
+safe recovery/release or tool-side production boundaries.
+
 ## V2 gate
 
 - `TEMPLATE_VERSION` and `project-policy.json.template_version` must agree.

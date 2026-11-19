@@ -1,6 +1,7 @@
 //! Native-only sequential relay. No frontend dispatch command is enabled yet:
 //! real CLI permission profiles and desktop interaction still need acceptance.
 //! Reports are untrusted proposals, never production approval or task completion.
+use crate::task_document::{AttemptEvent, AttemptState, DocumentStore};
 use crate::task_ledger::{Ledger, Phase, Snapshot};
 use crate::task_process::{self, ProcessError, ProcessSpec};
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,7 @@ pub enum RelayError {
     Process(ProcessError),
     UnverifiedReport,
     ReusedSession,
+    Document(String),
 }
 
 #[derive(Debug)]
@@ -174,12 +176,49 @@ pub struct Outcome {
 }
 
 /// Executes at most two fresh processes, sequentially. Nothing is retried or
-/// released. Results remain in memory for the future artifact UI (#11).
+/// released. Use run_recorded when durable workbench progress is required.
 /// Not exposed over IPC: this backend slice does not grant CLI/production access.
 pub fn run(ledger: &Ledger, ticket: &Ticket, plan: &Plan) -> Result<Outcome, RelayError> {
     validate_plan(plan)?;
     let binaries = [plan.worker.resolve()?, plan.reviewer.resolve()?];
     run_with(ledger, ticket, plan, &binaries, task_process::run)
+}
+
+/// Persists bounded progress/reports for the workbench. Native-only: no new
+/// renderer launch command or production permission is introduced.
+pub fn run_recorded(
+    ledger: &Ledger,
+    ticket: &Ticket,
+    plan: &Plan,
+    store: &DocumentStore,
+) -> Result<Outcome, RelayError> {
+    validate_plan(plan)?;
+    let document = store.snapshot().map_err(RelayError::Document)?;
+    let cwd = plan
+        .project_dir
+        .canonicalize()
+        .map_err(|_| RelayError::InvalidPlan)?;
+    if document.plan.task_id != ticket.task_id
+        || document.plan.generation != ticket.generation
+        || document.plan.project_id != cwd.to_string_lossy()
+        || document.plan.goal != plan.goal
+    {
+        return Err(RelayError::InvalidPlan);
+    }
+    let binaries = [plan.worker.resolve()?, plan.reviewer.resolve()?];
+    run_observed(
+        ledger,
+        ticket,
+        plan,
+        &binaries,
+        task_process::run,
+        |event| {
+            store
+                .record(event)
+                .map(|_| ())
+                .map_err(RelayError::Document)
+        },
+    )
 }
 
 fn validate_plan(plan: &Plan) -> Result<(), RelayError> {
@@ -230,7 +269,18 @@ fn run_with(
     ticket: &Ticket,
     plan: &Plan,
     binaries: &[PathBuf; 2],
+    execute: impl FnMut(ProcessSpec, Duration) -> Result<Vec<u8>, ProcessError>,
+) -> Result<Outcome, RelayError> {
+    run_observed(ledger, ticket, plan, binaries, execute, |_| Ok(()))
+}
+
+fn run_observed(
+    ledger: &Ledger,
+    ticket: &Ticket,
+    plan: &Plan,
+    binaries: &[PathBuf; 2],
     mut execute: impl FnMut(ProcessSpec, Duration) -> Result<Vec<u8>, ProcessError>,
+    mut record: impl FnMut(AttemptEvent) -> Result<(), RelayError>,
 ) -> Result<Outcome, RelayError> {
     validate_plan(plan)?;
     let cwd = plan
@@ -265,6 +315,28 @@ fn run_with(
             "{}:{}:{index}",
             ticket.generation, outcome.snapshot.revision
         );
+        let event_sequence = outcome
+            .snapshot
+            .revision
+            .checked_mul(2)
+            .ok_or(RelayError::InvalidPlan)?;
+        let step = if role == Role::Worker {
+            "worker"
+        } else {
+            "reviewer"
+        };
+        let start = AttemptEvent {
+            id: format!("{dispatch}:start"),
+            sequence: event_sequence,
+            attempt_id: dispatch.clone(),
+            step_id: step.into(),
+            state: AttemptState::Running,
+            summary: "已记录执行意图，等待进程结果".into(),
+        };
+        if let Err(error) = record(start) {
+            phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
+            return Err(error);
+        }
         let prompt = prompt(ticket, plan, role, &dispatch, outcome.worker.as_ref());
         let cli = if role == Role::Worker {
             plan.worker
@@ -279,16 +351,48 @@ fn run_with(
             Err(error) => {
                 outcome.snapshot =
                     phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
+                record(AttemptEvent {
+                    id: format!("{dispatch}:result"),
+                    sequence: event_sequence + 1,
+                    attempt_id: dispatch,
+                    step_id: step.into(),
+                    state: AttemptState::Unknown,
+                    summary: format!("结果待核实：{error:?}"),
+                })?;
                 outcome.issue = Some(error);
                 return Ok(outcome);
             }
         };
         if worker_session.as_ref() == Some(&session) {
             outcome.snapshot = phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
+            record(AttemptEvent {
+                id: format!("{dispatch}:result"),
+                sequence: event_sequence + 1,
+                attempt_id: dispatch,
+                step_id: step.into(),
+                state: AttemptState::Unknown,
+                summary: "审查复用了执行会话，不能作为独立验收".into(),
+            })?;
             outcome.issue = Some(RelayError::ReusedSession);
             return Ok(outcome);
         }
         let blocked = report.status == ReportStatus::Blocked;
+        let event = AttemptEvent {
+            id: format!("{dispatch}:result"),
+            sequence: event_sequence + 1,
+            attempt_id: dispatch,
+            step_id: step.into(),
+            state: match report.status {
+                ReportStatus::Blocked => AttemptState::Blocked,
+                ReportStatus::Fail => AttemptState::Failed,
+                _ => AttemptState::Reported,
+            },
+            summary: report.summary.clone(),
+        };
+        if let Err(error) = record(event) {
+            phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
+            return Err(error);
+        }
         match role {
             Role::Worker => {
                 outcome.worker = Some(report);
@@ -727,6 +831,97 @@ fn main() {
         assert_eq!(
             ledger.snapshot().unwrap().active.unwrap().phase,
             Phase::WaitingApproval
+        );
+    }
+    #[test]
+    fn persisted_reports_are_readable_and_storage_failure_blocks_handoff() {
+        let (ledger, ticket, plan, binaries) = fixture();
+        let root = plan.project_dir.canonicalize().unwrap();
+        let store = DocumentStore::at(&root, &ticket.task_id, ticket.generation).unwrap();
+        store
+            .create(crate::task_document::TaskPlan {
+                task_id: ticket.task_id.clone(),
+                generation: ticket.generation,
+                project_id: root.to_string_lossy().into_owned(),
+                goal: plan.goal.clone(),
+                owner: "owner".into(),
+                scope: "local".into(),
+                output_dir: root.to_string_lossy().into_owned(),
+                steps: vec![
+                    crate::task_document::Step {
+                        id: "worker".into(),
+                        title: "worker".into(),
+                        assignee: "worker".into(),
+                    },
+                    crate::task_document::Step {
+                        id: "reviewer".into(),
+                        title: "reviewer".into(),
+                        assignee: "reviewer".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        let outcome = run_observed(
+            &ledger,
+            &ticket,
+            &plan,
+            &binaries,
+            |spec, _| Ok(response(&spec, |_| {})),
+            |event| {
+                store
+                    .record(event)
+                    .map(|_| ())
+                    .map_err(RelayError::Document)
+            },
+        )
+        .unwrap();
+        assert!(outcome.issue.is_none());
+        let saved = store.snapshot().unwrap();
+        assert_eq!(saved.events.len(), 4);
+        assert_eq!(saved.events[3].step_id, "reviewer");
+        assert_eq!(saved.events[3].state, AttemptState::Reported);
+
+        let (ledger, ticket, plan, binaries) = fixture();
+        let mut launches = 0;
+        let result = run_observed(
+            &ledger,
+            &ticket,
+            &plan,
+            &binaries,
+            |spec, _| {
+                launches += 1;
+                Ok(response(&spec, |_| {}))
+            },
+            |event| {
+                if event.state == AttemptState::Reported {
+                    Err(RelayError::Document("disk unavailable".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(RelayError::Document(_))));
+        assert_eq!(launches, 1);
+        assert_eq!(
+            ledger.snapshot().unwrap().active.unwrap().phase,
+            Phase::RecoveryRequired
+        );
+    }
+    #[test]
+    fn progress_write_failure_before_spawn_launches_nothing() {
+        let (ledger, ticket, plan, binaries) = fixture();
+        let result = run_observed(
+            &ledger,
+            &ticket,
+            &plan,
+            &binaries,
+            |_, _| panic!("must not launch"),
+            |_| Err(RelayError::Document("storage failure".into())),
+        );
+        assert!(matches!(result, Err(RelayError::Document(_))));
+        assert_eq!(
+            ledger.snapshot().unwrap().active.unwrap().phase,
+            Phase::RecoveryRequired
         );
     }
     #[test]

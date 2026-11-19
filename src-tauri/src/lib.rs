@@ -1,6 +1,7 @@
 mod projects;
 mod sessions;
 mod task_commands;
+pub mod task_document;
 pub mod task_ledger;
 mod task_process;
 pub mod task_relay;
@@ -30,7 +31,12 @@ pub fn run() {
             task_commands::task_ledger_initialize,
             task_commands::task_ledger_snapshot,
             task_commands::claim_main_task,
-            task_commands::cancel_main_task_reservation
+            task_commands::cancel_main_task_reservation,
+            task_commands::workbench_snapshot,
+            task_commands::create_workbench_task,
+            task_commands::attach_task_plan,
+            task_commands::reference_task_artifact,
+            task_commands::preview_task_artifact
         ])
         .setup(|app| {
             tray::install_tray(app)?;

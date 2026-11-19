@@ -1,4 +1,6 @@
 import { PRODUCT_NAME, SUPPORTED_TARGETS } from "./meta";
+import { useState } from "react";
+import TaskWorkbench from "./TaskWorkbench";
 import ProjectList from "./projects/ProjectList";
 import { useProjects } from "./projects/useProjects";
 import SessionPanel from "./terminal/SessionPanel";
@@ -10,6 +12,7 @@ export default function App() {
   const tools = useTools();
   const projects = useProjects();
   const launcher = useLauncher();
+  const [page, setPage] = useState<"workbench" | "terminal">("workbench");
 
   return (
     <main className="app-shell">
@@ -20,7 +23,29 @@ export default function App() {
         <span>{PRODUCT_NAME}</span>
       </header>
 
-      {launcher.session ? (
+      <nav className="app-tabs" aria-label="工作区">
+        <button
+          className="ghost-button"
+          aria-current={page === "workbench" ? "page" : undefined}
+          onClick={() => setPage("workbench")}
+        >
+          任务工作台
+        </button>
+        <button
+          className="ghost-button"
+          aria-current={page === "terminal" ? "page" : undefined}
+          onClick={() => setPage("terminal")}
+        >
+          项目与独立终端
+        </button>
+      </nav>
+
+      {page === "workbench" ? (
+        <TaskWorkbench
+          projects={projects.projects}
+          onProjects={() => setPage("terminal")}
+        />
+      ) : launcher.session ? (
         <SessionPanel
           session={launcher.session.info}
           running={launcher.session.running}
@@ -31,7 +56,7 @@ export default function App() {
           onExit={launcher.handleExit}
         />
       ) : (
-        <>
+        <div className="launcher-content">
           <section className="status-card" aria-labelledby="foundation-title">
             <p className="eyebrow">MILESTONE 1</p>
             <h1 id="foundation-title">一个入口，管理你的 AI 终端。</h1>
@@ -68,7 +93,7 @@ export default function App() {
             error={tools.error}
             onRefresh={tools.refresh}
           />
-        </>
+        </div>
       )}
 
       <footer className="footer">Tauri 2 · Rust · React</footer>
