@@ -57,7 +57,7 @@
 
 ## 数据工作台运行契约（2026-11-19，首个后端切片）
 
-本节约束工作台实现。现已实现的是 `task_ledger.rs` 的单任务预留账本和 `task_commands.rs` 的四个后端命令；完整编排、任务页面与 CLI 接力仍是后续工作。产品范围以 [PRD](PRD.md) 为准，开发接力纪律见 [workflow](workflow.md)，实施次序与测试清单见 [tasks](tasks.md)。
+本节约束工作台实现。现已实现的是 `task_ledger.rs` 的单任务预留账本和 `task_commands.rs` 的四个后端命令；另有 `task_relay.rs` 与 `task_process.rs` 的原生顺序接力切片；任务页面、真实 CLI 权限验收与恢复释放仍是后续工作。产品范围以 [PRD](PRD.md) 为准，开发接力纪律见 [workflow](workflow.md)，实施次序与测试清单见 [tasks](tasks.md)。
 
 ### 功能 9 当前实现与取舍
 
@@ -69,6 +69,16 @@
 - 四个命令为 `task_ledger_initialize`、`task_ledger_snapshot`、`claim_main_task`、`cancel_main_task_reservation`。取消仅允许同一后端归属、相同代次与版本、尚未记录执行意图的 `reserved` 状态。
 - `set_phase` 仅供后续可信原生调度器调用，不暴露给前端。进入运行、验收、等待、暂停或待核实后不能回到 `reserved`，也不能用取消预留释放。安全停止与完成释放属于后续恢复功能；本轮不提供自述“已停止”的通用释放接口。
 - 当前没有调用 CLI 或线上系统，原有手动终端不经过账本。完整工作台约束只能在后续调度器接入后验收；当前证据证明受管账本操作的单占用，不证明所有终端已经单并发。
+
+### 功能 10 当前后端切片
+
+- 原生 `task_relay::run` 接收已预留账本的任务票据，核对项目真实路径、后端归属、代次、版本与 reserved 状态。以账本版本比较和同步写入记录 running 后才启动；同一票据只能启动一次。工作进程返回并确认停止后，先持久记录 verifying 再开启新的审查进程。
+- 适配 Claude（stdin + JSON）与 Cursor（独立 argv 参数 + JSON）。只解析终态 result/success/is_error=false 和非空 session_id；内部报告须具有固定版本、任务/代次/尝试/角色、允许的状态及有界摘要。普通文本、错误身份、未知字段、重复会话均待核实，退出 0 不代表报告有效。reviewer 的 pass/fail 只是意见，完整产物证据门禁属于 #13。
+- 回报不合规、启动失败、超时、超限、退出异常或残留进程进入 recoveryRequired；worker 明确 blocked 或两阶段完成进入 waitingInput。所有路径保留主任务占用，没有自动重试、取消释放或生产完成操作。重启沿用 #9 的旧归属保护，不能自动重派；结果目前仅在返回值内，持久产物与恢复 UI 属于 #11/#12。
+- 进程输出上限 256 KiB，目标与报告摘要各 8 KiB，stdin 上限 32 KiB，单次执行上限 300 秒，停止与管道回收有界。stderr 丢弃、不写原始日志；stdout 仅内存解析。Unix 使用独立进程组，Windows 使用启动时挂起、先加入禁止逃逸的 Job Object 再恢复线程；退出残留即使清理成功也不接力。Unix 进程主动 setsid 逃逸不是此进程组机制可证明的隔离边界。
+- Windows 仅接受 `.exe`，拒绝 `.cmd/.bat/.ps1` 的 shell 包装；当前本机 Cursor `.cmd` 不满足此限制，不能宣称已经实测可用。Cursor 适配器只查 `cursor-agent`，避免把通用 `agent` 名误识别；不修改既有三工具手动终端注册表。Claude 禁用内置工具及 MCP，Cursor 请求 ask 模式；这些参数不等于已验收的跨工具权限隔离。
+- 因 CLI 的项目 hooks、全局配置、网络与写入能力尚未逐项验收，本切片仅提供原生后端接口和离线协议测试，**没有新增 Tauri 派发命令、UI 按钮或自动运行入口**。不称为受控只读执行能力，不接生产，不运行本机真实账号 CLI，不改全局配置。真实双 CLI、完整入口、进程逃逸、权限隔离与资源基线属于未验项目。
+- JSON 解析直接依赖已在锁文件中的 `serde_json`，用于严格校验报告，避免手写解析器；没有新服务、数据库或运行时。CLI 协议依据官方 CLI reference 与 output-format 文档核对于 2026-11-19，兼容性须以实际安装版本验收。
 
 ### 职责与持久状态
 

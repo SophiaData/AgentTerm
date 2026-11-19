@@ -2,6 +2,8 @@ mod projects;
 mod sessions;
 mod task_commands;
 pub mod task_ledger;
+mod task_process;
+pub mod task_relay;
 mod tools;
 mod tray;
 

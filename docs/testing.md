@@ -26,6 +26,35 @@ This does not verify a task page, CLI dispatch, Teambition integration, safe sto
 
 Stack examples (only use when applicable and installed): Python `python -m pytest -q`, Node `pnpm test`, Java `mvn test`, DBT `dbt test`. SQL engine tests require an appropriate isolated environment.
 
+## Sequential CLI relay (feature 10 backend slice)
+
+Run `cargo test --manifest-path src-tauri/Cargo.toml task_relay` and
+`cargo test --manifest-path src-tauri/Cargo.toml task_process`, followed by `pnpm check`.
+The process layer also supports a standalone Windows test build:
+
+```text
+rustc --edition 2024 --test src-tauri/src/task_process.rs --crate-name task_process -o <existing-directory>/task-process-tests.exe
+<existing-directory>/task-process-tests.exe --test-threads=1
+```
+
+The seven Windows process checks cover actual stdin/output and process termination,
+missing/invalid executables, nonzero exit, timeout, bounded output and a surviving
+descendant. The ignored `process_fixture` is invoked as a real child by these tests.
+Relay tests validate both adapter protocols with a compiled native CLI fixture,
+including actual argument/stdin handling, structured result output, process exit
+and sequential launch. Further tests cover competing dispatches, stale tickets,
+changed ledger revision, wrong project/owner, missing CLIs, all process failure
+classes, report identity/role/status/schema, blocked worker, reused review session
+and a failed review retaining occupancy. Test files use existing OS temp directories;
+no new directory or deletion is needed.
+
+Fixtures do not authenticate or call an AI service. Record full CI and actual test
+counts in the PR. Not verified: real Claude/Cursor accounts and installed versions,
+macOS desktop interaction, CLI-side permission enforcement, escaped Unix processes,
+Windows batch wrappers (deliberately rejected), task UI, persisted report artifacts,
+safe recovery/release or production tools. The native API is not exposed to the
+renderer until those runtime permissions are accepted; #10 remains pending acceptance.
+
 ## V2 gate
 
 - `TEMPLATE_VERSION` and `project-policy.json.template_version` must agree.
