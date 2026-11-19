@@ -116,6 +116,21 @@ pub struct Ledger {
     guard_path: PathBuf,
 }
 
+// Explicit unlock releases the shared open-file-description lock even when a
+// concurrent fork temporarily retains a descriptor before exec/close-on-exec.
+struct OperationGuard(File);
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+struct DataGuard<'a>(&'a mut File);
+impl Drop for DataGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 impl Ledger {
     /// Parent must already exist. This constructor performs no writes.
     pub fn at(path: &Path) -> Result<Self, LedgerError> {
@@ -157,8 +172,9 @@ impl Ledger {
             Ok(mut file) => {
                 after_create();
                 lock(&file)?;
-                file.write_all(HEADER)?;
-                file.sync_all()?;
+                let data = DataGuard(&mut file);
+                data.0.write_all(HEADER)?;
+                data.0.sync_all()?;
                 // Persist the new directory entry on Unix as well as its data.
                 #[cfg(unix)]
                 File::open(self.path.parent().ok_or(LedgerError::InvalidPath)?)?.sync_all()?;
@@ -259,7 +275,7 @@ impl Ledger {
         self.with_data_locked(operation)
     }
 
-    fn operation_guard(&self, create: bool) -> Result<File, LedgerError> {
+    fn operation_guard(&self, create: bool) -> Result<OperationGuard, LedgerError> {
         let guard = if create {
             match OpenOptions::new()
                 .read(true)
@@ -285,7 +301,7 @@ impl Ledger {
                 .open(&self.guard_path)?
         };
         lock(&guard)?;
-        Ok(guard)
+        Ok(OperationGuard(guard))
     }
 
     fn with_data_locked<T>(
@@ -295,10 +311,11 @@ impl Ledger {
         validate_file_path(&self.path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         lock(&file)?;
+        let data = DataGuard(&mut file);
         // The file itself is never replaced, renamed or truncated by this API.
         // All operations acquire guard then data, in that order. Neither file
         // is replaced or removed; process exit releases locks, not occupancy.
-        operation(&mut file)
+        operation(data.0)
     }
 }
 
@@ -527,6 +544,21 @@ mod tests {
         let ledger = Ledger::at(&fresh_path()).unwrap();
         ledger.initialize().unwrap();
         ledger
+    }
+
+    #[test]
+    fn operation_unlock_is_explicit_even_with_a_duplicated_handle() {
+        let ledger = fresh();
+        let guard = ledger.operation_guard(false).unwrap();
+        let duplicate = guard.0.try_clone().unwrap();
+        drop(guard);
+        assert!(ledger.snapshot().is_ok());
+        drop(duplicate);
+        let duplicate = ledger
+            .with_data_locked(|file| Ok(file.try_clone()?))
+            .unwrap();
+        assert!(ledger.snapshot().is_ok());
+        drop(duplicate);
     }
 
     #[test]

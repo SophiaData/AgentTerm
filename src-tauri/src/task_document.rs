@@ -93,6 +93,13 @@ pub struct DocumentStore {
     guard: PathBuf,
 }
 
+struct DocumentGuard(File);
+impl Drop for DocumentGuard {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 fn io_error(_: impl std::fmt::Display) -> String {
     "任务文档读写失败；保留占用，请重新核实".into()
 }
@@ -133,7 +140,7 @@ impl DocumentStore {
         let guard = directory.join(format!("{name}.lock"));
         Ok(Self { path, guard })
     }
-    fn lock(&self, create: bool) -> Result<File, String> {
+    fn lock(&self, create: bool) -> Result<DocumentGuard, String> {
         if self.guard.exists() || fs::symlink_metadata(&self.guard).is_ok() {
             regular(&self.guard)?;
         }
@@ -146,7 +153,7 @@ impl DocumentStore {
             .map_err(io_error)?;
         file.try_lock()
             .map_err(|_| "任务文档正被其他操作占用，请重试".to_string())?;
-        Ok(file)
+        Ok(DocumentGuard(file))
     }
     fn open(&self) -> Result<File, String> {
         regular(&self.path)?;
@@ -678,5 +685,15 @@ mod tests {
         assert!(store.record(event(false)).is_err());
         drop(guard);
         assert_eq!(store.snapshot().unwrap().revision, 1);
+    }
+    #[test]
+    fn document_unlock_does_not_wait_for_duplicated_handles() {
+        let (store, plan) = fixture();
+        store.create(plan).unwrap();
+        let guard = store.lock(false).unwrap();
+        let duplicate = guard.0.try_clone().unwrap();
+        drop(guard);
+        assert_eq!(store.snapshot().unwrap().revision, 1);
+        drop(duplicate);
     }
 }

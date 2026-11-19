@@ -65,7 +65,7 @@ Run the repository `pnpm check`. Focused checks are
 
 Backend coverage includes persistent plan reopen, immutable metadata, current
 task/owner/version checks, invalid input before occupancy, duplicate/conflicting/
-out-of-order events, checksum/truncation/schema failure, locked journals, existing
+out-of-order events, checksum/truncation/schema failure, locked journals and explicit unlock with duplicated handles, existing
 directories only, relative artifact boundaries, symlink rejection, byte/content
 limits, version changes and stale preview refusal. Recorded relay tests persist
 both stages and prove document failure before spawn or before handoff prevents
