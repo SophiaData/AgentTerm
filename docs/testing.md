@@ -77,7 +77,17 @@ recovery-only viewing, missing-plan state, reservation-only cancellation, and
 escaping report/file text. Static React rendering is not desktop interaction.
 Record actual complete test counts and CI commit in the PR.
 
-Manual acceptance after the stacked PRs are merged: open the task workbench, add
+The `windows-frontend` PR job runs `pnpm test` and `pnpm build` on Windows.
+This reproduces the case-insensitive module resolution used by the Windows
+desktop build: `TaskWorkbench.tsx` and the old `taskWorkbench.ts` helper caused
+TS1192/TS1261/TS2305/TS1149 in package run `44565167859`, although Linux quality
+checks passed. The unchanged helper is now `workbenchState.ts`. A successful job
+also retains the exact compiled frontend for seven days for browser interaction
+acceptance. Browser checks with simulated IPC validate UI behavior only; they do
+not validate the native ledger, file picker, CLI, or desktop WebView.
+
+Manual acceptance using a package from the exact PR head (merge is not required):
+open the task workbench, add
 an existing project through the projects tab, explicitly initialize the local
 ledger, reserve one task with an existing output directory, reference a small
 existing SQL/report file and preview it. Change that disposable file externally,

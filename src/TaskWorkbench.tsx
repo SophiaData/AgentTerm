@@ -15,7 +15,7 @@ import {
   type PlanInput,
   type Preview,
   type WorkbenchView,
-} from "./taskWorkbench";
+} from "./workbenchState";
 
 async function invoke<T>(
   command: string,

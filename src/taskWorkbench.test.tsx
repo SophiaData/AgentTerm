@@ -7,7 +7,7 @@ import {
   requestOrder,
   type AttemptEvent,
   type WorkbenchView,
-} from "./taskWorkbench";
+} from "./workbenchState";
 
 function view(): WorkbenchView {
   return {
