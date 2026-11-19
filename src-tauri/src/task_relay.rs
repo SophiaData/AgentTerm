@@ -26,19 +26,7 @@ impl Cli {
         self.resolve_in(&crate::tools::candidate_search_dirs())
     }
     fn resolve_in(self, dirs: &[PathBuf]) -> Result<PathBuf, RelayError> {
-        match crate::tools::resolve_binary(self.binaries(), dirs) {
-            crate::tools::ResolveResult::Found(path) => {
-                #[cfg(windows)]
-                if !path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-                {
-                    return Err(RelayError::NativeBinaryRequired);
-                }
-                Ok(path)
-            }
-            _ => Err(RelayError::CliUnavailable),
-        }
+        resolve_native(self.binaries(), dirs)
     }
     fn spec(self, binary: &Path, cwd: &Path, prompt: String) -> ProcessSpec {
         let (args, input) = match self {
@@ -82,6 +70,29 @@ impl Cli {
             cwd: cwd.to_path_buf(),
             input,
         }
+    }
+}
+
+fn resolve_native(binaries: &[&str], dirs: &[PathBuf]) -> Result<PathBuf, RelayError> {
+    match crate::tools::resolve_binary(binaries, dirs) {
+        crate::tools::ResolveResult::Found(path) => {
+            // Resolve relative PATH entries before Command changes cwd.
+            let path = path
+                .canonicalize()
+                .map_err(|_| RelayError::CliUnavailable)?;
+            if !path.is_file() {
+                return Err(RelayError::CliUnavailable);
+            }
+            #[cfg(windows)]
+            if !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+            {
+                return Err(RelayError::NativeBinaryRequired);
+            }
+            Ok(path)
+        }
+        _ => Err(RelayError::CliUnavailable),
     }
 }
 
@@ -717,5 +728,42 @@ fn main() {
             ledger.snapshot().unwrap().active.unwrap().phase,
             Phase::WaitingApproval
         );
+    }
+    #[test]
+    fn relative_search_entry_stays_bound_when_project_directory_changes() {
+        // No global cwd/PATH mutation, new directory, or permanent CLI filename.
+        let application_dir = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let project_dir = std::env::temp_dir().canonicalize().unwrap();
+        assert_ne!(application_dir, project_dir);
+        let fixture = native_fixture();
+        let name = fixture.file_name().unwrap().to_str().unwrap();
+        let local = application_dir.join(name);
+        // create_new protects any existing path; ordinary copy avoids a link
+        // whose later cleanup could affect another workspace.
+        let mut source = std::fs::File::open(&fixture).unwrap();
+        let mut destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&local)
+            .unwrap();
+        std::io::copy(&mut source, &mut destination).unwrap();
+        drop(destination);
+        std::fs::set_permissions(&local, std::fs::metadata(&fixture).unwrap().permissions())
+            .unwrap();
+        let resolved = resolve_native(&[name], &[PathBuf::from(".")]).unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, local.canonicalize().unwrap());
+        let (ledger, ticket, plan, _) = self::fixture();
+        assert_eq!(plan.project_dir, project_dir);
+        let outcome = run_with(
+            &ledger,
+            &ticket,
+            &plan,
+            &[resolved.clone(), resolved],
+            task_process::run,
+        )
+        .unwrap();
+        assert!(outcome.issue.is_none());
+        assert!(outcome.reviewer.is_some());
     }
 }
