@@ -25,7 +25,7 @@ Windows NSIS 包名沿用 `AgentTerm_0.2.0-rc.1_x64-setup.exe`；验收必须同
 - `%LOCALAPPDATA%\AgentTerm\agentterm.exe`、`%LOCALAPPDATA%\Programs\AgentTerm\agentterm.exe`、`%ProgramFiles%\AgentTerm\agentterm.exe`、`E:\AgentTerm` 均不存在。此结论限于明确核对的入口，未全盘搜索。
 - 包哈希与上表一致。已按授权创建 `E:\AgentTerm\app`、`runtime`、`temp`；原生安装界面回读到目标 `E:\AgentTerm\app`，报告所需9.9 MB、可用约38.1 GB。Windows已有WebView2 Runtime，未下载安装额外运行时。
 - 首次以E盘临时目录启动，原生提示 `Error writing temporary file`；21字节普通写入探针成功。使用既有Windows临时目录进入安装界面后，原生提示 `Error opening file for writing: E:\AgentTerm\app\agentterm.exe`。某次静默退出0但无安装文件/登记，因此不判成功。
-- 对同一安装进程读取非敏感令牌属性：完整性RID=4096（低）、未提升；普通探针进程RID=8192（中）。包内manifest为`requestedExecutionLevel="asInvoker"`。低完整性与写入拒绝已有证据，但使安装器降级的具体来源未知；未更改ACL、执行策略或完整性级别，未提权绕过。
+- 对同一安装进程读取非敏感令牌属性：完整性RID=4096（低）、未提升；普通探针进程RID=8192（中）。包内manifest为`requestedExecutionLevel="asInvoker"`。随后读取该EXE的强制完整性标签，文件RID同为4096、policy mask=1；`__COMPAT_LAYER`未设置，未发现针对该文件路径的AppCompat Layers项。标签由谁设置未知；未更改ACL、执行策略、文件或进程完整性级别。
 - Windows原生UI Automation根接口可用，Win32已实际读取并操作安装器按钮和目录框；未启动新浏览器/CDP。因为安装未成功，应用WebView控件和原生IPC仍未验。
 - 安装器已显示 `Installation Aborted` 并退出；`E:\AgentTerm\app`为空，未生成AgentTerm安装登记、应用进程或真实账本。目录授权已满足，不再把用户授权列为阻塞；后续需要正常受信任的安装执行环境。
 
