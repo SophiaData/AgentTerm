@@ -9,57 +9,52 @@
 | 仓库质量门     | run `44566178018`；13项配置检查，Rust102/前端30/TUI17；2个 ignored 为子进程测试入口 | PASS                                                                | 真实 CLI、原生桌面交互                 |
 | Windows 前端   | 同 run 的 `windows-frontend`；30项测试、类型检查与构建                              | PASS                                                                | Windows WebView、原生文件选择          |
 | 浏览器交互     | 同提交的 CI 页面构建；现有 Playwright Extension、DOM 事件、模拟 IPC；14项           | PASS（模拟后端）                                                    | 原生账本、文件系统、真实权限与生产边界 |
-| Windows 打包   | run `44566248894`；NSIS artifact `14549924822` 与 TUI artifact `14551448972`        | 构建SUCCESS；实际安装写入失败并中止，应用未启动                     | 原生功能验收、用户验收                 |
+| Windows 打包   | run `44566248894`；NSIS artifact `14549924822` 与 TUI artifact `14551448972`        | 构建/安装成功；Windows原生主要流程通过，重启项目列表有缺口                     | 原生功能验收、用户验收                 |
 | macOS 打包     | 同 run 两次尝试的 desktop/TUI jobs；check annotations                               | 两次均CANCELLED：arm64 runner容量不足，未执行构建步骤；停止连续重试 | 没有已验证成功包，也没有真机验收       |
 | 原生接力与恢复 | 两种 CLI 原生账号/权限、受管按钮、暂停/恢复                                         | NOT RUN / 尚未实现的部分见台账                                      | 离线测试进程不是真实 Agent             |
 
 Windows NSIS 包名沿用 `AgentTerm_0.2.0-rc.1_x64-setup.exe`；验收必须同时核对 run、提交和 SHA-256，不能只看版本名。文件为 2,337,722 bytes，SHA-256 `f5f3e35105405e2065e04f1c423315240b1a1e1f1b371dbb26082e6f565cbbf8`。未正式发布。
 
-### A1 Windows 原生桌面清单（唯一下一项）
+### A1 Windows 原生桌面结果（2026-11-20）
 
-使用上述包和已有的授权项目、已有输出目录、可恢复测试文件。操作前记录环境、应用来源、现有账本是否有占用；有未知占用先核实，不能清空文件强行继续。2026-11-20用户已授权为AgentTerm安装/运行创建必要专用目录，并要求控制和清理缓存；该授权不涵盖其他项目目录或安全策略变更。原生界面未实际运行的检查仍记NOT RUN。
+应用代码仍为上表 `1e5f20d`，本轮原生控件由Windows UI Automation/Win32操作，调用真实原生IPC与文件系统；没有模拟IPC、启动新浏览器/CDP或调用子Agent。主实例PID38224、竞争实例30532、重启实例33872；收尾均已退出。
 
-2026-11-20 实际安装结果为 **BLOCKED（本机安装执行权限），应用功能操作仍为 NOT RUN**：
+此前安装被Low完整性标签阻塞；用户处理后，02:15回读安装包标签为Medium（RID8192），SHA-256与上表一致。安装器PID3188退出0，实际安装 `E:\AgentTerm\app\agentterm.exe`（10,345,984 bytes，SHA-256 `3c57eef2c47dd081b30e4601d1ecbf1ce17560570af76f1bd12985f6073f455a`）与卸载程序。应用窗口实际打开；不再把安装权限列为当前阻塞。安装器退出太快，本轮未采集其进程完整性令牌，不将文件标签值冒充进程测量。
 
-- `Get-CimInstance Win32_Process -Filter "Name='agentterm.exe'"` 无运行实例；HKCU/HKLM 卸载登记未命中 AgentTerm；`Get-Command agentterm.exe` 无命中。
-- 安装前检查时，`%LOCALAPPDATA%\AgentTerm\agentterm.exe`、`%LOCALAPPDATA%\Programs\AgentTerm\agentterm.exe`、`%ProgramFiles%\AgentTerm\agentterm.exe`、`E:\AgentTerm` 均不存在。随后按授权创建E盘专用目录，目前app子目录为空；前述不存在仅为安装前状态，未全盘搜索。
-- 包哈希与上表一致。已按授权创建 `E:\AgentTerm\app`、`runtime`、`temp`；原生安装界面回读到目标 `E:\AgentTerm\app`，报告所需9.9 MB、可用约38.1 GB。Windows已有WebView2 Runtime，未下载安装额外运行时。
-- 首次以E盘临时目录启动，原生提示 `Error writing temporary file`；21字节普通写入探针成功。使用既有Windows临时目录进入安装界面后，原生提示 `Error opening file for writing: E:\AgentTerm\app\agentterm.exe`。某次静默退出0但无安装文件/登记，因此不判成功。
-- 对同一安装进程读取非敏感令牌属性：完整性RID=4096（低）、未提升；普通探针进程RID=8192（中）。包内manifest为`requestedExecutionLevel="asInvoker"`。随后读取该EXE的强制完整性标签，文件RID同为4096、policy mask=1；`__COMPAT_LAYER`未设置，未发现针对该文件路径的AppCompat Layers项。标签由谁设置未知；未更改ACL、执行策略、文件或进程完整性级别。
-- Windows原生UI Automation根接口可用，Win32已实际读取并操作安装器按钮和目录框；未启动新浏览器/CDP。因为安装未成功，应用WebView控件和原生IPC仍未验。
-- 安装器已显示 `Installation Aborted` 并退出；`E:\AgentTerm\app`为空，未生成AgentTerm安装登记、应用进程或真实账本。目录授权已满足；后续用户也授权了下述单文件标签调整，当前阻塞为本机会话执行权限。
-- 2026-11-20 02:03执行已授权的 `icacls <该安装包> /setintegritylevel M`，返回退出码5、`Access is denied`。回读文件标签仍RID4096、policy mask=1，SHA-256保持上表值。当前进程RID8192、未提升，当前用户为文件所有者，但令牌无 `SeRelabelPrivilege`；没有成功修改标签或启动新安装器。标签调整前的元数据已备份，失败结果已保存到本地验收证据。
+| 顺序 | 原生操作与实际证据 | 结果 |
+| ---- | ------------------ | ---- |
+| 1 | 原生选择器登记已有 `E:\dw-modeling-template`，显式初始化默认账本；初始化前文件不存在，之后出现24字节头记录 | PASS |
+| 2 | 首实例保存目标/负责人/范围/既有产物目录；快速第二次Invoke被拒绝；另一已打开实例为 `E:\AgentTerm` 提交被后端拒绝，两窗口显示同一taskId，账本只有一次reserved | PASS；顺序竞争，非同时压力测试；没有持久排队 |
+| 3 | 引用 `agentterm-native-artifact.md`，原生预览内容、字节数、SHA-256逐项与磁盘核对 | PASS |
+| 4 | 改为版本二后刷新，旧预览报“文件内容已变化”；登记后两摘要独立显示，新预览正确；`../../AGENTS.md`被“只接受产物目录内的相对文件路径”拒绝；测试文件最后按备份原字节恢复 | PASS |
+| 5 | 原进程取消尚未派发预留，界面回读无主任务，账本追加idle；再次创建新预留，账本为generation2/revision3 | PASS |
+| 6a | 受控终止两个已核验测试PID后重启；新进程显示同一taskId“待核实”，没有取消/登记/预留入口；账本重启前后哈希一致 | PASS（异常重启保护） |
+| 6b | 重启后项目页显示“还没有项目” | GAP：#6最小项目持久化并入#12恢复集成 |
+| 6c | 尝试操作托盘退出菜单但未取得可操作控件；本轮退出用受控进程终止 | 正常菜单退出NOT RUN，不能由异常重启替代 |
 
-后续操作需由用户在具备权限的管理员PowerShell中执行以下单文件命令；只调整这份安装包，主Agent随后核对标签与原哈希再启动安装。既有授权继续有效，无须重复申请。
+A1为**部分通过**，不宣布 #9～#11、恢复闭环或M4完成。真实CLI、Mac原生、正常退出、历史任务浏览和安全恢复释放仍未验；原生冲突提示“须排队”不表示已实现队列。
 
-```powershell
-icacls.exe "E:\dw-modeling-template\.trash\2026-11-19\agentterm-1e5f20d-windows-x64-setup.exe" /setintegritylevel M
-```
+#### 本机证据与保留占用
 
-此命令本轮没有成功，管理员执行也尚未验证；不得将预期结果写为已完成。
+证据均位于既有 `E:\dw-modeling-template\.trash\2026-11-19`；`agentterm-native-acceptance-session.json`汇总检查与各证据SHA-256，原生UI快照分别为claim、preview-v1、stale、preview-v2、boundary、cancel、restart-before、restarted、projects-after-restart的 `agentterm-native-*-uia.json`。两次任务文档与最终账本快照为 `agentterm-native-evidence-*.txt`；重启界面截图为 `agentterm-native-recovery.png`。
 
-### 本轮缓存与磁盘收尾
+| 声明 | 出处 | 回读原文或结果 |
+| ---- | ---- | -------------- |
+| 仅一个占用 | claim UI快照与最终账本快照 | “已有主任务占用执行位置，当前任务须排队”；第一次只一条reserved |
+| 版本失效拒绝 | stale UI快照 | “文件内容已变化，当前内容不再属于此版本；请登记新版本” |
+| 越界拒绝 | boundary UI快照 | “只接受产物目录内的相对文件路径” |
+| 异常重启保留 | restarted UI快照与session中的账本SHA-256 | “待核实”；前后账本字节一致 |
+| 项目持久化缺口 | projects-after-restart UI快照 | “还没有项目。点击「添加项目」，选择一个本地文件夹即可开始。” |
 
-| 项目     | 记录                                                                                                                       |
-| -------- | -------------------------------------------------------------------------------------------------------------------------- |
-| 控制预算 | 临时/运行缓存上限512 MiB；E盘剩余低于5 GiB停止继续写入并检查；本轮未达到阈值                                               |
-| 使用位置 | E盘专用根目录`E:\AgentTerm`；安装器因E临时目录写入失败改用已有Windows临时目录；没有D盘构建/缓存                            |
-| 前后余量 | C盘58.50→约58.55 GiB；D盘41.82→41.82 GiB；E盘38.07→约38.06 GiB；这是磁盘整体读数，不把其他进程变化归因于本任务             |
-| 清理结果 | 21字节探针所在temp目录与空runtime目录已送系统回收站；未产生WebView缓存；核对本轮时间范围的NSIS临时项无残留，安装进程已退出 |
-| 保留内容 | 已核对的安装包约2.23 MiB、文档/错误证据及空安装目标目录；不清任务账本/凭据，不清其他项目缓存                               |
+最终保留task `task-38224-1795112161279866200-1795112776004138000`，项目 `E:\dw-modeling-template`，generation2/revision3，状态reserved、旧owner，尚未派发。默认账本为 `%LOCALAPPDATA%\agentterm-main-task-ledger.log`；两份任务文档位于同一既有目录。当前应用进程均退出，后续打开应只读待核实；只通过后续经验证的#12流程核实并恢复/释放，不删除或改用另一账本。
 
-清缓存必须先确认相关进程退出、核对绝对路径及链接类型，只处理本轮专用缓存；按用户删除禁令采用可恢复回收。回收站不等于物理空间释放，若今后有大缓存需处理，应明确区分已回收与已释放；本轮只有21字节探针，无大缓存堆积。
+#### 本轮缓存与收尾
 
-| 顺序 | 操作                                                                      | 必须看到的真实结果                                                                     | 当前状态 |
-| ---- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | -------- |
-| 1    | 进入工作台，通过原生选择器添加已有项目，显式初始化账本                    | 项目归属正确；没有创建项目/产物目录；初始化不覆盖现有占用                              | NOT RUN  |
-| 2    | 填目标、负责人、范围与已有产物目录，连续提交预留；另一个窗口/实例尝试竞争 | 只一次成功；真实后端拒绝第二次占用，目标与步骤回读一致；当前仅冲突反馈，尚无队列       | NOT RUN  |
-| 3    | 登记一个已有 SQL/Markdown 测试文件，预览并与文件核对                      | 相对路径、内容、字节数及 SHA-256 对应；不执行 SQL，正文作为文本显示                    | NOT RUN  |
-| 4    | 变更可恢复测试文件后查看旧版本，再登记新版本；尝试越界路径                | 旧版本拒绝冒充当前文件，新版本单独列出；越界由原生入口拒绝；测试文件按原字节恢复       | NOT RUN  |
-| 5    | 取消同一进程中尚未派发的预留，再新建一项测试预留                          | 只有未派发且版本/归属匹配时释放；不误删文档或项目文件                                  | NOT RUN  |
-| 6    | 保留这项预留并退出重启，检查原生回读及项目列表                            | 旧归属显示只读待核实；不能自动重派、取消或释放；如项目列表未恢复，登记 #6/#12 集成缺口 | NOT RUN  |
+预算：运行/临时缓存512 MiB，E盘低于5 GiB停止。实际WebView用户数据目录设在 `E:\AgentTerm\runtime\webview`，该目录实际产生文件；本轮未在D盘构建或下载运行时。原生界面截图与证据保留在上述已有目录。
 
-第6步是最后一步，会按当前实现留下待核实占用；它用于验证保护，不代表恢复已经完成。后续只能通过经验证的 #12 流程处理，不删除/另开账本绕过。逐步记录提交、OS、步骤、期望、实际、证据位置、PASS/FAIL/NOT RUN及遗留占用；只有全部真实执行才报 A1 通过。
+收尾核对应用及其已识别WebView进程全部退出后，逐级审查专用目录无链接，再将空temp与runtime（285个文件，72,695,077 bytes，约69.33 MiB）送系统回收站；路径已不存在。最终磁盘整体余量C约58.54/D41.82/E37.96 GiB。回收不等于物理空间释放，不把其他进程的磁盘变化归因本任务；账本、测试文档、安装文件和证据保留。`agentterm-native-cleanup.json`为回读记录。
+
+下一实现任务为B1 #12与#6最小项目持久化；正常退出需补验，异常终止、合法接续、安全释放与残留进程判定分别留证。主Agent完成声明-证据与机械检查；按用户禁止子Agent要求不调用独立评审，不称cc独立门禁PASS。
 
 ### 后续验收进入条件
 
@@ -188,7 +183,7 @@ refresh-failure disabled actions, recovery-only viewing and reservation cancel.
 This is frontend evidence only; backend behavior is simulated and cannot be
 counted as a native filesystem or permission test.
 
-Not verified by unit/CI tests: macOS/Windows live WebView and file picker interaction,
+Unit/CI tests alone do not verify live desktop interaction; Windows component evidence is recorded in A1 above. Still unverified: macOS live WebView and file picker interaction,
 real CLI permissions and accounts, historical-task browsing, automatic refresh,
 safe recovery/release or tool-side production boundaries.
 
