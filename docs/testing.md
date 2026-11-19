@@ -198,3 +198,13 @@ safe recovery/release or tool-side production boundaries.
 - Template contract tests run in CI before repository-specific checks.
 - Repository owners must configure real dependency installation and any secret
   fixtures through appropriately restricted GitHub Actions environments.
+
+## B1 项目持久化与未派发预留恢复（2026-11-20）
+
+本节为新实现的验收记录，不能沿用上方旧包A1结果。主Agent单线程实施与自检，不调用子Agent。
+
+- 本地Windows独立账本：`rustc --edition 2024 --test src-tauri/src/task_ledger.rs --crate-name task_ledger -o <existing-directory>/ledger-tests.exe`；`ledger-tests.exe --test-threads=1` → 24 passed，1 ignored helper。真实子进程退出、旧票据/owner、并发接管、未知/存活/复用PID、运行中拒绝恢复、损坏及截断均覆盖。
+- 完整检查须执行 `pnpm check`；项目存储覆盖重开、多实例读取、原子替换已有文件、重复项/未知schema/损坏/超限、pending中断残留、锁冲突、非法目录与软链接。命令层覆盖文档保留、缺项目拒绝接管、释放保留记录、已有执行事件拒绝恢复；前端覆盖允许的按钮和运行中禁止按钮。当前完整CI结果以本切片PR回读为准，尚未取得时记NOT RUN。
+- 新包原生待验：重启后项目仍在；旧未派发任务接管后计划/产物不变且可取消；缺项目先重新登记；第二个仍在运行的实例不能抢占；明确释放后可建新任务；损坏项目文件应显示错误且不覆盖。真实OS默认账本只通过新入口操作，不删除或换路径。
+- 接管写入新阶段recoveredReserved，旧版本遇到该历史记录失败关闭；应用回滚不能直接继续使用已接管账本，需保留原件并核实。未接管的schema1历史正常读取，不静默重写。
+- 当前恢复仅限从未派发状态。正在执行/验收/等待/暂停/未知状态均不由该入口释放；没有停止运行进程、撤回外部作业或自动重派的能力。正常托盘退出和最后工具记忆仍NOT RUN/未实现。

@@ -10,6 +10,7 @@ import {
   acceptSnapshot,
   attemptLabels,
   latestAttempts,
+  isReservation,
   phaseLabels,
   requestOrder,
   type PlanInput,
@@ -35,6 +36,7 @@ export function TaskCard({
   onReference,
   onPreview,
   onCancel,
+  onRecover,
 }: {
   view: WorkbenchView;
   busy: boolean;
@@ -42,6 +44,7 @@ export function TaskCard({
   onReference: (relativePath: string, label: string) => void;
   onPreview: (id: string) => void;
   onCancel: () => void;
+  onRecover: (release: boolean) => void;
 }) {
   const active = view.ledger.active;
   const document = view.document;
@@ -66,9 +69,33 @@ export function TaskCard({
       <p className="task-path">{active.projectId}</p>
       {active.recoveryRequired && (
         <p role="status">
-          这项任务来自先前进程或执行状态待核实。占用继续保留，目前仅可查看。
+          这项任务来自其他进程或执行状态待核实。占用继续保留。
         </p>
       )}
+      {active.recoveryRequired &&
+        isReservation(active.phase) &&
+        (!document || document.events.length === 0) && (
+          <section aria-label="核实未派发预留">
+            <p>
+              后端确认旧进程已退出且没有派发记录后，才允许接管或释放。
+              查询失败、进程仍在或状态不明时继续保留占用。
+            </p>
+            <button
+              className="ghost-button"
+              disabled={busy}
+              onClick={() => onRecover(false)}
+            >
+              核实并接管预留
+            </button>
+            <button
+              className="ghost-button"
+              disabled={busy}
+              onClick={() => onRecover(true)}
+            >
+              核实并释放未派发预留
+            </button>
+          </section>
+        )}
       {document ? (
         <>
           <h3>{document.plan.goal}</h3>
@@ -183,7 +210,7 @@ export function TaskCard({
           此任务尚无计划文档。未派发且归属当前进程时，可以补全计划。
         </p>
       )}
-      {editable && active.phase === "reserved" && (
+      {editable && isReservation(active.phase) && (
         <button className="ghost-button" disabled={busy} onClick={onCancel}>
           取消未派发预留
         </button>
@@ -364,7 +391,7 @@ export default function TaskWorkbench({
     !!view &&
     (!active ||
       (!view.document &&
-        active.phase === "reserved" &&
+        isReservation(active.phase) &&
         !active.recoveryRequired));
   return (
     <section className="workbench" aria-labelledby="workbench-title">
@@ -413,6 +440,12 @@ export default function TaskWorkbench({
           }
           onPreview={(id) => void showPreview(id)}
           onCancel={() => void act("cancel_main_task_reservation", ticket())}
+          onRecover={(release) =>
+            void act("recover_main_task_reservation", {
+              ...ticket(),
+              release,
+            })
+          }
         />
       )}
       {canPlan && (

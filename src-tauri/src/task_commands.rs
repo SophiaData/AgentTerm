@@ -283,6 +283,64 @@ impl TaskLedgerState {
         let store = self.document_store(task_id, generation)?;
         Ok((snapshot, store))
     }
+
+    fn recover(
+        &self,
+        projects: &ProjectStore,
+        task_id: &str,
+        generation: u64,
+        revision: u64,
+        release: bool,
+    ) -> Result<WorkbenchView, String> {
+        let (snapshot, store) = self.current_store(task_id, generation, revision, false)?;
+        let active = snapshot
+            .active
+            .as_ref()
+            .ok_or_else(|| "没有当前主任务".to_string())?;
+        if !active.phase.is_reserved() {
+            return Err("已有派发意图，不能使用未派发预留恢复；占用继续保留".into());
+        }
+        if store.exists() {
+            let document = store.snapshot()?;
+            if document.plan.task_id != task_id
+                || document.plan.generation != generation
+                || document.plan.project_id != active.project_id
+                || !document.events.is_empty()
+            {
+                return Err("计划不匹配或已有执行记录；占用继续保留，需核实".into());
+            }
+        }
+        if !release {
+            let project = projects
+                .list()?
+                .into_iter()
+                .find(|p| p.id == active.project_id)
+                .ok_or_else(|| "请先重新登记该任务的已有项目，再接管预留".to_string())?;
+            if crate::projects::normalize_project_dir(&project.path)?.to_string_lossy()
+                != project.id
+            {
+                return Err("项目真实路径已变化，不能接管".into());
+            }
+        }
+        // OS absence proof and ticket CAS run together under the ledger locks.
+        // No process starts here; document/plan versions are left unchanged.
+        self.ledger()?
+            .recover_reservation(&self.owner_id, task_id, generation, revision, release)
+            .map_err(|e| e.to_string())?;
+        self.workbench()
+    }
+}
+
+#[tauri::command]
+pub fn recover_main_task_reservation(
+    state: tauri::State<'_, TaskLedgerState>,
+    projects: tauri::State<'_, ProjectStore>,
+    task_id: String,
+    generation: u64,
+    expected_revision: u64,
+    release: bool,
+) -> Result<WorkbenchView, String> {
+    state.recover(&projects, &task_id, generation, expected_revision, release)
 }
 
 #[tauri::command]
@@ -315,7 +373,7 @@ pub fn attach_task_plan(
         .active
         .as_ref()
         .ok_or_else(|| "没有当前主任务".to_string())?;
-    if active.phase != Phase::Reserved || active.project_id != input.project_id {
+    if !active.phase.is_reserved() || active.project_id != input.project_id {
         return Err("仅可为当前未派发任务补全计划".into());
     }
     let plan = state.plan_input(&projects, input, task_id, generation)?;
@@ -529,5 +587,114 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    fn exited_owner() -> String {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(child.wait().unwrap().success());
+        format!("{pid}-1")
+    }
+
+    #[test]
+    fn restart_recovery_preserves_plan_and_rejects_old_tickets() {
+        let (mut old, projects, project) = configured();
+        old.owner_id = exited_owner();
+        let view = old.create_task(&projects, input(project)).unwrap();
+        let task = view.ledger.active.unwrap().task_id;
+        let new = TaskLedgerState::default();
+        new.configure(old.path.lock().unwrap().clone().unwrap())
+            .unwrap();
+        let recovered = new.recover(&projects, &task, 1, 1, false).unwrap();
+        assert_eq!(recovered.document, view.document);
+        assert_eq!(recovered.ledger.revision, 2);
+        let active = recovered.ledger.active.unwrap();
+        assert!(!active.recovery_required);
+        assert_eq!(active.phase, "recoveredReserved");
+        assert!(old.current_store(&task, 1, 1, true).is_err());
+        assert!(old.current_store(&task, 1, 2, true).is_err());
+        assert!(new.recover(&projects, &task, 1, 1, true).is_err());
+        new.ledger()
+            .unwrap()
+            .cancel_reservation(&new.owner_id, &task, 1, 2)
+            .unwrap();
+        assert!(new.workbench().unwrap().ledger.active.is_none());
+    }
+
+    #[test]
+    fn live_owner_unknown_identity_and_dispatched_tasks_stay_occupied() {
+        for owner in [format!("{}-1", std::process::id()), "legacy-unknown".into()] {
+            let (mut old, projects, project) = configured();
+            old.owner_id = owner;
+            let view = old.create_task(&projects, input(project)).unwrap();
+            let task = view.ledger.active.unwrap().task_id;
+            let new = TaskLedgerState::default();
+            new.configure(old.path.lock().unwrap().clone().unwrap())
+                .unwrap();
+            assert!(new.recover(&projects, &task, 1, 1, false).is_err());
+            assert!(new.recover(&projects, &task, 1, 1, true).is_err());
+            assert_eq!(old.ledger().unwrap().snapshot().unwrap().revision, 1);
+            old.ledger()
+                .unwrap()
+                .set_phase(&old.owner_id, &task, 1, 1, Phase::Running)
+                .unwrap();
+            assert!(new.recover(&projects, &task, 1, 2, true).is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_needs_registered_project_but_release_does_not_remove_documents() {
+        let (mut old, projects, project) = configured();
+        old.owner_id = exited_owner();
+        let view = old.create_task(&projects, input(project)).unwrap();
+        let task = view.ledger.active.unwrap().task_id;
+        let new = TaskLedgerState::default();
+        new.configure(old.path.lock().unwrap().clone().unwrap())
+            .unwrap();
+        let empty = ProjectStore::default();
+        assert!(
+            new.recover(&empty, &task, 1, 1, false)
+                .unwrap_err()
+                .contains("重新登记")
+        );
+        let released = new.recover(&empty, &task, 1, 1, true).unwrap();
+        assert!(released.ledger.active.is_none());
+        assert_eq!(
+            old.document_store(&task, 1).unwrap().snapshot().unwrap(),
+            view.document.unwrap()
+        );
+    }
+
+    #[test]
+    fn a_document_execution_event_blocks_reservation_recovery() {
+        let (mut old, projects, project) = configured();
+        old.owner_id = exited_owner();
+        let view = old.create_task(&projects, input(project)).unwrap();
+        let task = view.ledger.active.unwrap().task_id;
+        old.document_store(&task, 1)
+            .unwrap()
+            .record(crate::task_document::AttemptEvent {
+                id: "1:2:0:start".into(),
+                sequence: 4,
+                attempt_id: "1:2:0".into(),
+                step_id: "worker".into(),
+                state: crate::task_document::AttemptState::Running,
+                summary: "intent".into(),
+            })
+            .unwrap();
+        let new = TaskLedgerState::default();
+        new.configure(old.path.lock().unwrap().clone().unwrap())
+            .unwrap();
+        assert!(
+            new.recover(&projects, &task, 1, 1, true)
+                .unwrap_err()
+                .contains("执行记录")
+        );
+        assert_eq!(old.ledger().unwrap().snapshot().unwrap().revision, 1);
     }
 }

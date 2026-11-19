@@ -32,6 +32,7 @@ pub fn run() {
             task_commands::task_ledger_snapshot,
             task_commands::claim_main_task,
             task_commands::cancel_main_task_reservation,
+            task_commands::recover_main_task_reservation,
             task_commands::workbench_snapshot,
             task_commands::create_workbench_task,
             task_commands::attach_task_plan,
@@ -43,13 +44,13 @@ pub fn run() {
 
             // Fixed existing OS data directory: projects and windows cannot
             // select separate ledgers. No directory or ledger is auto-created.
-            if let Ok(directory) = app.path().local_data_dir()
-                && let Err(error) = app
-                    .state::<task_commands::TaskLedgerState>()
-                    .configure(directory.join("agentterm-main-task-ledger.log"))
-            {
-                eprintln!("Task ledger unavailable: {error}");
-            }
+            let directory = app.path().local_data_dir()?;
+            app.state::<projects::ProjectStore>()
+                .configure(directory.join("agentterm-projects.json"))
+                .map_err(std::io::Error::other)?;
+            app.state::<task_commands::TaskLedgerState>()
+                .configure(directory.join("agentterm-main-task-ledger.log"))
+                .map_err(std::io::Error::other)?;
 
             let window = app
                 .get_webview_window("main")

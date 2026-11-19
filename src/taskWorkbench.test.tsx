@@ -69,6 +69,7 @@ const callbacks = {
   onReference: () => {},
   onPreview: () => {},
   onCancel: () => {},
+  onRecover: () => {},
 };
 
 describe("task workbench", () => {
@@ -139,6 +140,43 @@ describe("task workbench", () => {
     expect(html).toContain("查看此版本");
     expect(html).not.toContain("登记版本");
     expect(html).not.toContain("取消未派发预留");
+    expect(html).toContain("核实并接管预留");
+    expect(html).toContain("核实并释放未派发预留");
+  });
+  it("never offers reservation recovery for dispatched or unknown work", () => {
+    for (const phase of [
+      "running",
+      "pausing",
+      "recoveryRequired",
+      "unexpected",
+    ]) {
+      const current = view();
+      current.ledger.active!.recoveryRequired = true;
+      current.ledger.active!.phase = phase;
+      const html = renderToStaticMarkup(
+        <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
+      );
+      expect(html).not.toContain("核实并接管预留");
+      expect(html).not.toContain("核实并释放未派发预留");
+    }
+    const current = view();
+    current.ledger.active!.phase = "reserved";
+    current.ledger.active!.recoveryRequired = true;
+    current.document!.events = [start];
+    const html = renderToStaticMarkup(
+      <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
+    );
+    expect(html).not.toContain("核实并接管预留");
+  });
+  it("recovered reservations remain undispatched and can be cancelled by their owner", () => {
+    const current = view();
+    current.ledger.active!.phase = "recoveredReserved";
+    const html = renderToStaticMarkup(
+      <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
+    );
+    expect(html).toContain("已接管预留");
+    expect(html).toContain("取消未派发预留");
+    expect(html).not.toContain("核实并接管预留");
   });
   it("shows missing metadata and permits cancelling only an untouched reservation", () => {
     const current = view();

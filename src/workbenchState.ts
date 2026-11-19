@@ -51,6 +51,7 @@ export type Preview = { id: string; sha256: string; content: string };
 
 export const phaseLabels: Record<string, string> = {
   reserved: "已预留 · 尚未派发",
+  recoveredReserved: "已接管预留 · 尚未派发",
   running: "执行中",
   verifying: "独立验收中",
   waitingInput: "等待确认",
@@ -58,6 +59,10 @@ export const phaseLabels: Record<string, string> = {
   pausing: "正在暂停",
   recoveryRequired: "待核实",
 };
+
+export function isReservation(phase: string): boolean {
+  return phase === "reserved" || phase === "recoveredReserved";
+}
 export const attemptLabels: Record<AttemptEvent["state"], string> = {
   running: "执行意图已登记",
   reported: "结果已提交",

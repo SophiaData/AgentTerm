@@ -57,7 +57,7 @@
 
 ## 数据工作台运行契约（2026-11-20，部分实现与后续约束）
 
-本节约束工作台实现。已实现 `task_ledger.rs` 单任务预留账本、`task_commands.rs` 的账本与任务文档命令、`task_relay.rs`/`task_process.rs` 原生顺序接力核心，以及 `task_document.rs`/`TaskWorkbench.tsx`/`workbenchState.ts` 的任务页与产物引用。真实 CLI 派发、工具权限、持久队列、恢复与完成释放仍未形成闭环。产品范围以 [PRD](PRD.md) 为准，开发纪律见 [workflow](workflow.md)，实施顺序与当前状态以 [tasks](tasks.md) 为准。
+本节约束工作台实现。已实现 `task_ledger.rs` 单任务预留账本、`task_commands.rs` 的账本与任务文档命令、`task_relay.rs`/`task_process.rs` 原生顺序接力核心，以及 `task_document.rs`/`TaskWorkbench.tsx`/`workbenchState.ts` 的任务页与产物引用。真实 CLI 派发、工具权限、持久队列、完整恢复与完成释放仍未形成闭环。产品范围以 [PRD](PRD.md) 为准，开发纪律见 [workflow](workflow.md)，实施顺序与当前状态以 [tasks](tasks.md) 为准。
 
 ### 当前入口与后续集成次序
 
@@ -160,3 +160,15 @@ tests/                  模板契约测试
 .claude/agents/         独立 QA 评审代理
 backups/                本地配置备份，不提交
 ```
+
+### B1 第一切片：项目持久化与未派发恢复
+
+项目存储使用既有 `local_data_dir()` 下固定 `agentterm-projects.json`，由后端启动时绑定；不能由renderer切换。每次读取/修改以伴随锁串行并重新读取磁盘，schema1/1 MiB/200项校验。修改先用create_new写 `.pending`、sync_all，再在同目录rename替换；Unix同步目录项。损坏和未完成pending失败关闭并保留原件，读取不创建目录或数据文件。移除仅改变项目记录，不删除项目目录；不保存敏感环境或原始日志。最后使用工具的记忆留待#6后续。
+
+新命令 `recover_main_task_reservation` 只接收当前taskId/generation/revision与接管或释放选择，旧owner从账本读取。任务必须仍为reserved或recoveredReserved，文档不存在或其计划身份匹配且没有尝试事件；若接管还须核对已登记的真实项目。缺计划可在接管后用既有补全入口补齐，已有计划绝不覆盖。
+
+OS确认旧PID不存在或句柄已结束后，在同一账本锁下CAS追加恢复结果。PID仍活着（即使其实已被复用）、无法查询、owner格式未知时继续保留占用；时间戳不作为PID复用后放行依据，保守拒绝可能需人工核实。Windows只请求SYNCHRONIZE并零等待查询，不读进程内存、不终止进程、不提权；Unix用signal0且仅ESRCH算退出。
+
+接管保持taskId/generation和文档，变更owner、增加revision并写recoveredReserved；旧票据失效，旧程序不认识该阶段会失败关闭，不能继续读写整个账本。释放只允许上述未派发状态，保留所有任务文档。接管记录是兼容性边界，不能承诺旧程序直接回滚。所有派发必须先CAS离开预留状态再启动进程，因而不能在核实过程中绕过占用启动。
+
+本切片不实现已派发尝试的停止证明或断点接续；#12后续仍需持久启动身份、残留/外部作业核实和恢复协议。项目与任务存储分别提交，失败时显示错误并保持任务占用，不声称跨文件事务。

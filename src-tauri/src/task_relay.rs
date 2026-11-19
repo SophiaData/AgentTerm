@@ -293,7 +293,7 @@ fn run_observed(
         || before.generation != ticket.generation
         || active.task_id != ticket.task_id
         || active.owner_id != ticket.owner_id
-        || active.phase != Phase::Reserved
+        || !active.phase.is_reserved()
         || active.project_id != cwd.to_string_lossy()
     {
         return Err(RelayError::Stale);

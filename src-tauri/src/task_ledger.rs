@@ -16,6 +16,7 @@ const MAX_FIELD_BYTES: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Reserved,
+    RecoveredReserved,
     Running,
     Verifying,
     WaitingInput,
@@ -28,6 +29,7 @@ impl Phase {
     pub fn name(self) -> &'static str {
         match self {
             Self::Reserved => "reserved",
+            Self::RecoveredReserved => "recoveredReserved",
             Self::Running => "running",
             Self::Verifying => "verifying",
             Self::WaitingInput => "waitingInput",
@@ -40,6 +42,7 @@ impl Phase {
     fn parse(value: &str) -> Result<Self, LedgerError> {
         match value {
             "reserved" => Ok(Self::Reserved),
+            "recoveredReserved" => Ok(Self::RecoveredReserved),
             "running" => Ok(Self::Running),
             "verifying" => Ok(Self::Verifying),
             "waitingInput" => Ok(Self::WaitingInput),
@@ -48,6 +51,10 @@ impl Phase {
             "recoveryRequired" => Ok(Self::RecoveryRequired),
             _ => Err(LedgerError::InvalidData),
         }
+    }
+
+    pub fn is_reserved(self) -> bool {
+        matches!(self, Self::Reserved | Self::RecoveredReserved)
     }
 }
 
@@ -234,7 +241,7 @@ impl Ledger {
             let mut state = read_snapshot(file)?;
             require_owner(&state, owner_id, task_id, generation, expected_revision)?;
             let task = state.active.as_mut().ok_or(LedgerError::Stale)?;
-            if phase == Phase::Reserved || task.phase == Phase::RecoveryRequired {
+            if phase.is_reserved() || task.phase == Phase::RecoveryRequired {
                 return Err(LedgerError::CannotRelease);
             }
             task.phase = phase;
@@ -257,10 +264,75 @@ impl Ledger {
         self.with_locked(|file| {
             let mut state = read_snapshot(file)?;
             require_owner(&state, owner_id, task_id, generation, expected_revision)?;
-            if state.active.as_ref().ok_or(LedgerError::Stale)?.phase != Phase::Reserved {
+            if !state
+                .active
+                .as_ref()
+                .ok_or(LedgerError::Stale)?
+                .phase
+                .is_reserved()
+            {
                 return Err(LedgerError::CannotRelease);
             }
             state.active = None;
+            state.revision = next(state.revision)?;
+            append(file, &state)?;
+            Ok(state)
+        })
+    }
+
+    /// Only an untouched reservation whose old process is demonstrably gone.
+    /// The caller cannot supply a PID, owner, or a frontend "stopped" assertion.
+    /// Old clients reject recoveredReserved as an unknown phase (fail closed).
+    pub fn recover_reservation(
+        &self,
+        new_owner: &str,
+        task_id: &str,
+        generation: u64,
+        revision: u64,
+        release: bool,
+    ) -> Result<Snapshot, LedgerError> {
+        self.recover_with(
+            new_owner,
+            task_id,
+            generation,
+            revision,
+            release,
+            owner_has_exited,
+        )
+    }
+
+    fn recover_with(
+        &self,
+        new_owner: &str,
+        task_id: &str,
+        generation: u64,
+        revision: u64,
+        release: bool,
+        stopped: impl FnOnce(&str) -> bool,
+    ) -> Result<Snapshot, LedgerError> {
+        validate_field(new_owner)?;
+        self.with_locked(|file| {
+            let mut state = read_snapshot(file)?;
+            let old = state.active.as_ref().ok_or(LedgerError::Stale)?;
+            if state.generation != generation
+                || state.revision != revision
+                || old.task_id != task_id
+            {
+                return Err(LedgerError::Stale);
+            }
+            if !old.phase.is_reserved() {
+                return Err(LedgerError::CannotRelease);
+            }
+            if old.owner_id == new_owner || !stopped(&old.owner_id) {
+                return Err(LedgerError::RecoveryRequired);
+            }
+            if release {
+                state.active = None;
+            } else {
+                let task = state.active.as_mut().ok_or(LedgerError::Stale)?;
+                task.owner_id = new_owner.into();
+                task.phase = Phase::RecoveredReserved;
+            }
             state.revision = next(state.revision)?;
             append(file, &state)?;
             Ok(state)
@@ -317,6 +389,60 @@ impl Ledger {
         // is replaced or removed; process exit releases locks, not occupancy.
         operation(data.0)
     }
+}
+
+/// PID reuse is conservative: any live process at that PID blocks recovery,
+/// regardless of the embedded lifetime timestamp. Only absence/exit is proof.
+fn owner_has_exited(owner: &str) -> bool {
+    let Some((pid, lifetime)) = owner.split_once('-') else {
+        return false;
+    };
+    let Ok(pid) = pid.parse::<u32>() else {
+        return false;
+    };
+    if pid == 0
+        || pid > i32::MAX as u32
+        || lifetime.parse::<u128>().ok().filter(|n| *n > 0).is_none()
+    {
+        return false;
+    }
+    process_has_exited(pid)
+}
+
+#[cfg(windows)]
+fn process_has_exited(pid: u32) -> bool {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    // SYNCHRONIZE only: no memory access, no termination or privilege changes.
+    let handle = unsafe { OpenProcess(0x0010_0000, 0, pid) };
+    if handle.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(87);
+    }
+    let exited = unsafe { WaitForSingleObject(handle, 0) } == 0;
+    unsafe {
+        CloseHandle(handle);
+    }
+    exited
+}
+
+#[cfg(unix)]
+fn process_has_exited(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // Signal zero checks existence only. EPERM and all unknown errors block.
+    (unsafe { kill(pid as i32, 0) }) == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(3)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn process_has_exited(_: u32) -> bool {
+    false
 }
 
 fn validate_file_path(path: &Path) -> Result<(), LedgerError> {
@@ -462,16 +588,17 @@ fn validate_transition(before: &Snapshot, after: &Snapshot) -> Result<(), Ledger
             before.generation.checked_add(1) == Some(after.generation)
                 && task.phase == Phase::Reserved
         }
-        (Some(task), None) => {
-            before.generation == after.generation && task.phase == Phase::Reserved
-        }
+        (Some(task), None) => before.generation == after.generation && task.phase.is_reserved(),
         (Some(old), Some(new)) => {
             before.generation == after.generation
                 && old.task_id == new.task_id
                 && old.project_id == new.project_id
-                && old.owner_id == new.owner_id
-                && old.phase != Phase::RecoveryRequired
-                && new.phase != Phase::Reserved
+                && ((old.phase.is_reserved()
+                    && new.phase == Phase::RecoveredReserved
+                    && old.owner_id != new.owner_id)
+                    || (old.owner_id == new.owner_id
+                        && old.phase != Phase::RecoveryRequired
+                        && !new.phase.is_reserved()))
         }
         (None, None) => false,
     };
@@ -928,5 +1055,167 @@ mod tests {
         drop(file);
         assert_eq!(ledger.snapshot().unwrap(), Snapshot::default());
         assert!(child(&ledger.path).wait().unwrap().success());
+    }
+
+    #[test]
+    fn recovery_preserves_task_and_fences_old_owner_and_duplicate_tickets() {
+        let ledger = fresh();
+        ledger.claim("task", "project", "old").unwrap();
+        let after = ledger
+            .recover_with("new", "task", 1, 1, false, |_| true)
+            .unwrap();
+        assert_eq!(after.generation, 1);
+        assert_eq!(after.revision, 2);
+        let task = after.active.unwrap();
+        assert_eq!(task.task_id, "task");
+        assert_eq!(task.owner_id, "new");
+        assert_eq!(task.phase, Phase::RecoveredReserved);
+        assert!(
+            ledger
+                .recover_with("another", "task", 1, 1, true, |_| true)
+                .is_err()
+        );
+        assert!(
+            ledger
+                .set_phase("old", "task", 1, 1, Phase::Running)
+                .is_err()
+        );
+        assert!(
+            ledger
+                .set_phase("old", "task", 1, 2, Phase::Running)
+                .is_err()
+        );
+        assert!(ledger.cancel_reservation("old", "task", 1, 2).is_err());
+        assert!(ledger.claim("other", "project2", "new").is_err());
+        assert!(
+            ledger
+                .cancel_reservation("new", "task", 1, 2)
+                .unwrap()
+                .active
+                .is_none()
+        );
+        assert_eq!(ledger.snapshot().unwrap().revision, 3);
+    }
+
+    #[test]
+    fn unknown_alive_and_dispatched_states_never_release() {
+        for phase in [
+            Phase::Reserved,
+            Phase::Running,
+            Phase::Verifying,
+            Phase::WaitingInput,
+            Phase::WaitingApproval,
+            Phase::Pausing,
+            Phase::RecoveryRequired,
+        ] {
+            let ledger = fresh();
+            ledger.claim("task", "project", "old").unwrap();
+            let before = if phase == Phase::Reserved {
+                ledger.snapshot().unwrap()
+            } else {
+                ledger.set_phase("old", "task", 1, 1, phase).unwrap()
+            };
+            for release in [false, true] {
+                assert!(
+                    ledger
+                        .recover_with("new", "task", 1, before.revision, release, |_| false)
+                        .is_err()
+                );
+                if phase != Phase::Reserved {
+                    assert!(
+                        ledger
+                            .recover_with("new", "task", 1, before.revision, release, |_| true)
+                            .is_err()
+                    );
+                }
+                assert_eq!(ledger.snapshot().unwrap(), before);
+            }
+        }
+        assert!(!owner_has_exited("unknown-owner"));
+        assert!(!owner_has_exited("0-1"));
+        assert!(!owner_has_exited("4294967295-1"));
+        assert!(!owner_has_exited(&format!("{}-1", std::process::id()))); // reused PID blocks
+    }
+
+    #[test]
+    fn recovery_checks_version_under_lock_and_only_one_contender_wins() {
+        let ledger = fresh();
+        ledger.claim("task", "project", "old").unwrap();
+        let barrier = Arc::new(Barrier::new(6));
+        let threads: Vec<_> = (0..6)
+            .map(|n| {
+                let ledger = ledger.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ledger.recover_with(&format!("new-{n}"), "task", 1, 1, false, |_| true)
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(ledger.snapshot().unwrap().revision, 2);
+        let before = ledger.snapshot().unwrap();
+        assert!(
+            ledger
+                .recover_with("newer", "task", 2, 2, true, |_| true)
+                .is_err()
+        );
+        assert_eq!(ledger.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn actual_exited_child_owner_can_release_a_reservation() {
+        let source = fresh();
+        let mut process = child(&source.path);
+        let pid = process.id();
+        assert!(process.wait().unwrap().success());
+        // If the OS already reused this PID, recovery conservatively blocks.
+        assert!(owner_has_exited(&format!("{pid}-1")));
+        let ledger = fresh();
+        ledger
+            .claim("task", "project", &format!("{pid}-1"))
+            .unwrap();
+        let recovered = ledger
+            .recover_reservation("current", "task", 1, 1, false)
+            .unwrap();
+        assert_eq!(recovered.active.unwrap().phase, Phase::RecoveredReserved);
+        ledger.cancel_reservation("current", "task", 1, 2).unwrap();
+        ledger
+            .claim("next", "project", &format!("{pid}-1"))
+            .unwrap();
+        assert!(
+            ledger
+                .recover_reservation("current", "next", 2, 4, true)
+                .unwrap()
+                .active
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_corruption_and_stale_versions_preserve_original_bytes() {
+        let ledger = fresh();
+        ledger.claim("task", "project", "old").unwrap();
+        let original = fs::read(&ledger.path).unwrap();
+        assert!(
+            ledger
+                .recover_with("new", "task", 1, 0, true, |_| true)
+                .is_err()
+        );
+        assert_eq!(fs::read(&ledger.path).unwrap(), original);
+        OpenOptions::new()
+            .append(true)
+            .open(&ledger.path)
+            .unwrap()
+            .write_all(b"truncated")
+            .unwrap();
+        let damaged = fs::read(&ledger.path).unwrap();
+        assert!(
+            ledger
+                .recover_with("new", "task", 1, 1, true, |_| true)
+                .is_err()
+        );
+        assert_eq!(fs::read(&ledger.path).unwrap(), damaged);
     }
 }
