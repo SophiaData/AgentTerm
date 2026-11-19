@@ -406,6 +406,167 @@ button:disabled {
   max-width: 260px;
 }
 
+.terminal-dock {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 16px;
+  background: var(--at-surface-raised);
+  border: 1px solid var(--at-border-subtle);
+  border-radius: var(--at-radius-lg);
+  padding: 14px;
+}
+
+.terminal-dock[hidden],
+.terminal-pane[hidden] {
+  display: none;
+}
+
+.terminal-dock-header,
+.terminal-actions,
+.session-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.terminal-dock-header {
+  justify-content: space-between;
+}
+
+.terminal-dock-header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.terminal-hint,
+.session-exit-reason {
+  color: var(--at-text-tertiary);
+  font-size: 12px;
+}
+
+.terminal-tabs {
+  display: flex;
+  gap: 7px;
+  overflow-x: auto;
+  padding: 3px 2px 7px;
+  scrollbar-width: thin;
+}
+
+.terminal-tab {
+  display: flex;
+  min-width: 180px;
+  max-width: 270px;
+  align-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--at-border-default);
+  border-radius: var(--at-radius-md);
+  background: #131c2d;
+}
+
+.terminal-tab.is-selected {
+  border-color: var(--at-accent);
+  background: #1b2e35;
+}
+
+.terminal-tab-choice,
+.terminal-tab-close {
+  border: 0;
+  color: var(--at-text-primary);
+  background: transparent;
+}
+
+.terminal-tab-choice {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.terminal-tab-name {
+  width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.terminal-tab-status,
+.session-state {
+  font-size: 11px;
+  color: var(--at-text-secondary);
+}
+
+.state-running {
+  color: var(--at-accent);
+}
+
+.state-finished {
+  color: var(--at-text-tertiary);
+}
+
+.state-failed {
+  color: var(--at-danger);
+}
+
+.terminal-tab-close {
+  min-height: 40px;
+  min-width: 32px;
+  font-size: 20px;
+  border-radius: var(--at-radius-sm);
+}
+
+.terminal-tab-close:hover:not(:disabled) {
+  background: var(--at-surface-hover);
+  color: var(--at-danger);
+}
+
+.terminal-pane {
+  min-width: 0;
+}
+
+.terminal-actions {
+  min-height: 32px;
+  margin-bottom: 8px;
+}
+
+.terminal-actions .message {
+  margin: 0;
+}
+
+.session-confirm {
+  flex: 1;
+  justify-content: flex-end;
+}
+
+.session-confirm > span {
+  margin-right: auto;
+  color: var(--at-warning);
+  font-size: 12px;
+}
+
+.terminal-host {
+  width: 100%;
+  height: min(50vh, 440px);
+  min-height: 260px;
+  padding: 7px;
+  overflow: hidden;
+  background: #101827;
+  border-radius: var(--at-radius-md);
+  border: 1px solid var(--at-border-default);
+}
+
+.terminal-host .xterm {
+  height: 100%;
+}
+
 .footer {
   color: var(--at-text-tertiary);
   font-size: 11px;

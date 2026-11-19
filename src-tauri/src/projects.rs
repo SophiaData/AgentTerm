@@ -189,6 +189,11 @@ impl ProjectStore {
         Self::at_path(Some(path))
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_save_for_test(&self) {
+        self.fail_next_save.store(true, Ordering::SeqCst);
+    }
+
     /// Refresh before every operation so TUI and GUI observe each other's edits.
     /// Malformed/unsupported configs are never silently replaced with an empty list.
     fn lock_latest(&self) -> Result<MutexGuard<'_, StoreData>, String> {

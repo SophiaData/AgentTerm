@@ -1,6 +1,6 @@
 # AgentTerm
 
-集中管理 Claude Code、Codex、Agy 等 AI CLI 的轻量启动器。桌面 GUI 采用 Tauri 2 + Rust + 原生 TypeScript/CSS（无 React 或其他 UI 框架），终端 TUI 采用 Rust + Ratatui。支持 macOS Apple Silicon 与 Windows x64。CLI 在系统原生终端运行，而不是在桌面窗口内嵌显示。
+集中管理 Claude Code、Codex、Agy 等 AI CLI 的轻量会话管理器。桌面 GUI 采用 Tauri 2 + Rust + 原生 TypeScript/CSS（无 React 等 UI 框架），按需加载 xterm.js 展示受管 PTY 终端；终端 TUI 采用 Rust + Ratatui。支持 macOS Apple Silicon 与 Windows x64。
 
 ## 本地启动
 
@@ -28,7 +28,7 @@ pnpm check
 
 ## 使用方式
 
-桌面版：添加项目 → 选择项目 → 选择已安装工具 → 点击「启动终端」。macOS 打开 Terminal.app，Windows 在原生控制台运行工具；可同时启动多个独立终端窗口。桌面窗口只管理启动入口，不会监听、关闭或恢复这些原生终端中的 AI 会话。移除项目只删除应用记录，不删除本地文件夹。
+桌面版：添加项目 → 选择项目 → 选择已安装工具 → 点击「启动终端」。新终端会话在 AgentTerm 内显示，切换标签继续运行；关闭运行中会话须确认。关闭主窗口仅隐藏，不会停止会话；完全退出程序时回收其受管理的子进程。移除项目只删除应用记录，不删除文件夹。**本阶段只管理从 AgentTerm 内启动的会话**，不接管外部终端；退出进程后仍可连接会话需要后续的独立守护服务。
 
 TUI 版：在已有终端中运行 `agentterm`，选择项目和工具，交给原生 CLI；CLI 退出后返回 TUI 列表。
 

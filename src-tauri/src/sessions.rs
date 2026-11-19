@@ -2,13 +2,148 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
-use crate::projects::normalize_project_dir;
+use crate::projects::ProjectStore;
 use crate::tools::{ResolveResult, TOOL_DEFINITIONS, candidate_search_dirs, resolve_binary};
 
 const READ_BUFFER_SIZE: usize = 8192;
+const MAX_SESSION_ID_BYTES: usize = 64;
+const MAX_PTY_ROWS: u16 = 300;
+const MAX_PTY_COLS: u16 = 500;
+/// A blocked OS Read may outlive its PTY. Never allow unbounded such threads.
+const MAX_READER_THREADS: usize = 64;
+const MAX_LIFETIME_SESSION_IDS: usize = 65_536;
+
+/// Counts live reader threads (not merely sessions). A stalled read keeps its
+/// permit until the underlying OS call returns, even after stop/forget.
+struct ReaderPermit(Arc<AtomicUsize>);
+
+impl ReaderPermit {
+    fn acquire(active: &Arc<AtomicUsize>) -> Result<Self, String> {
+        // compare_exchange_weak is available on the project's Rust 1.90 MSRV.
+        let mut current = active.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_READER_THREADS {
+                return Err(
+                    "终端读取线程已达到安全上限，请重启应用释放被系统阻塞的终端资源".to_string(),
+                );
+            }
+            match active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self(Arc::clone(active))),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ReaderPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Serializes event dispatch with stop/forget. A reserved ID never becomes
+/// available again during this app lifetime, even after its buffer is deleted.
+#[derive(Default)]
+struct EventRegistry {
+    allowed: HashMap<String, bool>,
+}
+
+impl EventRegistry {
+    fn reserve(&mut self, id: &str) -> Result<(), String> {
+        if self.allowed.contains_key(id) {
+            return Err("会话 ID 已使用，请为新会话生成新 ID".to_string());
+        }
+        if self.allowed.len() >= MAX_LIFETIME_SESSION_IDS {
+            return Err("会话累计数量已达到安全上限，请重启应用".to_string());
+        }
+        self.allowed.insert(id.to_string(), true);
+        Ok(())
+    }
+
+    fn close(&mut self, id: &str) {
+        if let Some(allowed) = self.allowed.get_mut(id) {
+            *allowed = false;
+        }
+    }
+}
+
+/// Holding the lock *during* dispatch prevents a just-stopped session from
+/// emitting a late event. The same helper drives real Tauri and test sinks.
+fn dispatch_session_event(
+    registry: &Mutex<EventRegistry>,
+    id: &str,
+    dispatch: impl FnOnce(),
+) -> bool {
+    let Ok(guard) = registry.lock() else {
+        return false;
+    };
+    if guard.allowed.get(id) != Some(&true) {
+        return false;
+    }
+    dispatch();
+    true
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.is_empty()
+        || session_id.len() > MAX_SESSION_ID_BYTES
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("会话 ID 必须是 1-64 位字母、数字、横线或下划线".to_string());
+    }
+    Ok(())
+}
+
+fn validate_pty_size(rows: u16, cols: u16) -> Result<(), String> {
+    if rows == 0 || rows > MAX_PTY_ROWS || cols == 0 || cols > MAX_PTY_COLS {
+        return Err(format!(
+            "终端尺寸超出允许范围：rows=1-{MAX_PTY_ROWS}, cols=1-{MAX_PTY_COLS}"
+        ));
+    }
+    Ok(())
+}
+
+/// Once a PTY is running, history persistence is best-effort: never report
+/// a launch failure that would hide the live session from the frontend.
+fn remember_started_tool(
+    projects: &ProjectStore,
+    project_path: &str,
+    tool_id: &str,
+) -> Option<String> {
+    projects
+        .remember_last_tool(project_path, tool_id)
+        .err()
+        .map(|error| format!("会话已启动，但无法保存最近工具：{error}"))
+}
+
+fn validate_start_request(
+    projects: &ProjectStore,
+    session_id: &str,
+    tool_id: &str,
+    project_path: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<(&'static crate::tools::ToolDefinition, std::path::PathBuf), String> {
+    validate_session_id(session_id)?;
+    validate_pty_size(rows, cols)?;
+    let tool = TOOL_DEFINITIONS
+        .iter()
+        .find(|definition| definition.id == tool_id)
+        .ok_or_else(|| format!("不支持的工具：{tool_id}"))?;
+    let directory = projects.require_enabled_project(project_path)?;
+    Ok((tool, directory))
+}
 
 /// Environment variables that point child tools at an unrelated parent
 /// terminal (multiplexers) or at a server port. Inheriting them makes tools
@@ -33,6 +168,8 @@ pub struct SessionInfo {
     pub tool_id: String,
     pub tool_name: String,
     pub project_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +236,9 @@ struct PtySession {
     /// before the listener attached (e.g. Claude Code's first screen) is not
     /// lost, and so snapshot + live events can be stitched without overlap.
     buffer: Arc<Mutex<OutputBuffer>>,
+    /// Identity shared with the watcher; prevents an old worker from touching
+    /// a new session that reuses the same public ID.
+    archived: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A freshly spawned PTY with all handles still separated, so the caller can
@@ -136,20 +276,21 @@ pub fn spawn_pty(
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
 
-    let child = pair
+    let mut child = pair
         .slave
         .spawn_command(command)
         .map_err(|error| format!("无法启动终端进程：{error}"))?;
     drop(pair.slave);
 
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|error| format!("无法读取终端输出：{error}"))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|error| format!("无法写入终端：{error}"))?;
+    // A spawned child must not survive an error preparing its I/O handles.
+    let reader = pair.master.try_clone_reader().map_err(|error| {
+        abort_child(&mut *child, &*pair.master);
+        format!("无法读取终端输出：{error}")
+    })?;
+    let writer = pair.master.take_writer().map_err(|error| {
+        abort_child(&mut *child, &*pair.master);
+        format!("无法写入终端：{error}")
+    })?;
 
     Ok(SpawnedPty {
         master: pair.master,
@@ -320,8 +461,15 @@ fn kill_process_group(pgid: Option<libc::pid_t>) {
     }
 }
 
-#[cfg(not(unix))]
-fn kill_process_group(_pgid: Option<i32>) {}
+/// Clean up every failed launch, including descendants still holding the PTY.
+fn abort_child(child: &mut dyn portable_pty::Child, master: &dyn portable_pty::MasterPty) {
+    #[cfg(unix)]
+    kill_process_group(master.process_group_leader());
+    #[cfg(not(unix))]
+    let _ = master;
+    let _ = child.kill();
+    let _ = child.try_wait();
+}
 
 /// Terminate a child, distinguishing "already exited" from "termination failed".
 /// Extracted so the failure path can be exercised with a fake child (#17).
@@ -360,8 +508,18 @@ fn wait_for_drain(
     true
 }
 
+struct StartRequest<'a> {
+    session_id: &'a str,
+    tool_id: &'a str,
+    project_path: &'a str,
+    rows: u16,
+    cols: u16,
+}
+
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+    events: Arc<Mutex<EventRegistry>>,
+    reader_threads: Arc<AtomicUsize>,
     /// Last output of sessions that have already exited, keyed by session id.
     /// Kept so a view that mounts *after* the process died can still replay the
     /// final screen and learn the process is gone (instead of seeing "running").
@@ -372,6 +530,8 @@ impl Default for SessionManager {
     fn default() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            events: Arc::new(Mutex::new(EventRegistry::default())),
+            reader_threads: Arc::new(AtomicUsize::new(0)),
             finished: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -384,21 +544,36 @@ impl SessionManager {
             .map_err(|_| "会话管理暂时不可用，请重试".to_string())
     }
 
-    pub fn start(
+    /// A worker-thread spawn failure must not leave a running PTY unmanaged.
+    fn abort_start(&self, session_id: &str) {
+        if let Ok(mut sessions) = self.lock()
+            && let Some(mut session) = sessions.remove(session_id)
+        {
+            if let Ok(mut events) = self.events.lock() {
+                events.close(session_id);
+            }
+            session
+                .archived
+                .store(true, std::sync::atomic::Ordering::Release);
+            abort_child(&mut *session.child, &*session.master);
+        }
+    }
+
+    fn start(
         &self,
         app: AppHandle,
-        session_id: &str,
-        tool_id: &str,
-        project_path: &str,
-        rows: u16,
-        cols: u16,
+        projects: &ProjectStore,
+        request: StartRequest<'_>,
     ) -> Result<SessionInfo, String> {
-        let tool = TOOL_DEFINITIONS
-            .iter()
-            .find(|definition| definition.id == tool_id)
-            .ok_or_else(|| format!("不支持的工具：{tool_id}"))?;
-
-        let project_dir = normalize_project_dir(project_path)?;
+        let StartRequest {
+            session_id,
+            tool_id,
+            project_path,
+            rows,
+            cols,
+        } = request;
+        let (tool, project_dir) =
+            validate_start_request(projects, session_id, tool_id, project_path, rows, cols)?;
 
         let binary = match resolve_binary(tool.binaries, &candidate_search_dirs()) {
             ResolveResult::Found(path) => path,
@@ -414,14 +589,30 @@ impl SessionManager {
             }
         };
 
-        {
-            let sessions = self.lock()?;
-            if sessions.contains_key(session_id) {
-                return Err("会话已存在，请换一个会话再启动".to_string());
-            }
+        // A blocked OS read still occupies a worker slot after stop/forget.
+        // Reject new sessions at the cap instead of leaking threads without bound.
+        let reader_permit = ReaderPermit::acquire(&self.reader_threads)?;
+        // Keep this lock through reservation, spawn and insertion; no second
+        // start can race the same ID, even across finished/forgotten sessions.
+        let mut sessions_guard = self.lock()?;
+        if sessions_guard.contains_key(session_id) {
+            return Err("会话已存在，请换一个会话再启动".to_string());
         }
+        self.events
+            .lock()
+            .map_err(|_| "无法读取会话事件状态".to_string())?
+            .reserve(session_id)?;
 
-        let spawned = spawn_pty(&binary, &project_dir, rows, cols)?;
+        let spawned = match spawn_pty(&binary, &project_dir, rows, cols) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                // Nothing was started; allow a retry using the same ID.
+                if let Ok(mut events) = self.events.lock() {
+                    events.allowed.remove(session_id);
+                }
+                return Err(error);
+            }
+        };
         let SpawnedPty {
             master,
             child,
@@ -429,13 +620,16 @@ impl SessionManager {
             reader,
         } = spawned;
 
-        let info = SessionInfo {
+        let mut info = SessionInfo {
             id: session_id.to_string(),
             tool_id: tool.id.to_string(),
             tool_name: tool.name.to_string(),
             project_path: project_dir.display().to_string(),
+            warning: None,
         };
 
+        // Shared with each worker and stored on the record as its identity.
+        let archived = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(unix)]
         let pgid = master.process_group_leader();
         let session = PtySession {
@@ -445,6 +639,7 @@ impl SessionManager {
             child,
             writer,
             buffer: Arc::new(Mutex::new(OutputBuffer::default())),
+            archived: Arc::clone(&archived),
         };
         let buffer = Arc::clone(&session.buffer);
 
@@ -453,15 +648,13 @@ impl SessionManager {
         // always includes the final output produced just before exit (#9).
         let read_done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
 
-        // Set by the watcher once the session is archived. The reader checks it
-        // before emitting, so a descendant that keeps the PTY open cannot keep
-        // injecting output into an already-finished session (#15).
-        let archived = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        self.lock()?.insert(session_id.to_string(), session);
+        sessions_guard.insert(session_id.to_string(), session);
+        drop(sessions_guard);
 
         let sessions = Arc::clone(&self.sessions);
         let finished_buffers = Arc::clone(&self.finished);
+        let event_registry_reader = Arc::clone(&self.events);
+        let event_registry_watcher = Arc::clone(&self.events);
         let read_done_reader = Arc::clone(&read_done);
         let read_done_watcher = Arc::clone(&read_done);
         let archived_reader = Arc::clone(&archived);
@@ -474,88 +667,132 @@ impl SessionManager {
         // Reader thread: streams PTY output to the frontend as UTF-8 text and
         // keeps a replayable copy in the session buffer. The loop itself lives in
         // `pump_reader` so tests can drive the real path with controlled input.
-        std::thread::spawn(move || {
-            let mut reader = reader;
-            let mut sink = |event: SessionOutput| {
-                app_output
-                    .emit(&format!("session-output-{output_id}"), event)
-                    .is_ok()
-            };
-            pump_reader(&mut *reader, &buffer, &archived_reader, &mut sink);
-            // Signal the watcher that we have drained the PTY, so it archives a
-            // snapshot that includes every byte written before exit (#9).
-            if let Ok(mut done) = read_done_reader.0.lock() {
-                *done = true;
-                read_done_reader.1.notify_all();
-            }
-        });
+        let reader_thread = std::thread::Builder::new()
+            .name(format!("pty-reader-{session_id}"))
+            .spawn(move || {
+                let _reader_permit = reader_permit;
+                let mut reader = reader;
+                let mut sink = |event: SessionOutput| {
+                    let mut succeeded = false;
+                    dispatch_session_event(&event_registry_reader, &output_id, || {
+                        succeeded = app_output
+                            .emit(&format!("session-output-{output_id}"), event)
+                            .is_ok();
+                    }) && succeeded
+                };
+                pump_reader(&mut *reader, &buffer, &archived_reader, &mut sink);
+                // Signal the watcher that we have drained the PTY, so it archives a
+                // snapshot that includes every byte written before exit (#9).
+                if let Ok(mut done) = read_done_reader.0.lock() {
+                    *done = true;
+                    read_done_reader.1.notify_all();
+                }
+            });
+        if let Err(error) = reader_thread {
+            archived.store(true, std::sync::atomic::Ordering::Release);
+            self.abort_start(session_id);
+            return Err(format!("无法启动会话输出线程：{error}"));
+        }
 
         // Watcher thread: reports process exit and releases the session.
-        std::thread::spawn(move || {
-            let reason = loop {
-                let finished = {
-                    let mut guard = match sessions.lock() {
-                        Ok(guard) => guard,
-                        Err(_) => break "会话管理错误".to_string(),
+        let watcher_thread = std::thread::Builder::new()
+            .name(format!("pty-watcher-{session_id}"))
+            .spawn(move || {
+                let reason = loop {
+                    let exit_reason = {
+                        let mut guard = match sessions.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => break "会话管理错误".to_string(),
+                        };
+                        match guard.get_mut(&exit_id) {
+                            Some(session)
+                                if Arc::ptr_eq(&session.archived, &archived_watcher)
+                                    && !archived_watcher
+                                        .load(std::sync::atomic::Ordering::Acquire) =>
+                            {
+                                match session.child.try_wait() {
+                                    Ok(Some(status)) => Some(format!("{status}")),
+                                    Ok(None) => None,
+                                    Err(error) => {
+                                        // A persistent wait error must not poll forever with
+                                        // an unmanaged live child.
+                                        abort_child(&mut *session.child, &*session.master);
+                                        Some(format!("无法确认会话状态：{error}"))
+                                    }
+                                }
+                            }
+                            _ => break "会话已结束".to_string(),
+                        }
                     };
-                    match guard.get_mut(&exit_id) {
-                        Some(session) => session.child.try_wait().ok().flatten(),
-                        None => break "会话已结束".to_string(),
-                    }
-                };
 
-                if let Some(status) = finished {
-                    let reason = format!("{status}");
-                    // Wait for the reader thread to drain the PTY before
-                    // archiving, so the archived snapshot includes the final
-                    // output (e.g. an error printed right before exit) — #9.
-                    // But cap the total wait: if the output end stays open (e.g.
-                    // a descendant process still holds the PTY), the reader may
-                    // never hit EOF. Without a deadline the session would hang
-                    // "running" forever (#12). After the deadline we archive what
-                    // we have and release the session anyway.
-                    let drained = wait_for_drain(&read_done_watcher, DRAIN_TIMEOUT);
-                    if !drained {
-                        // The output end stayed open past the deadline: kill the
-                        // process group so the reader unblocks and releases its
-                        // PTY handle, instead of leaking it (#15).
+                    if let Some(reason) = exit_reason {
+                        // Wait for the reader thread to drain the PTY before
+                        // archiving, so the archived snapshot includes the final
+                        // output (e.g. an error printed right before exit) — #9.
+                        // But cap the total wait: if the output end stays open (e.g.
+                        // a descendant process still holds the PTY), the reader may
+                        // never hit EOF. Without a deadline the session would hang
+                        // "running" forever (#12). After the deadline we archive what
+                        // we have and release the session anyway.
+                        let _ = wait_for_drain(&read_done_watcher, DRAIN_TIMEOUT);
+                        // Even when output reached EOF, descendants that closed
+                        // their PTY can still be alive. Reap the owned process
+                        // group so a finished session cannot orphan them.
                         #[cfg(unix)]
                         if let Ok(guard) = sessions.lock()
                             && let Some(session) = guard.get(&exit_id)
+                            && Arc::ptr_eq(&session.archived, &archived_watcher)
                         {
                             let pgid = session.pgid;
                             drop(guard);
                             kill_process_group(pgid);
                         }
+                        // Mark archived BEFORE releasing the session: the reader
+                        // checks this flag and stops emitting, so late output from a
+                        // descendant cannot reach a finished session (#15).
+                        archived_watcher.store(true, std::sync::atomic::Ordering::Release);
+                        // Preserve the final buffer before releasing the session so a
+                        // late-mounting view can replay it and see the exit state.
+                        if let Ok(mut guard) = sessions.lock()
+                            && let Some(session) = guard.get(&exit_id)
+                            && Arc::ptr_eq(&session.archived, &archived_watcher)
+                        {
+                            let snapshot = session
+                                .buffer
+                                .lock()
+                                .map(|buffer| (buffer.data.clone(), buffer.end_offset))
+                                .unwrap_or_default();
+                            if let Ok(mut done) = finished_buffers.lock() {
+                                done.insert(exit_id.clone(), snapshot);
+                            }
+                            guard.remove(&exit_id);
+                        }
+                        break reason;
                     }
-                    // Mark archived BEFORE releasing the session: the reader
-                    // checks this flag and stops emitting, so late output from a
-                    // descendant cannot reach a finished session (#15).
-                    archived_watcher.store(true, std::sync::atomic::Ordering::Release);
-                    // Preserve the final buffer before releasing the session so a
-                    // late-mounting view can replay it and see the exit state.
-                    if let Ok(mut guard) = sessions.lock()
-                        && let Some(session) = guard.remove(&exit_id)
-                        && let Ok(buffer) = session.buffer.lock()
-                        && let Ok(mut done) = finished_buffers.lock()
-                    {
-                        done.insert(exit_id.clone(), (buffer.data.clone(), buffer.end_offset));
-                    }
-                    break reason;
-                }
 
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            };
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                };
 
-            let _ = app_exit.emit(
-                &format!("session-exit-{exit_id}"),
-                SessionExit {
-                    id: exit_id.clone(),
-                    reason,
-                },
-            );
-        });
+                // stop/forget may run while the watcher drains or archives.
+                // Emit only while the ID's lifetime event gate is still open.
+                // The registry lock also serializes in-flight dispatch vs close.
+                dispatch_session_event(&event_registry_watcher, &exit_id, || {
+                    let _ = app_exit.emit(
+                        &format!("session-exit-{exit_id}"),
+                        SessionExit {
+                            id: exit_id.clone(),
+                            reason,
+                        },
+                    );
+                });
+            });
+        if let Err(error) = watcher_thread {
+            archived.store(true, std::sync::atomic::Ordering::Release);
+            self.abort_start(session_id);
+            return Err(format!("无法启动会话监测线程：{error}"));
+        }
 
+        info.warning = remember_started_tool(projects, &info.project_path, &info.tool_id);
         Ok(info)
     }
 
@@ -604,6 +841,7 @@ impl SessionManager {
     }
 
     pub fn resize(&self, session_id: &str, rows: u16, cols: u16) -> Result<(), String> {
+        validate_pty_size(rows, cols)?;
         let sessions = self.lock()?;
         let session = sessions
             .get(session_id)
@@ -620,34 +858,87 @@ impl SessionManager {
     }
 
     pub fn stop(&self, session_id: &str) -> Result<(), String> {
-        // Kill first, only then drop the record. Removing before a successful
-        // kill lost the session on failure, leaving the process alive with no
-        // handle to retry from (#17).
-        {
-            let mut sessions = self.lock()?;
-            let session = sessions
-                .get_mut(session_id)
-                .ok_or_else(|| "会话不存在或已结束".to_string())?;
-            // A failed kill returns early here, leaving the session in the map so
-            // the user can retry (#17).
+        // Hold the map lock through termination and removal. The watcher must
+        // not archive/release the same child in between those two operations.
+        let mut sessions = self.lock()?;
+        if let Some(session) = sessions.get_mut(session_id) {
+            // On failure the record is still present, so the caller can retry.
             terminate_child(&mut *session.child)?;
+            // Wait for any in-flight output/exit dispatch and close its gate
+            // *before* stop can return or the watcher can dispatch again.
+            self.events
+                .lock()
+                .map_err(|_| "无法读取会话事件状态".to_string())?
+                .close(session_id);
+            session
+                .archived
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Terminate descendants too; otherwise they can keep the PTY reader
+            // alive after we discard the parent handle.
+            #[cfg(unix)]
+            kill_process_group(session.pgid);
+            sessions.remove(session_id);
+            if let Ok(mut done) = self.finished.lock() {
+                done.remove(session_id);
+            }
+            return Ok(());
         }
 
-        // Kill succeeded (or the process was already gone): now release it.
-        let session = self.lock()?.remove(session_id);
-        // Drop any finished-buffer leftover for this id so it cannot accumulate.
-        if let Ok(mut done) = self.finished.lock() {
-            done.remove(session_id);
+        // The natural-exit watcher may have won the race while the UI was
+        // closing a running tab. Stop must also clear that finished snapshot.
+        let mut finished = self
+            .finished
+            .lock()
+            .map_err(|_| "无法读取会话状态".to_string())?;
+        if finished.contains_key(session_id) {
+            self.events
+                .lock()
+                .map_err(|_| "无法读取会话事件状态".to_string())?
+                .close(session_id);
+            finished.remove(session_id);
+            Ok(())
+        } else {
+            Err("会话不存在或已结束".to_string())
         }
-        drop(session);
-        Ok(())
+    }
+
+    pub fn forget(&self, session_id: &str) -> Result<(), String> {
+        let sessions = self.lock()?;
+        if sessions.contains_key(session_id) {
+            return Err("会话仍在运行，请先结束会话".to_string());
+        }
+        let mut finished = self
+            .finished
+            .lock()
+            .map_err(|_| "无法读取会话状态".to_string())?;
+        if finished.contains_key(session_id) {
+            self.events
+                .lock()
+                .map_err(|_| "无法读取会话事件状态".to_string())?
+                .close(session_id);
+            finished.remove(session_id);
+            Ok(())
+        } else {
+            Err("会话不存在或未结束".to_string())
+        }
     }
 
     pub fn stop_all(&self) {
         if let Ok(mut sessions) = self.sessions.lock() {
-            for (_, mut session) in sessions.drain() {
-                let _ = session.child.kill();
+            // Emission is serialized against this gate; no stale event can
+            // arrive after the app has closed its sessions.
+            if let Ok(mut events) = self.events.lock() {
+                for allowed in events.allowed.values_mut() {
+                    *allowed = false;
+                }
             }
+            for session in sessions.values_mut() {
+                session
+                    .archived
+                    .store(true, std::sync::atomic::Ordering::Release);
+                abort_child(&mut *session.child, &*session.master);
+            }
+            sessions.clear();
         }
     }
 
@@ -660,9 +951,13 @@ impl SessionManager {
     }
 }
 
+// Tauri injects two State values and AppHandle alongside five IPC fields;
+// flattening those fields preserves the existing frontend invoke contract.
+#[expect(clippy::too_many_arguments, reason = "Tauri IPC argument contract")]
 #[tauri::command]
 pub fn start_session(
     state: tauri::State<'_, SessionManager>,
+    projects: tauri::State<'_, ProjectStore>,
     app: AppHandle,
     session_id: String,
     tool_id: String,
@@ -670,7 +965,17 @@ pub fn start_session(
     rows: u16,
     cols: u16,
 ) -> Result<SessionInfo, String> {
-    state.start(app, &session_id, &tool_id, &project_path, rows, cols)
+    state.start(
+        app,
+        &projects,
+        StartRequest {
+            session_id: &session_id,
+            tool_id: &tool_id,
+            project_path: &project_path,
+            rows,
+            cols,
+        },
+    )
 }
 
 #[tauri::command]
@@ -708,12 +1013,407 @@ pub fn stop_session(
     state.stop(&session_id)
 }
 
+#[tauri::command]
+pub fn forget_session(
+    state: tauri::State<'_, SessionManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state.forget(&session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
     use std::time::Duration;
 
     use super::SessionManager;
+
+    // Isolated project registry: tests must never touch the user's real config.
+    struct TempProjects(std::path::PathBuf);
+
+    impl TempProjects {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "agentterm-pty-registry-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(dir.join("registered")).unwrap();
+            Self(dir)
+        }
+
+        fn store(&self) -> crate::projects::ProjectStore {
+            crate::projects::ProjectStore::with_path(self.0.join("config/projects.json"))
+        }
+
+        fn project(&self) -> String {
+            self.0.join("registered").display().to_string()
+        }
+    }
+
+    impl Drop for TempProjects {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn start_request_requires_a_registered_project_not_just_a_directory() {
+        let dir = TempProjects::new();
+        let store = dir.store();
+        let path = dir.project();
+        let missing = super::validate_start_request(&store, "pty-1", "codex", &path, 24, 80)
+            .err()
+            .expect("existing but unregistered project must be denied");
+        assert!(missing.contains("未注册"), "got: {missing}");
+
+        let saved = store.add(&path).unwrap();
+        let (tool, canonical) =
+            super::validate_start_request(&store, "pty-1", "codex", &path, 24, 80).unwrap();
+        assert_eq!(tool.id, "codex");
+        assert_eq!(canonical.display().to_string(), saved.path);
+
+        store.remove(&saved.id).unwrap();
+        assert!(super::validate_start_request(&store, "pty-2", "codex", &path, 24, 80).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_project_allows_isolated_pty_spawn() {
+        let dir = TempProjects::new();
+        let store = dir.store();
+        let saved = store.add(&dir.project()).unwrap();
+        let (_, cwd) =
+            super::validate_start_request(&store, "pty-real", "codex", &saved.path, 24, 80)
+                .unwrap();
+        let mut pty = super::spawn_pty(std::path::Path::new("/bin/cat"), &cwd, 24, 80)
+            .expect("registered project must permit valid PTY startup");
+        pty.child.kill().unwrap();
+        let _ = pty.child.wait();
+    }
+
+    #[test]
+    fn oversized_terminal_and_untrusted_session_ids_are_denied() {
+        let dir = TempProjects::new();
+        let store = dir.store();
+        store.add(&dir.project()).unwrap();
+        for id in ["", "../escape", "event:inject", &"x".repeat(65)] {
+            assert!(
+                super::validate_start_request(&store, id, "codex", &dir.project(), 24, 80).is_err()
+            );
+        }
+        for (rows, cols) in [(0, 80), (24, 0), (301, 80), (24, 501)] {
+            assert!(
+                super::validate_start_request(&store, "ok-id", "codex", &dir.project(), rows, cols)
+                    .is_err()
+            );
+        }
+        assert!(
+            super::validate_start_request(&store, "ok-id", "sh", &dir.project(), 24, 80).is_err()
+        );
+        assert!(
+            SessionManager::default()
+                .resize("unknown", 301, 80)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn forget_only_removes_finished_snapshots_and_stop_finished_is_safe() {
+        let manager = SessionManager::default();
+        manager
+            .finished
+            .lock()
+            .unwrap()
+            .insert("finished".to_string(), ("last bytes".to_string(), 10));
+
+        assert!(!manager.snapshot("finished").unwrap().running);
+        assert!(manager.forget("finished").is_ok());
+        assert!(manager.snapshot("finished").is_err());
+        assert!(manager.forget("finished").is_err());
+
+        // Closing a running tab can race with the natural-exit watcher.
+        manager
+            .finished
+            .lock()
+            .unwrap()
+            .insert("raced".to_string(), ("done".to_string(), 4));
+        assert!(manager.stop("raced").is_ok());
+        assert!(manager.snapshot("raced").is_err());
+        assert!(manager.forget("raced").is_err());
+
+        insert_fake_session(&manager, "running", false);
+        assert!(manager.forget("running").is_err());
+        assert!(manager.is_running("running"));
+        manager.stop("running").unwrap();
+    }
+
+    #[test]
+    fn a_running_session_stays_managed_when_history_save_fails() {
+        let dir = TempProjects::new();
+        let store = dir.store();
+        store.add(&dir.project()).unwrap();
+
+        assert!(super::remember_started_tool(&store, &dir.project(), "codex").is_none());
+        assert_eq!(store.list().unwrap()[0].last_tool.as_deref(), Some("codex"));
+
+        store.fail_next_save_for_test();
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "live", false);
+        let warning = super::remember_started_tool(&store, &dir.project(), "claude")
+            .expect("save failure must become a non-fatal warning");
+        assert!(warning.contains("会话已启动"));
+        assert!(
+            manager.is_running("live"),
+            "save failure must not lose the PTY handle"
+        );
+        assert_eq!(store.list().unwrap()[0].last_tool.as_deref(), Some("codex"));
+        manager.stop("live").unwrap();
+
+        let mut info = super::SessionInfo {
+            id: "live".to_string(),
+            tool_id: "claude".to_string(),
+            tool_name: "Claude Code".to_string(),
+            project_path: dir.project(),
+            warning: None,
+        };
+        let encoded = serde_json::to_value(&info).unwrap();
+        assert!(
+            encoded.get("warning").is_none(),
+            "successful launch stays backward compatible"
+        );
+        info.warning = Some(warning);
+        let encoded = serde_json::to_value(&info).unwrap();
+        assert!(encoded["warning"].as_str().unwrap().contains("会话已启动"));
+    }
+
+    #[test]
+    fn stopped_watchers_cannot_claim_a_reused_session_id() {
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "reused", false);
+        let old_flag = manager
+            .sessions
+            .lock()
+            .unwrap()
+            .get("reused")
+            .unwrap()
+            .archived
+            .clone();
+        manager.stop("reused").unwrap();
+        assert!(old_flag.load(std::sync::atomic::Ordering::Acquire));
+        // The public ID is tombstoned for the whole application lifetime, not
+        // merely while active or retained in finished buffers.
+        assert!(manager.events.lock().unwrap().reserve("reused").is_err());
+        let mut old_watcher_called = false;
+        assert!(!super::dispatch_session_event(
+            &manager.events,
+            "reused",
+            || {
+                old_watcher_called = true;
+            }
+        ));
+        assert!(!old_watcher_called);
+    }
+
+    #[test]
+    fn controlled_exit_event_dispatch_is_serialized_with_stop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        let manager = Arc::new(SessionManager::default());
+        insert_fake_session(&manager, "event-stop", false);
+        let delivery_count = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let registry = Arc::clone(&manager.events);
+        let delivered = Arc::clone(&delivery_count);
+        let old_watcher = std::thread::spawn(move || {
+            super::dispatch_session_event(&registry, "event-stop", || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                delivered.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Simulate the exact race: an event was accepted, then stop starts.
+        // The stop must wait for this in-flight delivery to finish.
+        let stop_manager = Arc::clone(&manager);
+        let stop_thread = std::thread::spawn(move || stop_manager.stop("event-stop"));
+        release_tx.send(()).unwrap();
+        assert!(old_watcher.join().unwrap());
+        assert!(stop_thread.join().unwrap().is_ok());
+
+        // After stop returns, even an old watcher holding the same ID must
+        // never dispatch a second session-exit event.
+        let emitted = super::dispatch_session_event(&manager.events, "event-stop", || {
+            delivery_count.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(!emitted);
+        assert_eq!(delivery_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .events
+                .lock()
+                .unwrap()
+                .reserve("event-stop")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn controlled_natural_exit_event_is_suppressed_after_forget() {
+        let manager = SessionManager::default();
+        manager
+            .events
+            .lock()
+            .unwrap()
+            .reserve("event-finished")
+            .unwrap();
+        manager
+            .finished
+            .lock()
+            .unwrap()
+            .insert("event-finished".to_string(), ("tail".to_string(), 4));
+        let mut delivered = Vec::new();
+        // A naturally finished session can still emit its legitimate exit
+        // notification until the user closes that finished tab.
+        assert!(super::dispatch_session_event(
+            &manager.events,
+            "event-finished",
+            || {
+                delivered.push("session-exit-event-finished");
+            }
+        ));
+        manager.forget("event-finished").unwrap();
+        assert!(!super::dispatch_session_event(
+            &manager.events,
+            "event-finished",
+            || {
+                delivered.push("late-exit");
+            }
+        ));
+        assert_eq!(delivered, vec!["session-exit-event-finished"]);
+        assert!(
+            manager
+                .events
+                .lock()
+                .unwrap()
+                .reserve("event-finished")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn blocked_reader_keeps_a_budget_slot_until_read_returns() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+        struct BlockedReader {
+            entered: Option<mpsc::Sender<()>>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        impl std::io::Read for BlockedReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                }
+                let mut allowed = self.release.0.lock().unwrap();
+                while !*allowed {
+                    allowed = self.release.1.wait(allowed).unwrap();
+                }
+                Ok(0)
+            }
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let permit = super::ReaderPermit::acquire(&active).unwrap();
+        let archived = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let worker_release = Arc::clone(&release);
+        let worker_archived = Arc::clone(&archived);
+        let worker = std::thread::spawn(move || {
+            let _permit = permit;
+            let mut reader = BlockedReader {
+                entered: Some(entered_tx),
+                release: worker_release,
+            };
+            let buffer = Mutex::new(super::OutputBuffer::default());
+            super::pump_reader(&mut reader, &buffer, &worker_archived, &mut |_| true);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        archived.store(true, Ordering::Release);
+        // Cancel flag alone does NOT close a blocked OS read or free its fd.
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        {
+            let mut unblocked = release.0.lock().unwrap();
+            *unblocked = true;
+            release.1.notify_all();
+        }
+        worker.join().unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn reader_budget_fails_closed_at_hard_limit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut permits = Vec::new();
+        for _ in 0..super::MAX_READER_THREADS {
+            permits.push(super::ReaderPermit::acquire(&active).unwrap());
+        }
+        assert_eq!(active.load(Ordering::Acquire), super::MAX_READER_THREADS);
+        assert!(super::ReaderPermit::acquire(&active).is_err());
+        permits.pop();
+        let replacement = super::ReaderPermit::acquire(&active).unwrap();
+        drop(replacement);
+        drop(permits);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_failed_stop_remains_retryable_and_natural_exit_stop_is_safe() {
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "retry", true);
+        let flag = manager
+            .sessions
+            .lock()
+            .unwrap()
+            .get("retry")
+            .unwrap()
+            .archived
+            .clone();
+        assert!(manager.stop("retry").is_err());
+        assert!(manager.is_running("retry"));
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+        {
+            let mut guard = manager.sessions.lock().unwrap();
+            guard.get_mut("retry").unwrap().child = Box::new(FakeChild {
+                exited: false,
+                kill_fails: false,
+                kill_calls: 0,
+            });
+        }
+        assert!(manager.stop("retry").is_ok());
+        assert!(!manager.is_running("retry"));
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+
+        insert_fake_session(&manager, "exited", true);
+        {
+            let mut guard = manager.sessions.lock().unwrap();
+            guard.get_mut("exited").unwrap().child = Box::new(FakeChild {
+                exited: true,
+                kill_fails: true,
+                kill_calls: 0,
+            });
+        }
+        assert!(manager.stop("exited").is_ok());
+    }
 
     /// A child whose `kill` can be made to fail, for exercising the stop failure
     /// path without needing a real unkillable process (#17).
@@ -834,6 +1534,7 @@ mod tests {
     }
 
     fn insert_fake_session(manager: &SessionManager, id: &str, kill_fails: bool) {
+        manager.events.lock().unwrap().reserve(id).unwrap();
         let mut map = manager.sessions.lock().unwrap();
         map.insert(
             id.to_string(),
@@ -848,6 +1549,7 @@ mod tests {
                 }),
                 writer: Box::new(std::io::sink()),
                 buffer: std::sync::Arc::new(super::Mutex::new(super::OutputBuffer::default())),
+                archived: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
     }

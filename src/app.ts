@@ -1,5 +1,6 @@
 import type { Backend } from "./api";
 import { announce, button, element } from "./dom";
+import { createSessionDock } from "./terminalSessions";
 import {
   statusDetail,
   statusText,
@@ -30,6 +31,9 @@ function describeError(error: unknown): string {
 export function createApp(root: HTMLElement, api: Backend) {
   let destroyed = false;
   let desiredFocus: { action: string; id?: string } | null = null;
+  const dock = createSessionDock(api);
+  let initialized = false;
+  let workspace: HTMLElement;
   const state: AppState = {
     projects: [],
     tools: [],
@@ -232,11 +236,15 @@ export function createApp(root: HTMLElement, api: Backend) {
           ? currentProject.name + " · " + currentTool.name
           : "选择项目和工具",
       ),
-      element("span", "", "将在系统原生终端中运行，多个窗口可以并行使用。"),
+      element(
+        "span",
+        "",
+        "将在 AgentTerm 内嵌终端中运行，多个会话可并行切换。",
+      ),
     );
     launcher.append(
       summary,
-      button(state.busy ? "启动中…" : "启动终端 ↗", "launch", {
+      button(state.busy ? "启动中…" : "启动终端", "launch", {
         className: "button button-primary",
         disabled:
           !canStart ||
@@ -259,36 +267,37 @@ export function createApp(root: HTMLElement, api: Backend) {
     ) {
       desiredFocus = { action: focused.dataset.action, id: focused.dataset.id };
     }
-    const shell = element("main", "app-shell");
-    const header = element("header", "topbar");
-    const brand = element("div", "brand");
-    brand.append(
-      element("span", "brand-mark", ">_"),
-      element("span", "brand-name", "AgentTerm"),
-    );
-    const descriptor = element("span", "tagline", "轻量 AI CLI 启动器");
-    header.append(brand, descriptor);
-
-    const intro = element("div", "intro");
-    intro.append(
-      element("h1", "", "一个入口，启动你的 AI 工具"),
-      element(
-        "p",
-        "",
-        "选定项目与工具，直接交给系统终端。无需内嵌终端，也无需前端框架。",
-      ),
-    );
-
-    const workspace = element("div", "workspace");
-    workspace.append(renderProjects(), renderTools());
-    const footer = element(
-      "footer",
-      "footer",
-      "Tauri 2 · Rust · TypeScript · Native Terminal",
-    );
-
-    shell.append(header, intro, workspace, footer);
-    root.replaceChildren(shell);
+    if (!initialized) {
+      const shell = element("main", "app-shell");
+      const header = element("header", "topbar");
+      const brand = element("div", "brand");
+      brand.append(
+        element("span", "brand-mark", ">_"),
+        element("span", "brand-name", "AgentTerm"),
+      );
+      header.append(brand, element("span", "tagline", "轻量受管 AI 终端"));
+      const intro = element("div", "intro");
+      intro.append(
+        element("h1", "", "一个入口，管理你的 AI 终端"),
+        element(
+          "p",
+          "",
+          "选择项目和工具，在应用内使用真实的交互式终端。无需前端框架。",
+        ),
+      );
+      workspace = element("div", "workspace");
+      const footer = element(
+        "footer",
+        "footer",
+        "Tauri 2 · Rust PTY · Vanilla TypeScript",
+      );
+      shell.append(header, intro, workspace, dock.element, footer);
+      root.replaceChildren(shell);
+      initialized = true;
+    }
+    // Only rerender the lightweight picker panels. PTY hosts and xterm objects
+    // stay mounted across project changes, tool refreshes and tab switches.
+    workspace.replaceChildren(renderProjects(), renderTools());
     if (desiredFocus) {
       const find = (action: string, id?: string) =>
         Array.from(
@@ -412,12 +421,13 @@ export function createApp(root: HTMLElement, api: Backend) {
     state.notice = null;
     render();
     try {
-      const result = await api.launchNativeTool(tool.id, project.path);
-      if (!result.launched) throw new Error("系统终端未报告启动成功");
-      if (!result.warning) project.lastTool = tool.id;
-      state.notice = result.warning
-        ? "已在系统终端启动 " + tool.name + "，但" + result.warning
-        : "已请求在系统终端启动 " + tool.name + "。";
+      const session = await dock.launch(project, tool);
+      // A display/persistence warning does not undo a successful PTY start.
+      project.lastTool = tool.id;
+      desiredFocus = null;
+      state.notice = session.warning
+        ? "已在内嵌终端启动 " + tool.name + "，但" + session.warning
+        : "已在内嵌终端启动 " + tool.name + "。";
     } catch (error) {
       state.launchError = "无法启动终端：" + describeError(error);
     } finally {
@@ -496,6 +506,7 @@ export function createApp(root: HTMLElement, api: Backend) {
       destroyed = true;
       desiredFocus = null;
       root.removeEventListener("click", handleClick);
+      dock.destroy();
       root.replaceChildren();
     },
   };

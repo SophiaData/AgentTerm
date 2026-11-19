@@ -5,7 +5,7 @@
 - An empty codebase can pass governance checks; when code appears, empty quality commands become an error.
 - Add success, failure and relevant edge/regression cases; do not delete tests to silence failures.
 - Treat `NOT RUN`, skipped tests and blocked integration tests honestly; never claim an installed runtime was validated by static checks alone.
-- GUI 使用 Vitest + happy-dom 进行 DOM 点击、状态变化与错误回归测试；此项不等于 macOS Terminal.app 和 Windows Console 实机验收。
+- GUI 使用 Vitest + happy-dom 验证 DOM 点击、标签切换、关闭确认和错误回归；独立校验 PTY 事件和输出 byte-offset 去重、防漏。此项不等于 macOS/Windows 内嵌 CLI 实机验收。
 - Record command, status, environment and evidence in every PR.
 
 Stack examples (only use when applicable and installed): Python `python -m pytest -q`, Node `pnpm test`, Java `mvn test`, DBT `dbt test`. SQL engine tests require an appropriate isolated environment.
