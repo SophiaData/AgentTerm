@@ -1,5 +1,7 @@
 mod projects;
 mod sessions;
+mod task_commands;
+pub mod task_ledger;
 mod tools;
 mod tray;
 
@@ -12,6 +14,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(projects::ProjectStore::default())
         .manage(sessions::SessionManager::default())
+        .manage(task_commands::TaskLedgerState::default())
         .invoke_handler(tauri::generate_handler![
             tools::detect_tools,
             projects::list_projects,
@@ -21,10 +24,24 @@ pub fn run() {
             sessions::session_snapshot,
             sessions::write_session_input,
             sessions::resize_session,
-            sessions::stop_session
+            sessions::stop_session,
+            task_commands::task_ledger_initialize,
+            task_commands::task_ledger_snapshot,
+            task_commands::claim_main_task,
+            task_commands::cancel_main_task_reservation
         ])
         .setup(|app| {
             tray::install_tray(app)?;
+
+            // Fixed existing OS data directory: projects and windows cannot
+            // select separate ledgers. No directory or ledger is auto-created.
+            if let Ok(directory) = app.path().local_data_dir()
+                && let Err(error) = app
+                    .state::<task_commands::TaskLedgerState>()
+                    .configure(directory.join("agentterm-main-task-ledger.log"))
+            {
+                eprintln!("Task ledger unavailable: {error}");
+            }
 
             let window = app
                 .get_webview_window("main")
