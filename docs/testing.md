@@ -22,12 +22,21 @@ Windows NSIS 包名沿用 `AgentTerm_0.2.0-rc.1_x64-setup.exe`；验收必须同
 2026-11-20 实际安装结果为 **BLOCKED（本机安装执行权限），应用功能操作仍为 NOT RUN**：
 
 - `Get-CimInstance Win32_Process -Filter "Name='agentterm.exe'"` 无运行实例；HKCU/HKLM 卸载登记未命中 AgentTerm；`Get-Command agentterm.exe` 无命中。
-- `%LOCALAPPDATA%\AgentTerm\agentterm.exe`、`%LOCALAPPDATA%\Programs\AgentTerm\agentterm.exe`、`%ProgramFiles%\AgentTerm\agentterm.exe`、`E:\AgentTerm` 均不存在。此结论限于明确核对的入口，未全盘搜索。
+- 安装前检查时，`%LOCALAPPDATA%\AgentTerm\agentterm.exe`、`%LOCALAPPDATA%\Programs\AgentTerm\agentterm.exe`、`%ProgramFiles%\AgentTerm\agentterm.exe`、`E:\AgentTerm` 均不存在。随后按授权创建E盘专用目录，目前app子目录为空；前述不存在仅为安装前状态，未全盘搜索。
 - 包哈希与上表一致。已按授权创建 `E:\AgentTerm\app`、`runtime`、`temp`；原生安装界面回读到目标 `E:\AgentTerm\app`，报告所需9.9 MB、可用约38.1 GB。Windows已有WebView2 Runtime，未下载安装额外运行时。
 - 首次以E盘临时目录启动，原生提示 `Error writing temporary file`；21字节普通写入探针成功。使用既有Windows临时目录进入安装界面后，原生提示 `Error opening file for writing: E:\AgentTerm\app\agentterm.exe`。某次静默退出0但无安装文件/登记，因此不判成功。
 - 对同一安装进程读取非敏感令牌属性：完整性RID=4096（低）、未提升；普通探针进程RID=8192（中）。包内manifest为`requestedExecutionLevel="asInvoker"`。随后读取该EXE的强制完整性标签，文件RID同为4096、policy mask=1；`__COMPAT_LAYER`未设置，未发现针对该文件路径的AppCompat Layers项。标签由谁设置未知；未更改ACL、执行策略、文件或进程完整性级别。
 - Windows原生UI Automation根接口可用，Win32已实际读取并操作安装器按钮和目录框；未启动新浏览器/CDP。因为安装未成功，应用WebView控件和原生IPC仍未验。
-- 安装器已显示 `Installation Aborted` 并退出；`E:\AgentTerm\app`为空，未生成AgentTerm安装登记、应用进程或真实账本。目录授权已满足，不再把用户授权列为阻塞；后续需要正常受信任的安装执行环境。
+- 安装器已显示 `Installation Aborted` 并退出；`E:\AgentTerm\app`为空，未生成AgentTerm安装登记、应用进程或真实账本。目录授权已满足；后续用户也授权了下述单文件标签调整，当前阻塞为本机会话执行权限。
+- 2026-11-20 02:03执行已授权的 `icacls <该安装包> /setintegritylevel M`，返回退出码5、`Access is denied`。回读文件标签仍RID4096、policy mask=1，SHA-256保持上表值。当前进程RID8192、未提升，当前用户为文件所有者，但令牌无 `SeRelabelPrivilege`；没有成功修改标签或启动新安装器。标签调整前的元数据已备份，失败结果已保存到本地验收证据。
+
+后续操作需由用户在具备权限的管理员PowerShell中执行以下单文件命令；只调整这份安装包，主Agent随后核对标签与原哈希再启动安装。既有授权继续有效，无须重复申请。
+
+```powershell
+icacls.exe "E:\dw-modeling-template\.trash\2026-11-19\agentterm-1e5f20d-windows-x64-setup.exe" /setintegritylevel M
+```
+
+此命令本轮没有成功，管理员执行也尚未验证；不得将预期结果写为已完成。
 
 ### 本轮缓存与磁盘收尾
 
