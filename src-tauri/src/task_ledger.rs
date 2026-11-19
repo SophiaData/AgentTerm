@@ -113,6 +113,7 @@ impl From<std::io::Error> for LedgerError {
 #[derive(Debug, Clone)]
 pub struct Ledger {
     path: PathBuf,
+    guard_path: PathBuf,
 }
 
 impl Ledger {
@@ -128,12 +129,25 @@ impl Ledger {
         if path.exists() || fs::symlink_metadata(&path).is_ok() {
             validate_file_path(&path)?;
         }
-        Ok(Self { path })
+        let mut guard_name = path.as_os_str().to_owned();
+        guard_name.push(".lock");
+        let guard_path = PathBuf::from(guard_name);
+        if fs::symlink_metadata(&guard_path).is_ok() {
+            validate_file_path(&guard_path)?;
+        }
+        Ok(Self { path, guard_path })
     }
 
     /// Explicit first initialization only. Existing or empty damaged files are
     /// read as-is, never truncated or reset. No directory is created.
     pub fn initialize(&self) -> Result<Snapshot, LedgerError> {
+        self.initialize_with(|| {})
+    }
+
+    fn initialize_with(&self, after_create: impl FnOnce()) -> Result<Snapshot, LedgerError> {
+        // The stable guard exists before the data file. Readers cannot enter
+        // the create_new -> header-write window, even on first initialization.
+        let _guard = self.operation_guard(true)?;
         match OpenOptions::new()
             .read(true)
             .write(true)
@@ -141,6 +155,7 @@ impl Ledger {
             .open(&self.path)
         {
             Ok(mut file) => {
+                after_create();
                 lock(&file)?;
                 file.write_all(HEADER)?;
                 file.sync_all()?;
@@ -149,7 +164,9 @@ impl Ledger {
                 File::open(self.path.parent().ok_or(LedgerError::InvalidPath)?)?.sync_all()?;
                 Ok(Snapshot::default())
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => self.snapshot(),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.with_data_locked(read_snapshot)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -238,11 +255,49 @@ impl Ledger {
         &self,
         operation: impl FnOnce(&mut File) -> Result<T, LedgerError>,
     ) -> Result<T, LedgerError> {
+        let _guard = self.operation_guard(false)?;
+        self.with_data_locked(operation)
+    }
+
+    fn operation_guard(&self, create: bool) -> Result<File, LedgerError> {
+        let guard = if create {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&self.guard_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    validate_file_path(&self.guard_path)?;
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&self.guard_path)?
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            validate_file_path(&self.guard_path)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.guard_path)?
+        };
+        lock(&guard)?;
+        Ok(guard)
+    }
+
+    fn with_data_locked<T>(
+        &self,
+        operation: impl FnOnce(&mut File) -> Result<T, LedgerError>,
+    ) -> Result<T, LedgerError> {
         validate_file_path(&self.path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         lock(&file)?;
         // The file itself is never replaced, renamed or truncated by this API.
-        // The same OS lock covers replay, validation and durable append.
+        // All operations acquire guard then data, in that order. Neither file
+        // is replaced or removed; process exit releases locks, not occupancy.
         operation(&mut file)
     }
 }
@@ -504,6 +559,78 @@ mod tests {
             ));
         }
         assert_eq!(ledger.snapshot().unwrap().revision, 1);
+    }
+
+    #[test]
+    fn first_creation_hides_the_empty_file_from_other_operations() {
+        let ledger = Ledger::at(&fresh_path()).unwrap();
+        let creator = ledger.clone();
+        let (created_tx, created_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            creator.initialize_with(|| {
+                created_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+            })
+        });
+        created_rx.recv().unwrap();
+        // Freeze precisely after create_new and before the data-file lock.
+        let read_result = ledger.snapshot();
+        let init_result = ledger.initialize();
+        let claim_result = ledger.claim("early", "project", "owner");
+        continue_tx.send(()).unwrap();
+        thread.join().unwrap().unwrap();
+        assert!(matches!(read_result, Err(LedgerError::LockUnavailable)));
+        assert!(matches!(init_result, Err(LedgerError::LockUnavailable)));
+        assert!(matches!(claim_result, Err(LedgerError::LockUnavailable)));
+        assert_eq!(ledger.snapshot().unwrap(), Snapshot::default());
+        ledger.claim("after-init", "project", "owner").unwrap();
+    }
+
+    #[test]
+    fn simultaneous_first_initialization_never_poison_the_ledger() {
+        let ledger = Ledger::at(&fresh_path()).unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let ledger = ledger.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ledger.initialize()
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(results.iter().any(Result::is_ok));
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Ok(_) | Err(LedgerError::LockUnavailable)))
+        );
+        assert_eq!(ledger.initialize().unwrap(), Snapshot::default());
+        ledger.claim("task", "project", "owner").unwrap();
+    }
+
+    #[test]
+    fn missing_guard_does_not_make_reading_create_files() {
+        let ledger = Ledger::at(&fresh_path()).unwrap();
+        assert!(matches!(
+            ledger.snapshot(),
+            Err(LedgerError::NotInitialized)
+        ));
+        assert!(!ledger.path.exists());
+        assert!(!ledger.guard_path.exists());
+        // An empty guard is normal after a process dies before data creation.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&ledger.guard_path)
+            .unwrap();
+        assert_eq!(ledger.initialize().unwrap(), Snapshot::default());
     }
 
     #[test]
