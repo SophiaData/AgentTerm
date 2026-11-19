@@ -263,30 +263,38 @@ mod tests {
     use super::{App, Prompt, Screen};
     use crate::store::ProjectStore;
     use crossterm::event::KeyCode;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(0);
+
+    /// Reserve an unused directory atomically, including when tests run in parallel.
+    fn unique_test_dir(label: &str) -> PathBuf {
+        loop {
+            let sequence = NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "agentterm-app-{label}-{}-{}-{sequence}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("无法创建测试隔离目录 {}：{error}", dir.display()),
+            }
+        }
+    }
 
     fn temp_dir(label: &str) -> String {
-        let dir = std::env::temp_dir().join(format!(
-            "agentterm-app-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.to_string_lossy().into_owned()
+        unique_test_dir(label).to_string_lossy().into_owned()
     }
 
     /// An app whose store lives in a private temp file, never the real config.
     fn isolated_app(label: &str) -> App {
-        let cfg = std::env::temp_dir().join(format!(
-            "agentterm-app-cfg-{label}-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let cfg = unique_test_dir(&format!("cfg-{label}")).join("projects.json");
         App::from_store(ProjectStore::with_path(cfg))
     }
 
@@ -295,6 +303,33 @@ mod tests {
         app.store.projects.clear();
         app.add_project_path(&temp_dir("solo"));
         app
+    }
+
+    #[test]
+    fn test_paths_are_unique_for_parallel_callers() {
+        use std::collections::HashSet;
+
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let app = isolated_app("parallel");
+                    let cfg = app.store.bound_path().unwrap().to_path_buf();
+                    let project_dir = PathBuf::from(temp_dir("parallel"));
+                    assert!(cfg.parent().unwrap().is_dir());
+                    assert!(!cfg.exists(), "config must start without old test data");
+                    assert!(project_dir.is_dir());
+                    (cfg, project_dir)
+                })
+            })
+            .collect();
+
+        let mut paths = HashSet::new();
+        for handle in handles {
+            let (cfg, project_dir) = handle.join().unwrap();
+            assert!(paths.insert(cfg), "config paths must not overlap");
+            assert!(paths.insert(project_dir), "project paths must not overlap");
+        }
+        assert_eq!(paths.len(), 64);
     }
 
     #[test]
