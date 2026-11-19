@@ -6,7 +6,7 @@ mod sessions;
 mod tools;
 mod tray;
 
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 
 pub const PRODUCT_NAME: &str = "AgentTerm";
 
@@ -28,6 +28,14 @@ pub fn run() {
             sessions::forget_session
         ])
         .setup(|app| {
+            // A single Rust-level reaper must be ready before any managed PTY
+            // can start. If its thread fails to boot, startup fails closed.
+            let event_app = app.handle().clone();
+            app.state::<sessions::SessionManager>()
+                .start_reaper(move |exit| {
+                    let _ = event_app.emit(&format!("session-exit-{}", exit.id), exit);
+                })
+                .map_err(std::io::Error::other)?;
             tray::install_tray(app)?;
 
             let window = app
@@ -48,8 +56,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("AgentTerm should build")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                app.state::<sessions::SessionManager>().stop_all();
+            if let tauri::RunEvent::ExitRequested { api, .. } = event
+                && let Err(error) = app.state::<sessions::SessionManager>().stop_all()
+            {
+                // Tauri 2.12 dispatches this before completing a normal exit.
+                // Synchronous prevention is required; logging alone is unsafe.
+                api.prevent_exit();
+                tray::report_shutdown_error(app, &error);
             }
         });
 }
