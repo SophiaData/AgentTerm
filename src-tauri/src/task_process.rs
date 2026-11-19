@@ -67,8 +67,11 @@ pub(crate) fn run(spec: ProcessSpec, timeout: Duration) -> Result<Vec<u8>, Proce
     let mut child = command.spawn().map_err(|_| ProcessError::Start)?;
     if scope.attach(&child).is_err() {
         let _ = child.kill();
-        let _ = child.wait();
-        return Err(ProcessError::Start);
+        return Err(if reap(&mut child) {
+            ProcessError::Start
+        } else {
+            ProcessError::StopUnconfirmed
+        });
     }
     let mut stdin = child.stdin.take().ok_or(ProcessError::Input)?;
     let mut stdout = child.stdout.take().ok_or(ProcessError::OutputRead)?;
@@ -426,6 +429,7 @@ mod tests {
     }
     #[test]
     #[ignore = "subprocess fixture invoked by runtime tests"]
+    #[allow(clippy::zombie_processes)] // This fixture intentionally leaves a child for containment.
     fn process_fixture() {
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input).unwrap();
@@ -503,6 +507,9 @@ mod tests {
     #[test]
     fn surviving_descendant_blocks_handoff() {
         let result = run(spec("descendant"), Duration::from_secs(5));
+        #[cfg(windows)]
+        assert_eq!(result, Err(ProcessError::Descendants));
+        #[cfg(unix)]
         assert!(matches!(
             result,
             Err(ProcessError::Descendants | ProcessError::StopUnconfirmed)

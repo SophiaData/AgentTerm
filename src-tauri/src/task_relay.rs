@@ -194,15 +194,24 @@ fn phase(
     current: &Snapshot,
     next: Phase,
 ) -> Result<Snapshot, RelayError> {
-    ledger
-        .set_phase(
+    let mut lock_retries = 0;
+    loop {
+        match ledger.set_phase(
             &ticket.owner_id,
             &ticket.task_id,
             ticket.generation,
             current.revision,
             next,
-        )
-        .map_err(ledger_error)
+        ) {
+            Err(crate::task_ledger::LedgerError::LockUnavailable) if lock_retries < 4 => {
+                // Only contention before a transaction may be retried. Never
+                // retry I/O with an unknown commit state, or a CLI invocation.
+                lock_retries += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result.map_err(ledger_error),
+        }
+    }
 }
 
 fn run_with(
