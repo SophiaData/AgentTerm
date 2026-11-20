@@ -614,17 +614,14 @@ impl SessionManager {
                     }
                     if let Ok(history_guard) = history_writer.lock()
                         && let Some(history) = history_guard.as_ref()
-                    {
-                        if let Err(error) = history.record_end(
+                        && let Err(error) = history.record_end(
                             &exit_id,
                             now_ms(),
                             Some(reason.clone()),
                             archived_bytes,
-                        ) {
-                            eprintln!(
-                                "AgentTerm could not persist session end for {exit_id}: {error}"
-                            );
-                        }
+                        )
+                    {
+                        eprintln!("AgentTerm could not persist session end for {exit_id}: {error}");
                     }
                     break reason;
                 }
@@ -747,9 +744,9 @@ impl SessionManager {
         let killed: Vec<String> = if let Ok(mut sessions) = self.sessions.lock() {
             sessions
                 .drain()
-                .filter_map(|(id, mut session)| {
+                .map(|(id, mut session)| {
                     let _ = session.child.kill();
-                    Some(id)
+                    id
                 })
                 .collect()
         } else {
