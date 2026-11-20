@@ -468,8 +468,12 @@ mod tests {
     #[test]
     fn root_like_paths_still_have_a_display_name() {
         let root = if cfg!(windows) { "C:\\" } else { "/" };
+        let expected = if cfg!(windows) { r"\\?\C:\" } else { "/" };
 
-        assert_eq!(project_name(&normalize_project_dir(root).unwrap()), root);
+        assert_eq!(
+            project_name(&normalize_project_dir(root).unwrap()),
+            expected
+        );
     }
 
     fn store_path() -> PathBuf {
