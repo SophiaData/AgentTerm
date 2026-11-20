@@ -40,7 +40,6 @@ export function connectSession(
   const pending: Chunk[] = [];
   const input: { data: string; bytes: number }[] = [];
   const subscriptions: (() => void)[] = [];
-  let timer: ReturnType<typeof setTimeout> | undefined;
 
   const dispose = () => {
     active = false;
@@ -93,7 +92,7 @@ export function connectSession(
   };
 
   callbacks.phase("connecting", null);
-  timer = setTimeout(
+  const timer = setTimeout(
     () => fail("终端连接超时。会话可能仍在运行，请重新连接显示。"),
     10_000,
   );
