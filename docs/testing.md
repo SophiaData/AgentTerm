@@ -2,22 +2,22 @@
 
 ## 验收现状与下一项（2026-11-20）
 
-应用代码证据绑定 `1e5f20d9475bca1a8aa2a1a11f98075d2ecc623e`，对应未合并草稿 PR #27；后续文档更新不代表安装包已按新文档提交重新运行。开发与复核由主 Agent 串行完成，未调用子 Agent；本轮结论为主 Agent 自检。
+当前B1原生包绑定 `6deebcf73f080953387edae4458acea999e0ba13`，完整CI绑定 `e24ecfdd1b329b380436487cabfad0005deb5eff`，对应未合并草稿 PR #28。两提交之间只有两个Windows测试修正，运行时代码相同；后续文档更新不代表重新打包或运行。下方A1保留旧应用 `1e5f20d9475bca1a8aa2a1a11f98075d2ecc623e` 的历史证据。开发与复核由主 Agent 串行完成，未调用子 Agent，属于主 Agent 自检。
 
-| 验证表面       | 证据                                                                                | 当前结论                                                            | 不能代替                               |
-| -------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------- | -------------------------------------- |
-| 仓库质量门     | run `44566178018`；13项配置检查，Rust102/前端30/TUI17；2个 ignored 为子进程测试入口 | PASS                                                                | 真实 CLI、原生桌面交互                 |
-| Windows 前端   | 同 run 的 `windows-frontend`；30项测试、类型检查与构建                              | PASS                                                                | Windows WebView、原生文件选择          |
-| 浏览器交互     | 同提交的 CI 页面构建；现有 Playwright Extension、DOM 事件、模拟 IPC；14项           | PASS（模拟后端）                                                    | 原生账本、文件系统、真实权限与生产边界 |
-| Windows 打包   | run `44566248894`；NSIS artifact `14549924822` 与 TUI artifact `14551448972`        | 构建/安装成功；Windows原生主要流程通过，重启项目列表有缺口          | 原生功能验收、用户验收                 |
-| macOS 打包     | 同 run 两次尝试的 desktop/TUI jobs；check annotations                               | 两次均CANCELLED：arm64 runner容量不足，未执行构建步骤；停止连续重试 | 没有已验证成功包，也没有真机验收       |
-| 原生接力与恢复 | 两种 CLI 原生账号/权限、受管按钮、暂停/恢复                                         | NOT RUN / 尚未实现的部分见台账                                      | 离线测试进程不是真实 Agent             |
+| 验证表面             | 证据                                                       | 当前结论                                               | 不能代替                  |
+| -------------------- | ---------------------------------------------------------- | ------------------------------------------------------ | ------------------------- |
+| 仓库质量门           | run `44664995322`；13项检查，Linux Rust120/前端32/TUI17    | PASS；2个ignored为被父测试调用的子进程入口             | 真实CLI、原生桌面交互     |
+| Windows 后端与前端   | 同run的 `windows-frontend`；Rust111/前端32、类型检查与构建 | PASS；后端另有2个ignored子进程入口                     | WebView与原生文件选择     |
+| 浏览器交互历史       | A1应用1e5f20d的CI页面，Playwright Extension、模拟IPC，14项 | PASS；仅属于旧前端                                     | B1恢复命令及真实文件系统  |
+| Windows 打包/原生    | run `44657066531`；NSIS artifact `14593348909`             | 包/安装成功；B1保存、重启、预留接管/释放通过，见本节末 | 用户验收、完整暂停与恢复  |
+| macOS 打包           | 同run desktop/TUI均成功，DMG artifact `14594266165`        | PASS；此前容量阻塞解除，Mac原生NOT RUN                 | 真机交互与权限验收        |
+| 原生接力与运行中恢复 | 两种CLI账号/权限、受管按钮、停止与接续                     | NOT RUN / 尚未实现                                     | 离线测试进程不是真实Agent |
 
-Windows NSIS 包名沿用 `AgentTerm_0.2.0-rc.1_x64-setup.exe`；验收必须同时核对 run、提交和 SHA-256，不能只看版本名。文件为 2,337,722 bytes，SHA-256 `f5f3e35105405e2065e04f1c423315240b1a1e1f1b371dbb26082e6f565cbbf8`。未正式发布。
+Windows NSIS 包名沿用 `AgentTerm_0.2.0-rc.1_x64-setup.exe`；验收必须同时核对run、提交和SHA-256，不能只看版本名。当前B1包2,365,118 bytes，SHA-256 `ba35c63d81ee2214d63688ef2aa8de9af6caa92a04950dedce331cee0bfbfb98`。A1历史包为2,337,722 bytes，SHA-256 `f5f3e35105405e2065e04f1c423315240b1a1e1f1b371dbb26082e6f565cbbf8`。均未正式发布。
 
 ### A1 Windows 原生桌面结果（2026-11-20）
 
-应用代码仍为上表 `1e5f20d`，本轮原生控件由Windows UI Automation/Win32操作，调用真实原生IPC与文件系统；没有模拟IPC、启动新浏览器/CDP或调用子Agent。主实例PID38224、竞争实例30532、重启实例33872；收尾均已退出。
+本段A1专属应用代码为 `1e5f20d`，历史原生控件由Windows UI Automation/Win32操作，调用真实原生IPC与文件系统；没有模拟IPC、启动新浏览器/CDP或调用子Agent。主实例PID38224、竞争实例30532、重启实例33872；收尾均已退出。
 
 此前安装被Low完整性标签阻塞；用户处理后，02:15回读安装包标签为Medium（RID8192），SHA-256与上表一致。安装器PID3188退出0，实际安装 `E:\AgentTerm\app\agentterm.exe`（10,345,984 bytes，SHA-256 `3c57eef2c47dd081b30e4601d1ecbf1ce17560570af76f1bd12985f6073f455a`）与卸载程序。应用窗口实际打开；不再把安装权限列为当前阻塞。安装器退出太快，本轮未采集其进程完整性令牌，不将文件标签值冒充进程测量。
 
@@ -32,7 +32,7 @@ Windows NSIS 包名沿用 `AgentTerm_0.2.0-rc.1_x64-setup.exe`；验收必须同
 | 6b   | 重启后项目页显示“还没有项目”                                                                                                                                        | GAP：#6最小项目持久化并入#12恢复集成         |
 | 6c   | 尝试操作托盘退出菜单但未取得可操作控件；本轮退出用受控进程终止                                                                                                      | 正常菜单退出NOT RUN，不能由异常重启替代      |
 
-A1为**部分通过**，不宣布 #9～#11、恢复闭环或M4完成。真实CLI、Mac原生、正常退出、历史任务浏览和安全恢复释放仍未验；原生冲突提示“须排队”不表示已实现队列。
+A1为**部分通过**，不宣布 #9～#11、恢复闭环或M4完成。真实CLI、Mac原生、正常退出、历史任务浏览和运行中恢复仍未验；未派发预留恢复见B1新证据。原生冲突提示“须排队”不表示已实现队列。
 
 #### 本机证据与保留占用
 
@@ -46,7 +46,7 @@ A1为**部分通过**，不宣布 #9～#11、恢复闭环或M4完成。真实CLI
 | 异常重启保留   | restarted UI快照与session中的账本SHA-256 | “待核实”；前后账本字节一致                                     |
 | 项目持久化缺口 | projects-after-restart UI快照            | “还没有项目。点击「添加项目」，选择一个本地文件夹即可开始。”   |
 
-最终保留task `task-38224-1795112161279866200-1795112776004138000`，项目 `E:\dw-modeling-template`，generation2/revision3，状态reserved、旧owner，尚未派发。默认账本为 `%LOCALAPPDATA%\agentterm-main-task-ledger.log`；两份任务文档位于同一既有目录。当前应用进程均退出，后续打开应只读待核实；只通过后续经验证的#12流程核实并恢复/释放，不删除或改用另一账本。
+A1当时保留task `task-38224-1795112161279866200-1795112776004138000`，项目 `E:\dw-modeling-template`，generation2/revision3、reserved、旧owner。默认账本为 `%LOCALAPPDATA%\agentterm-main-task-ledger.log`，文档位于同一既有目录。B1已通过新入口接管并取消该预留，再验证另一预留重启后释放；当前最终generation3/revision7、idle，原文档保留。没有删除或改用另一账本，详细新证据见B1。
 
 #### 本轮缓存与收尾
 
@@ -54,11 +54,11 @@ A1为**部分通过**，不宣布 #9～#11、恢复闭环或M4完成。真实CLI
 
 收尾核对应用及其已识别WebView进程全部退出后，逐级审查专用目录无链接，再将空temp与runtime（285个文件，72,695,077 bytes，约69.33 MiB）送系统回收站；路径已不存在。最终磁盘整体余量C约58.54/D41.82/E37.96 GiB。回收不等于物理空间释放，不把其他进程的磁盘变化归因本任务；账本、测试文档、安装文件和证据保留。`agentterm-native-cleanup.json`为回读记录。
 
-下一实现任务为B1 #12与#6最小项目持久化；正常退出需补验，异常终止、合法接续、安全释放与残留进程判定分别留证。主Agent完成声明-证据与机械检查；按用户禁止子Agent要求不调用独立评审，不称cc独立门禁PASS。
+A1发现的项目持久化与未派发恢复缺口已由下方B1切片补验；下一实现为#12受管尝试的持久启动身份与停止核实。正常退出、运行中合法接续、残留进程和完成释放分别留证。主Agent完成声明-证据与机械检查；按用户禁止子Agent要求不调用独立评审，不称cc独立门禁PASS。
 
 ### 后续验收进入条件
 
-- A2：已查明首轮取消原因并发起一次重试，见下方记录；成功后使用实际 Mac 验证 A1 的对应流程。缺 Mac 运行环境时明确保留原生未验。
+- A2：B1打包44657066531已成功取得arm64 DMG/TUI；仍需实际Mac验证原生流程，缺运行环境时保留NOT RUN。
 - A3：已完成路径/文件格式静态核查，见下方；Windows `.cmd/.ps1` 包装不符合当前适配器限制。实际启动须有明确测试入口和范围，不把产品测试当成开发委派，也不修改用户全局配置。
 - B1/B2：按 [台账](tasks.md) 的 #12/#13 覆盖暂停、启动前后崩溃、残留、重复和迟到事件、证据失效、合法完成释放；离线子进程测试与真实 Agent 验收分开。
 - B3/B4：安全停止、恢复、证据和工具权限通过后，才验证受管派发按钮、排队与两种真实 CLI 全流程。M4 仍须满足 #9～#14 原验收条件；当前报告不关闭这些功能。
@@ -69,6 +69,8 @@ A1为**部分通过**，不宣布 #9～#11、恢复闭环或M4完成。真实CLI
 首轮 job `135708662000`（desktop）与 `135708662319`（TUI）无 runner、无执行步骤；GitHub check annotations 明确报告多次未取得 hosted runner，并指出 macOS arm64 容量不足。这是调度资源失败，不是该次执行中的代码编译失败。
 
 已执行一次 `gh run rerun 44566248894 --repo SophiaData/AgentTerm --failed`，应用提交仍为`1e5f20d`，Windows成功结果沿用。第2次desktop `135742304005`、TUI `135742303296`同样取消；annotations仍为未取得hosted runner与arm64容量不足，无构建步骤，整体failure。当前不再连续重试，不提高付费runner配置，也不重复触发Windows构建；等待runner资源可用后继续A2。
+
+后续B1候选的44598629148及修正包44657066531均四项打包成功，macOS runner构建阻塞已解除。当前应用包以6deebcf/44657066531为准；未运行Mac桌面，旧包失败记录保留。
 
 ### A3 CLI 静态前置结果
 
@@ -130,7 +132,7 @@ no new directory or deletion is needed.
 Fixtures do not authenticate or call an AI service. Record full CI and actual test
 counts in the PR. Not verified: real Claude/Cursor accounts and installed versions,
 macOS desktop interaction, CLI-side permission enforcement, escaped Unix processes,
-Windows batch wrappers (deliberately rejected), safe recovery/release or production
+Windows batch wrappers (deliberately rejected), running-attempt recovery/release or production
 tools. Task UI and persisted report artifacts now have the separate feature 11
 evidence below. The native API is not exposed to the
 renderer until those runtime permissions are accepted; #10 remains pending acceptance.
@@ -185,7 +187,7 @@ counted as a native filesystem or permission test.
 
 Unit/CI tests alone do not verify live desktop interaction; Windows component evidence is recorded in A1 above. Still unverified: macOS live WebView and file picker interaction,
 real CLI permissions and accounts, historical-task browsing, automatic refresh,
-safe recovery/release or tool-side production boundaries.
+running-attempt recovery/release or tool-side production boundaries. B1 separately verifies undispatched reservation recovery below.
 
 ## V2 gate
 
@@ -205,7 +207,7 @@ safe recovery/release or tool-side production boundaries.
 
 - 本地Windows独立账本：`rustc --edition 2024 --test src-tauri/src/task_ledger.rs --crate-name task_ledger -o <existing-directory>/ledger-tests.exe`；`ledger-tests.exe --test-threads=1` → 24 passed，1 ignored helper。真实子进程退出、旧票据/owner、并发接管、未知/存活/复用PID、运行中拒绝恢复、损坏及截断均覆盖。
 - 完整检查须执行 `pnpm check`；项目存储覆盖重开、多实例读取、连续追加与重开、重复项/未知schema/损坏/超限、截断尾部、摘要/版本不匹配、旧pending残留、锁冲突、非法目录与软链接。命令层覆盖文档保留、缺项目拒绝接管、释放保留记录、已有执行事件拒绝恢复；前端覆盖允许的按钮和运行中禁止按钮。首候选de4a28f的CI44596777931与打包44598629148全部通过；本机安装后的项目存储rename失败，见下方原生修正记录，不能据此判新功能通过。
-- 新包原生待验：重启后项目仍在；旧未派发任务接管后计划/产物不变且可取消；缺项目先重新登记；第二个仍在运行的实例不能抢占；明确释放后可建新任务；损坏项目文件应显示错误且不覆盖。真实OS默认账本只通过新入口操作，不删除或换路径。
+- 新包6deebcf原生通过：项目保存及重启重载；旧预留接管后计划哈希不变且可取消；第二实例接管存活owner被拒、账本字节不变；取消后新建预留、异常重启仍占用、核实释放后回到可创建任务表单且文档不变。缺项目拒绝来自de4a28f原生记录；损坏/截断等由自动测试覆盖，未改真实项目文件做原生破坏试验。真实默认账本只通过产品入口操作。
 - 接管写入新阶段recoveredReserved，旧版本遇到该历史记录失败关闭；应用回滚不能直接继续使用已接管账本，需保留原件并核实。未接管的schema1历史正常读取，不静默重写。
 - 当前恢复仅限从未派发状态。正在执行/验收/等待/暂停/未知状态均不由该入口释放；没有停止运行进程、撤回外部作业或自动重派的能力。正常托盘退出和最后工具记忆仍NOT RUN/未实现。
 
@@ -215,4 +217,25 @@ safe recovery/release or tool-side production boundaries.
 
 修正为同一路径受锁追加schema2完整快照，连续revision与SHA-256校验；不依赖rename。半条追加、未知版本、错摘要/重复revision一律停止且保留原文件，不静默回滚旧快照。保留1 MiB总日志/200项目上限。旧schema1单文件兼容读取并保留原字节；旧pending仍需先核实、备份，不能自动导入或清空。#6原验收标准不修改，当前替换策略与完整记忆功能的验收限制明确记录。
 
-该修正待新的CI及Windows原生验收，de4a28f失败不被覆盖为PASS。
+该修正的CI与Windows原生结果如下，de4a28f失败不被覆盖为PASS。
+
+### B1 修正包与原生结果
+
+应用6deebcf的打包run44657066531全部成功。Windows archive artifact14593348909共2,365,300 bytes，SHA-256 `3b10e71dd5d507e1263c51c7c740dca413459ea44ed4f99044366b3b73d413bc`；单一NSIS文件2,365,118 bytes，摘要见本页首段。静默安装退出0，`E:\AgentTerm\app\agentterm.exe`为10,458,624 bytes，SHA-256 `191a5c846226bd43f696c4cf9d7e03917e73ad20b98e5fc53e8486c8de52cf63`。安装前应用、默认账本及旧任务文档已备份。
+
+CI44664995322绑定e24ecfdd：13项检查通过，Linux后端120/Windows后端111/前端32/TUI17；两端各2个ignored为父测试实际调用的子进程入口。6deebcf→e24ecfdd仅补测试FakeChild的Windows句柄方法与规范根路径期望，不改运行时代码。首次新增Windows后端检查发现的编译/断言失败保留为失败记录，未跳过测试。
+
+| 原生步骤           | 实际结果                                                                                                                                  | 证据文件（统一前缀 `agentterm-recovery-journal-`）   |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| 原生选择已有项目   | schema2/revision1快照落盘，无pending；页面显示项目                                                                                        | `project-saved-uia.json`                             |
+| 接管A1旧预留       | taskId/generation2不变，revision3→4、recoveredReserved；计划SHA-256仍为`376bfcd884d8d6483101a0981dad1b5710f3f32a1ad614591292b4c51afcfffb` | `takeover-uia.json`、`acceptance.json`               |
+| 存活进程阻止抢占   | PID21188仍在时，PID35028请求接管被后端拒绝；账本SHA-256仍为`e2186f6848c597811beefd2e864b099438da3ba90b57276c033446d02e3fd3fa`             | `live-owner-blocked-uia.json`、`second-session.json` |
+| 取消后新建预留     | revision5为idle，随后generation3/revision6为reserved                                                                                      | `cancel-uia.json`、`release-plan-uia.json`           |
+| 受控异常终止后重开 | PID38764显示同一taskId待核实；项目列表重载成功                                                                                            | `restarted-uia.json`、`restarted-projects-uia.json`  |
+| 明确核实释放       | generation3/revision7为idle；任务文档和项目文件哈希不变，创建表单重新可用                                                                 | `released-uia.json`、`restart-evidence.json`         |
+
+第二实例接管被拒后，错误态按现有规则禁用任务操作，需刷新再重试；后续“释放”点击因按钮禁用未实际提交，不记为另一项原生拒绝测试。选择项目时先确认应用窗口在前台，再核对实际选中值；只给控件焦点而未激活窗口的键盘操作未算通过。未启动真实CLI，未写生产或Teambition。
+
+证据目录仍为既有 `E:\dw-modeling-template\.trash\2026-11-19`。当前账本idle、文档保留；受控终止测试应用后，其7个已识别应用/WebView进程均退出。将72,777,786 bytes（约69.41 MiB）专用WebView缓存和空temp送回收站；11:10磁盘回读C57.46/D41.82/E35.46 GiB。回收不算物理空间释放。汇总为 `agentterm-recovery-journal-acceptance.json`、`agentterm-recovery-journal-cleanup.json`，CI为 `agentterm-recovery-ci-evidence.json`。
+
+此切片不关闭#6/#12或M4。正常托盘退出、Mac原生、真实CLI权限、运行中停止/接续与外部作业撤销仍NOT RUN/未实现。下一项先实现启动意图、实际启动身份和停止确认，并测试崩溃窗口、残留、重复请求和迟到回报；未知状态继续占用。
