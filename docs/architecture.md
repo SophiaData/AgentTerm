@@ -195,6 +195,14 @@ OS确认旧PID不存在或句柄已结束后，在同一账本锁下CAS追加恢
 
 ### 主入口纠正：项目与CLI会话（2026-11-20）
 
-用户截图明确CLI Agent会话为主要交互对象。App默认渲染项目侧栏、CLI启动区和已启动的SessionPanel；任务记录作为按需挂载的辅助抽屉，不初始化台账也能启动手动CLI。开关抽屉不卸载SessionPanel，输入、审批与快捷键继续由原CLI处理。后续本轮多会话改动将useLauncher改为按sessionId维护的集合：独立运行/退出/关闭错误、当前选择和启动/停止互斥；选择标签不调用进程命令。所有SessionPanel以固定sessionId挂载，非当前面板hidden且禁用输入，后台输出/退出订阅继续保留。新建页不卸载现有终端。自然退出保留输出；用户关闭后forget_session仅在没有活进程时释放该ID的后端回放，其他会话不受影响。持久会话resume、分屏和外部运行进程连接仍待实现。
+用户截图明确CLI Agent会话为主要交互对象。App默认渲染项目侧栏、CLI启动区和已启动的SessionPanel；任务记录作为按需挂载的辅助抽屉，不初始化台账也能启动手动CLI。开关抽屉不卸载SessionPanel，输入、审批与快捷键继续由原CLI处理。后续本轮多会话改动将useLauncher改为按sessionId维护的集合：独立运行/退出/关闭错误、当前选择和启动/停止互斥；选择标签不调用进程命令。所有SessionPanel以固定sessionId挂载，非当前面板hidden且禁用输入，后台输出/退出订阅继续保留。新建页不卸载现有终端。自然退出保留输出；用户关闭后forget_session仅在没有活进程时释放该ID的后端回放，其他会话不受影响。持久会话resume和外部运行进程连接仍待实现；分屏本轮改动如下。
 
 状态只显示已有进程运行/退出证据；待审批、后台作业、Agent完成等语义后续由具体CLI受验证协议提供，不用任意日志关键词冒充。已有工作台与手动CLI尚未自动关联，抽屉明确提示。打包流程max-parallel=1、Cargo单job且TUI等待desktop；可选只构建Windows桌面用于逐轮验收。
+
+### 双终端分屏与焦点（2026-11-20）
+
+会话集合与布局分开：paneIds最多两个已有sessionId，activeId只标识当前输入面板；showLauncher暂时隐藏布局但保留paneIds。select已可见会话只切焦点，选择隐藏会话只替换当前格；从新建页启动时替换右侧。split优先同项目的另一会话，不发起CLI；single只隐藏另一侧；关闭后从当前布局移除该ID，其他会话和输出不变。
+
+SessionWorkspace始终在同一父节点按sessionId挂载全部SessionPanel，分屏、单屏和新建页只改变grid位置与hidden，避免重建xterm。TerminalView的visible负责输入可用性和尺寸同步，focused/focusRequest只控制显式切换时的输入焦点；点击面板按钮更新当前面板但不把键盘焦点抢回终端。两个可见终端各自观察尺寸，隐藏终端不提交零尺寸，后台退出保持最后屏幕。
+
+分隔线采用Pointer Capture，指针up/cancel释放；容器小于720px改上下排列，比例30～70%，键盘Home/End/方向键和双击/Enter可调整或复位。布局在本次窗口内保留，不写全局配置；不宣称应用重启恢复或后台服务存活。原生测试不得全局注入键盘，不以CI或模拟IPC替代真实CLI审批验收。

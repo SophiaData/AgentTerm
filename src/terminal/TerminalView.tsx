@@ -4,7 +4,9 @@ import type { SessionInfo } from "./types";
 
 type Props = {
   session: SessionInfo;
-  active: boolean;
+  visible: boolean;
+  focused: boolean;
+  focusRequest: number;
   running: boolean;
   busy: boolean;
   onExit: (id: string, reason: string) => void;
@@ -12,14 +14,16 @@ type Props = {
 
 export default function TerminalView({
   session,
-  active,
+  visible,
+  focused,
+  focusRequest,
   running,
   busy,
   onExit,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const current = useRef({ active, running, busy, onExit });
-  current.current = { active, running, busy, onExit };
+  const current = useRef({ visible, focused, running, busy, onExit });
+  current.current = { visible, focused, running, busy, onExit };
   const controls = useRef<{
     focus: () => void;
     scroll: () => void;
@@ -69,19 +73,19 @@ export default function TerminalView({
       const input = () => {
         terminal.options.disableStdin =
           localPhase !== "ready" ||
-          !current.current.active ||
+          !current.current.visible ||
           !current.current.running ||
           current.current.busy;
       };
       const focus = () => {
-        if (current.current.active && localPhase === "ready") terminal.focus();
+        if (current.current.visible && localPhase === "ready") terminal.focus();
       };
       let lastSize = "";
       const resize = () => {
         const host = hostRef.current;
         if (
           disposed ||
-          !current.current.active ||
+          !current.current.visible ||
           !host ||
           host.clientHeight < 80 ||
           host.clientWidth < 160
@@ -146,7 +150,7 @@ export default function TerminalView({
                 requestAnimationFrame(() => {
                   if (disposed) return;
                   resize();
-                  focus();
+                  if (current.current.focused) focus();
                 }),
               );
             }
@@ -159,7 +163,7 @@ export default function TerminalView({
       cleanups.push(transport.dispose);
       const data = terminal.onData((text) => {
         if (
-          current.current.active &&
+          current.current.visible &&
           current.current.running &&
           !current.current.busy
         )
@@ -191,11 +195,15 @@ export default function TerminalView({
 
   useEffect(() => {
     controls.current?.input();
-    if (active) {
+    if (visible) {
       controls.current?.layout();
-      controls.current?.focus();
     }
-  }, [active, running, busy]);
+  }, [visible, running, busy]);
+
+  useEffect(() => {
+    if (current.current.visible && current.current.focused)
+      controls.current?.focus();
+  }, [focusRequest]);
 
   return (
     <div className="terminal-view">

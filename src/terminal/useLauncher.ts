@@ -15,6 +15,8 @@ export type ActiveSession = {
 type SessionState = {
   sessions: ActiveSession[];
   activeId: string | null;
+  paneIds: string[];
+  focusRequest: number;
   starting: boolean;
   closingId: string | null;
   startError: string | null;
@@ -31,6 +33,8 @@ export function createSessionStore(invoke: Invoke) {
   let state: SessionState = {
     sessions: [],
     activeId: null,
+    paneIds: [],
+    focusRequest: 0,
     starting: false,
     closingId: null,
     startError: null,
@@ -44,8 +48,58 @@ export function createSessionStore(invoke: Invoke) {
   };
   const select = (id: string) => {
     if (state.sessions.some((s) => s.info.id === id)) {
-      update({ activeId: id });
+      const paneIds = state.paneIds.includes(id)
+        ? state.paneIds
+        : state.paneIds.length === 2
+          ? state.paneIds.map((pane, index) =>
+              index ===
+              Math.max(
+                0,
+                state.paneIds.indexOf(state.activeId ?? state.paneIds[1]),
+              )
+                ? id
+                : pane,
+            )
+          : [id];
+      update({
+        activeId: id,
+        paneIds,
+        focusRequest: state.focusRequest + 1,
+      });
     }
+  };
+  // Focusing a visible pane must not steal focus from its buttons or selection.
+  const focus = (id: string) => {
+    if (
+      state.activeId !== null &&
+      state.activeId !== id &&
+      state.paneIds.includes(id)
+    )
+      update({ activeId: id });
+  };
+  const split = (partnerId?: string) => {
+    const active = state.sessions.find((s) => s.info.id === state.activeId);
+    if (!active) return;
+    const candidates = state.sessions.filter(
+      (s) => s.info.id !== active.info.id,
+    );
+    const partner = partnerId
+      ? candidates.find((s) => s.info.id === partnerId)
+      : (candidates
+          .filter((s) => s.info.projectPath === active.info.projectPath)
+          .slice(-1)[0] ?? candidates[candidates.length - 1]);
+    if (!partner) return;
+    update({
+      paneIds: [active.info.id, partner.info.id],
+      focusRequest: state.focusRequest + 1,
+    });
+  };
+  const single = () => {
+    if (state.activeId)
+      update({
+        paneIds: [state.activeId],
+        focusRequest: state.focusRequest + 1,
+      });
   };
   const showLauncher = () => update({ activeId: null, startError: null });
 
@@ -69,7 +123,8 @@ export function createSessionStore(invoke: Invoke) {
         exitReason: null,
         closeError: null,
       };
-      update({ sessions: [...state.sessions, next], activeId: info.id });
+      update({ sessions: [...state.sessions, next] });
+      select(info.id);
     } catch (error) {
       update({ startError: `无法启动会话：${errorMessage(error)}` });
     } finally {
@@ -113,13 +168,17 @@ export function createSessionStore(invoke: Invoke) {
       await invoke("forget_session", { sessionId: id });
       const index = state.sessions.findIndex((s) => s.info.id === id);
       const remaining = state.sessions.filter((s) => s.info.id !== id);
+      const panes = state.paneIds.filter((pane) => pane !== id);
+      const fallback =
+        panes[0] ??
+        remaining[Math.min(index, remaining.length - 1)]?.info.id ??
+        null;
+      const activeId = state.activeId === id ? fallback : state.activeId;
       update({
         sessions: remaining,
-        activeId:
-          state.activeId === id
-            ? (remaining[Math.min(index, remaining.length - 1)]?.info.id ??
-              null)
-            : state.activeId,
+        paneIds: panes.length ? panes : fallback ? [fallback] : [],
+        activeId,
+        focusRequest: state.focusRequest + (state.activeId === id ? 1 : 0),
       });
     } catch (error) {
       update({
@@ -147,6 +206,9 @@ export function createSessionStore(invoke: Invoke) {
       };
     },
     select,
+    focus,
+    split,
+    single,
     showLauncher,
     start,
     close,
@@ -175,6 +237,9 @@ export function useLauncher() {
     session: state.sessions.find((s) => s.info.id === state.activeId) ?? null,
     busy: state.starting || state.closingId !== null,
     select: store.select,
+    focus: store.focus,
+    split: store.split,
+    single: store.single,
     showLauncher: store.showLauncher,
     start: store.start,
     close: store.close,

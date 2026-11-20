@@ -2,7 +2,7 @@ import { useState } from "react";
 import { PRODUCT_NAME } from "./meta";
 import TaskWorkbench from "./TaskWorkbench";
 import { useProjects } from "./projects/useProjects";
-import SessionPanel from "./terminal/SessionPanel";
+import SessionWorkspace from "./terminal/SessionWorkspace";
 import { useLauncher, type ActiveSession } from "./terminal/useLauncher";
 import { badgeLabel, detailText } from "./tools/types";
 import { useTools } from "./tools/useTools";
@@ -102,7 +102,7 @@ export default function App() {
                   const recent = launcher.sessions
                     .filter((s) => s.info.projectPath === project.path)
                     .slice(-1)[0];
-                  if (recent) launcher.select(recent.info.id);
+                  if (recent) selectSession(recent);
                   else launcher.showLauncher();
                 }}
               >
@@ -218,15 +218,31 @@ export default function App() {
             <span className="workspace-context-separator">/</span>
             <strong>{currentSession ? "终端会话" : "新建会话"}</strong>
           </div>
-          <button
-            type="button"
-            className="ghost-button"
-            aria-expanded={recordsOpen}
-            aria-controls="session-records"
-            onClick={() => setRecordsOpen((open) => !open)}
-          >
-            {recordsOpen ? "收起任务记录" : "任务记录"}
-          </button>
+          <div className="workspace-topbar-actions">
+            <button
+              type="button"
+              className="ghost-button"
+              aria-pressed={launcher.paneIds.length === 2}
+              disabled={!currentSession || launcher.sessions.length < 2}
+              title="并排查看两个已有会话；选择其他会话会替换当前面板"
+              onClick={() =>
+                launcher.paneIds.length === 2
+                  ? launcher.single()
+                  : launcher.split()
+              }
+            >
+              {launcher.paneIds.length === 2 ? "返回单屏" : "分屏查看"}
+            </button>
+            <button
+              type="button"
+              className="ghost-button"
+              aria-expanded={recordsOpen}
+              aria-controls="session-records"
+              onClick={() => setRecordsOpen((open) => !open)}
+            >
+              {recordsOpen ? "收起任务记录" : "任务记录"}
+            </button>
+          </div>
         </header>
         {launcher.sessions.length ? (
           <div
@@ -291,28 +307,16 @@ export default function App() {
             </button>
           </div>
         ) : null}
-        {launcher.sessions.map((session) => (
-          <div
-            key={session.info.id}
-            className="workspace-terminal-stage"
-            id={`pane-${session.info.id}`}
-            role="tabpanel"
-            aria-labelledby={`tab-${session.info.id}`}
-            hidden={launcher.activeId !== session.info.id}
-          >
-            <SessionPanel
-              session={session.info}
-              label={session.label}
-              active={launcher.activeId === session.info.id}
-              running={session.running}
-              exitReason={session.exitReason}
-              busy={launcher.closingId === session.info.id}
-              closeError={session.closeError}
-              onClose={() => void launcher.close(session.info.id)}
-              onExit={launcher.handleExit}
-            />
-          </div>
-        ))}
+        <SessionWorkspace
+          sessions={launcher.sessions}
+          paneIds={launcher.paneIds}
+          activeId={launcher.activeId}
+          focusRequest={launcher.focusRequest}
+          closingId={launcher.closingId}
+          onFocus={launcher.focus}
+          onClose={(id) => void launcher.close(id)}
+          onExit={launcher.handleExit}
+        />
         {!currentSession ? (
           <div className="workspace-start">
             <div className="workspace-start-content">

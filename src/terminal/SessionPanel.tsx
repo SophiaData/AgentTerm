@@ -5,7 +5,9 @@ import { sessionTitle, type SessionInfo } from "./types";
 type Props = {
   session: SessionInfo;
   label: string;
-  active: boolean;
+  visible: boolean;
+  focused: boolean;
+  focusRequest: number;
   running: boolean;
   exitReason: string | null;
   busy: boolean;
@@ -17,7 +19,9 @@ type Props = {
 export default function SessionPanel({
   session,
   label,
-  active,
+  visible,
+  focused,
+  focusRequest,
   running,
   exitReason,
   busy,
@@ -27,7 +31,7 @@ export default function SessionPanel({
 }: Props) {
   const [confirmClose, setConfirmClose] = useState(false);
   return (
-    <section className="session-panel" aria-label="终端会话" hidden={!active}>
+    <section className="session-panel" aria-label="终端会话" hidden={!visible}>
       <div className="session-header">
         <div className="session-title-group">
           <span className="session-title" title={sessionTitle(session)}>
@@ -51,7 +55,7 @@ export default function SessionPanel({
         </button>
       </div>
       <p className="session-context" title={session.projectPath}>
-        {session.projectPath} · 切换会话后继续保留
+        {session.projectPath}
       </p>
       {confirmClose && running ? (
         <div className="session-confirm" role="group" aria-label="确认结束会话">
@@ -82,7 +86,9 @@ export default function SessionPanel({
       ) : null}
       <TerminalView
         session={session}
-        active={active}
+        visible={visible}
+        focused={focused}
+        focusRequest={focusRequest}
         running={running}
         busy={busy}
         onExit={onExit}

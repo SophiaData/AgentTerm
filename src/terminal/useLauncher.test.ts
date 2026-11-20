@@ -189,4 +189,153 @@ describe("independent CLI sessions", () => {
     expect(store.getSnapshot().sessions).toHaveLength(2);
     expect(store.getSnapshot().startError).toBeNull();
   });
+
+  it("splits two existing terminals without launching another process or duplicating panes", async () => {
+    const { store, invoke } = fixture();
+    await store.start(project, tool);
+    await store.start(project, tool);
+    const [a, b] = store.getSnapshot().sessions.map((s) => s.info.id);
+    store.select(a);
+    store.split(b);
+    expect(store.getSnapshot().paneIds).toEqual([a, b]);
+    expect(store.getSnapshot().activeId).toBe(a);
+    store.split(a);
+    expect(store.getSnapshot().paneIds).toEqual([a, b]);
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("focusing the other pane keeps their positions and does not request terminal focus again", async () => {
+    const { store } = fixture();
+    await store.start(project, tool);
+    await store.start(project, tool);
+    const [a, b] = store.getSnapshot().sessions.map((s) => s.info.id);
+    store.select(a);
+    store.split(b);
+    const revision = store.getSnapshot().focusRequest;
+    store.focus(b);
+    expect(store.getSnapshot().paneIds).toEqual([a, b]);
+    expect(store.getSnapshot().activeId).toBe(b);
+    expect(store.getSnapshot().focusRequest).toBe(revision);
+    store.select(a);
+    expect(store.getSnapshot().paneIds).toEqual([a, b]);
+    expect(store.getSnapshot().focusRequest).toBe(revision + 1);
+  });
+
+  it("selecting a hidden third session replaces only the focused pane", async () => {
+    const { store, invoke } = fixture();
+    await store.start(project, tool);
+    await store.start(project, tool);
+    await store.start(other, tool);
+    const [a, b, c] = store.getSnapshot().sessions.map((s) => s.info.id);
+    store.select(a);
+    store.split(b);
+    store.focus(b);
+    store.select(c);
+    expect(store.getSnapshot().paneIds).toEqual([a, c]);
+    expect(store.getSnapshot().activeId).toBe(c);
+    expect(store.getSnapshot().sessions).toHaveLength(3);
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it("single view keeps the focused terminal and leaves its partner open", async () => {
+    const { store, invoke } = fixture();
+    await store.start(project, tool);
+    await store.start(project, tool);
+    const [a, b] = store.getSnapshot().sessions.map((s) => s.info.id);
+    store.select(a);
+    store.split(b);
+    store.focus(b);
+    store.single();
+    expect(store.getSnapshot().paneIds).toEqual([b]);
+    expect(store.getSnapshot().sessions).toHaveLength(2);
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("new-session view preserves the split and a new session replaces only its right side", async () => {
+    const { store } = fixture();
+    await store.start(project, tool);
+    await store.start(project, tool);
+    const [a, b] = store.getSnapshot().sessions.map((s) => s.info.id);
+    store.select(a);
+    store.split(b);
+    store.showLauncher();
+    store.focus(b);
+    expect(store.getSnapshot().activeId).toBeNull();
+    expect(store.getSnapshot().paneIds).toEqual([a, b]);
+    await store.start(project, tool);
+    const c = store.getSnapshot().sessions[2].info.id;
+    expect(store.getSnapshot().paneIds).toEqual([a, c]);
+    expect(store.getSnapshot().activeId).toBe(c);
+  });
+
+  it("closing either split pane keeps its partner in place and returns to single view", async () => {
+    const { store } = fixture();
+    await store.start(project, tool);
+    await store.start(project, tool);
+    await store.start(other, tool);
+    const [a, b, c] = store.getSnapshot().sessions.map((s) => s.info.id);
+    store.select(a);
+    store.split(b);
+    store.focus(b);
+    await store.close(b);
+    expect(store.getSnapshot().paneIds).toEqual([a]);
+    expect(store.getSnapshot().activeId).toBe(a);
+    store.split(c);
+    await store.close(c);
+    expect(store.getSnapshot().paneIds).toEqual([a]);
+    expect(store.getSnapshot().activeId).toBe(a);
+  });
+
+  it("closing a hidden session or a failed close leaves the visible split intact", async () => {
+    const { store, invoke } = fixture();
+    await store.start(project, tool);
+    await store.start(project, tool);
+    await store.start(other, tool);
+    const [a, b, c] = store.getSnapshot().sessions.map((s) => s.info.id);
+    store.select(a);
+    store.split(b);
+    await store.close(c);
+    expect(store.getSnapshot().paneIds).toEqual([a, b]);
+    invoke.mockRejectedValueOnce(new Error("denied"));
+    invoke.mockResolvedValueOnce({ running: true });
+    await store.close(a);
+    expect(store.getSnapshot().paneIds).toEqual([a, b]);
+    expect(store.getSnapshot().activeId).toBe(a);
+  });
+
+  it("a background natural exit preserves its last screen beside the active terminal", async () => {
+    const { store } = fixture();
+    await store.start(project, tool);
+    await store.start(project, tool);
+    const [a, b] = store.getSnapshot().sessions.map((s) => s.info.id);
+    store.select(a);
+    store.split(b);
+    store.handleExit(b, "exit 1");
+    expect(store.getSnapshot().paneIds).toEqual([a, b]);
+    expect(store.getSnapshot().activeId).toBe(a);
+    expect(store.getSnapshot().sessions[1].exitReason).toBe("exit 1");
+  });
+
+  it("splitting a lone session is a no-op and unknown focus never changes selection", async () => {
+    const { store } = fixture();
+    store.split();
+    await store.start(project, tool);
+    const id = store.getSnapshot().activeId;
+    store.split();
+    store.focus("unknown");
+    store.select("unknown");
+    expect(store.getSnapshot().paneIds).toEqual([id]);
+    expect(store.getSnapshot().activeId).toBe(id);
+  });
+
+  it("prefers another terminal in the same project as the split partner", async () => {
+    const { store } = fixture();
+    await store.start(project, tool);
+    await store.start(project, tool);
+    await store.start(other, tool);
+    const [a, b] = store.getSnapshot().sessions.map((s) => s.info.id);
+    store.select(a);
+    store.split();
+    expect(store.getSnapshot().paneIds).toEqual([a, b]);
+  });
 });
