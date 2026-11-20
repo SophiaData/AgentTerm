@@ -14,13 +14,16 @@ function deferred<T>() {
 function fixture() {
   const listeners = new Map<string, (event: { payload: unknown }) => void>();
   const removed: string[] = [];
-  const invoke = vi.fn<SessionBridge["invoke"]>().mockResolvedValue({
-    data: "hello",
-    offset: 5,
-    running: true,
-  });
+  const invoke = vi
+    .fn<(command: string, args: Record<string, unknown>) => Promise<unknown>>()
+    .mockResolvedValue({
+      data: "hello",
+      offset: 5,
+      running: true,
+    });
   const bridge: SessionBridge = {
-    invoke,
+    invoke: async <T>(command: string, args: Record<string, unknown>) =>
+      (await invoke(command, args)) as T,
     listen: async <T>(
       name: string,
       listener: (event: { payload: T }) => void,
