@@ -8,9 +8,10 @@ describe("AgentTerm application shell", () => {
     const html = renderToStaticMarkup(<App />);
 
     expect(html).toContain(PRODUCT_NAME);
-    expect(html).toContain("一个主任务，逐步交付");
+    expect(html).toContain("任务工作台");
     expect(html).toContain("正在读取任务");
-    expect(html).toContain("项目与独立终端");
+    expect(html).toContain("项目与终端");
+    expect(html).not.toContain("Tauri 2");
   });
 
   it("declares exactly the macOS arm64 and Windows x64 targets", () => {

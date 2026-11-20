@@ -49,9 +49,51 @@ export type PlanInput = {
 };
 export type Preview = { id: string; sha256: string; content: string };
 
+export function emptyPlan(): PlanInput {
+  return {
+    projectId: "",
+    goal: "",
+    owner: "主 Agent",
+    scope: "",
+    outputDir: ".",
+  };
+}
+
+/** Only auto-select when there is exactly one choice and no prior selection. */
+export function selectedProject(
+  draft: PlanInput,
+  projects: { id: string }[],
+  activeProject?: string,
+): string {
+  if (activeProject) return activeProject;
+  if (draft.projectId)
+    return projects.some((project) => project.id === draft.projectId)
+      ? draft.projectId
+      : "";
+  return projects.length === 1 ? projects[0].id : "";
+}
+
+export function planProblem(input: PlanInput): string | null {
+  if (!input.projectId) return "请先选择或添加一个项目。";
+  if (!input.goal.trim()) return "请填写这次希望完成的任务。";
+  if (!input.scope.trim()) return "请说明本次允许处理的范围。";
+  if (!input.owner.trim()) return "请填写负责人。";
+  if (!input.outputDir.trim()) return "请选择一个已有的交付目录。";
+  return null;
+}
+
+/** A rejected action is retryable after a successful state read, not before. */
+export function actionsBlocked(
+  busy: boolean,
+  loading: boolean,
+  readError: string | null,
+): boolean {
+  return busy || loading || readError !== null;
+}
+
 export const phaseLabels: Record<string, string> = {
-  reserved: "已预留 · 尚未派发",
-  recoveredReserved: "已接管预留 · 尚未派发",
+  reserved: "计划已保存 · 未开始执行",
+  recoveredReserved: "已接回任务 · 未开始执行",
   running: "执行中",
   verifying: "独立验收中",
   waitingInput: "等待确认",
@@ -67,7 +109,7 @@ export const attemptLabels: Record<AttemptEvent["state"], string> = {
   running: "执行意图已登记",
   reported: "结果已提交",
   blocked: "等待补充",
-  failed: "验收未通过",
+  failed: "此步骤未通过",
   unknown: "结果待核实",
 };
 

@@ -10,6 +10,7 @@ function errorMessage(error: unknown, fallback: string): string {
 export function useProjects() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pendingRemovalId, setPendingRemovalId] = useState<string | null>(null);
 
@@ -17,12 +18,16 @@ export function useProjects() {
     projects.find((project) => project.id === pendingRemovalId) ?? null;
 
   const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const existing = await invoke<Project[]>("list_projects");
       setProjects(existing);
     } catch (error) {
       setError(errorMessage(error, "无法读取项目列表"));
+    } finally {
+      setLoading(false);
     }
   }, []);
 
@@ -90,11 +95,13 @@ export function useProjects() {
   return {
     projects,
     busy,
+    loading,
     error,
     pendingRemoval,
     add,
     requestRemove,
     cancelRemove,
     confirmRemove,
+    refresh: load,
   };
 }

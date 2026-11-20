@@ -1,10 +1,14 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { TaskCard } from "./TaskWorkbench";
+import { PlanForm, TaskCard } from "./TaskWorkbench";
 import {
   acceptSnapshot,
+  actionsBlocked,
+  emptyPlan,
   latestAttempts,
   requestOrder,
+  planProblem,
+  selectedProject,
   type AttemptEvent,
   type WorkbenchView,
 } from "./workbenchState";
@@ -126,7 +130,7 @@ describe("task workbench", () => {
       expect(html).toContain(text);
     }
     expect(html.match(/尝试 /g)).toHaveLength(1);
-    expect(html).not.toContain("取消未派发预留");
+    expect(html).not.toContain("取消这项任务");
     expect(html).toContain("不代表主任务完成");
   });
   it("recovery keeps read access but hides reference and cancellation actions", () => {
@@ -136,12 +140,13 @@ describe("task workbench", () => {
     const html = renderToStaticMarkup(
       <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
     );
-    expect(html).toContain("待核实");
-    expect(html).toContain("查看此版本");
-    expect(html).not.toContain("登记版本");
-    expect(html).not.toContain("取消未派发预留");
-    expect(html).toContain("核实并接管预留");
-    expect(html).toContain("核实并释放未派发预留");
+    expect(html).toContain("需要核实");
+    expect(html).toContain("查看内容");
+    expect(html).not.toContain("保存文件版本");
+    expect(html).not.toContain("取消这项任务");
+    expect(html).toContain("核实并接回任务");
+    expect(html).toContain("结束本次安排");
+    expect(html).not.toContain("核实并结束安排");
   });
   it("never offers reservation recovery for dispatched or unknown work", () => {
     for (const phase of [
@@ -156,8 +161,8 @@ describe("task workbench", () => {
       const html = renderToStaticMarkup(
         <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
       );
-      expect(html).not.toContain("核实并接管预留");
-      expect(html).not.toContain("核实并释放未派发预留");
+      expect(html).not.toContain("核实并接回任务");
+      expect(html).not.toContain("结束本次安排");
     }
     const current = view();
     current.ledger.active!.phase = "reserved";
@@ -166,7 +171,7 @@ describe("task workbench", () => {
     const html = renderToStaticMarkup(
       <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
     );
-    expect(html).not.toContain("核实并接管预留");
+    expect(html).not.toContain("核实并接回任务");
   });
   it("recovered reservations remain undispatched and can be cancelled by their owner", () => {
     const current = view();
@@ -174,9 +179,11 @@ describe("task workbench", () => {
     const html = renderToStaticMarkup(
       <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
     );
-    expect(html).toContain("已接管预留");
-    expect(html).toContain("取消未派发预留");
-    expect(html).not.toContain("核实并接管预留");
+    expect(html).toContain("已接回任务");
+    expect(html).toContain("取消这项任务");
+    expect(html).not.toContain("核实并接回任务");
+    expect(html).not.toContain("确认取消任务");
+    expect(html).toContain("自动执行尚未开放");
   });
   it("shows missing metadata and permits cancelling only an untouched reservation", () => {
     const current = view();
@@ -186,7 +193,7 @@ describe("task workbench", () => {
       <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
     );
     expect(html).toContain("尚无计划文档");
-    expect(html).toContain("取消未派发预留");
+    expect(html).toContain("取消这项任务");
   });
   it("escapes report/file content and never renders a preview for another task", () => {
     const current = view();
@@ -218,5 +225,80 @@ describe("task workbench", () => {
       />,
     );
     expect(stale).not.toContain("old-private-content");
+    const changedVersion = renderToStaticMarkup(
+      <TaskCard
+        {...props}
+        preview={{
+          id: "artifact-1",
+          sha256: "old",
+          content: "changed-version-content",
+        }}
+      />,
+    );
+    expect(changedVersion).not.toContain("changed-version-content");
+  });
+  it("auto-selects only an unambiguous project and never silently replaces a removed selection", () => {
+    const projects = [{ id: "/one" }, { id: "/two" }];
+    expect(selectedProject(emptyPlan(), projects)).toBe("");
+    expect(selectedProject(emptyPlan(), projects.slice(0, 1))).toBe("/one");
+    expect(
+      selectedProject(
+        { ...emptyPlan(), projectId: "/removed" },
+        projects.slice(0, 1),
+      ),
+    ).toBe("");
+    expect(selectedProject(emptyPlan(), [], "/active")).toBe("/active");
+  });
+  it("rejects whitespace-only plans without discarding the input", () => {
+    const input = {
+      ...emptyPlan(),
+      projectId: "/one",
+      goal: "核对数据",
+      scope: "本地 SQL",
+    };
+    expect(planProblem(input)).toBeNull();
+    expect(planProblem({ ...input, goal: "  \n" })).toContain("任务");
+    expect(planProblem({ ...input, scope: "  " })).toContain("范围");
+    expect(planProblem({ ...input, owner: "" })).toContain("负责人");
+    expect(planProblem({ ...input, outputDir: "" })).toContain("目录");
+    expect(planProblem({ ...input, projectId: "" })).toContain("项目");
+    expect(input.goal).toBe("核对数据");
+  });
+  it("allows correction after a rejected action only when the latest state can be read", () => {
+    expect(actionsBlocked(false, false, null)).toBe(false);
+    expect(actionsBlocked(false, false, "读取失败")).toBe(true);
+    expect(actionsBlocked(true, false, null)).toBe(true);
+    expect(actionsBlocked(false, true, null)).toBe(true);
+  });
+  it("keeps creation understandable and project addition inside the form", () => {
+    const html = renderToStaticMarkup(
+      <PlanForm
+        projects={[{ id: "/one", name: "数据项目", path: "/one" }]}
+        busy={false}
+        projectBusy={false}
+        draft={{ ...emptyPlan(), goal: "尚未保存的目标" }}
+        onDraftChange={() => {}}
+        onAddProject={() => {}}
+        onSubmit={() => {}}
+      />,
+    );
+    expect(html).toContain('value="/one" selected=""');
+    expect(html).toContain("尚未保存的目标");
+    expect(html).toContain("添加项目");
+    expect(html).toContain("保存任务计划");
+    expect(html).toContain("自动执行入口尚未开放");
+    expect(html).not.toContain("初始化本机任务账本");
+    expect(html).not.toContain("预留一个主任务");
+  });
+  it("labels failed worker attempts without misreporting a review failure", () => {
+    const current = view();
+    current.document!.events = [
+      { ...start, state: "failed", summary: "启动失败" },
+    ];
+    const html = renderToStaticMarkup(
+      <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
+    );
+    expect(html).toContain("此步骤未通过");
+    expect(html).not.toContain("验收未通过");
   });
 });

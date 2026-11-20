@@ -4,6 +4,7 @@
     -apple-system,
     BlinkMacSystemFont,
     "Segoe UI",
+    "Microsoft YaHei",
     sans-serif;
   color: #e6edf3;
   background: #0d1117;
@@ -14,7 +15,7 @@
   --color-foreground: #e6edf3;
   --color-muted: #9da7b3;
   --color-border: #30363d;
-  --color-primary: #00ff41;
+  --color-primary: #8cdec2;
 }
 
 * {
@@ -38,10 +39,11 @@ a {
 }
 
 .app-shell {
-  width: min(100%, 880px);
+  width: min(100%, 1180px);
   height: 100vh;
+  height: 100dvh;
   margin: 0 auto;
-  padding: 32px;
+  padding: 24px 32px 16px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -69,8 +71,34 @@ a {
   font-size: 15px;
 }
 
+.brand-copy {
+  display: grid;
+  gap: 3px;
+}
+.brand-copy small {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--color-muted);
+}
+.local-badge {
+  margin-left: auto;
+  color: var(--color-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
 .status-card {
-  padding: 40px 0 8px;
+  padding: 12px 0 8px;
+}
+.status-card h1 {
+  font-size: 28px;
+}
+.status-card .description {
+  margin-top: 12px;
+  font-size: 14px;
+}
+.status-card .target-list {
+  margin-top: 16px;
 }
 
 .eyebrow {
@@ -120,21 +148,34 @@ h1 {
 
 .footer {
   margin-top: auto;
-  padding-top: 40px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
   color: var(--color-muted);
-  font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 12px;
+  font-size: 11px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
 }
 
 .app-tabs {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-top: 20px;
+  margin-top: 24px;
   flex-shrink: 0;
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: 12px;
+}
+.app-tabs .ghost-button {
+  min-height: 38px;
+  padding: 8px 16px;
+  font-size: 13px;
+  border-color: transparent;
 }
 .app-tabs [aria-current="page"] {
-  border-color: var(--color-primary);
+  background: #1c302c;
+  border-color: #35574c;
   color: var(--color-primary);
 }
 .workbench,
@@ -142,10 +183,11 @@ h1 {
   min-height: 0;
   overflow-y: auto;
   flex: 1;
-  padding: 24px 4px 16px 0;
+  padding: 24px 8px 24px 0;
+  scrollbar-gutter: stable;
 }
 .workbench h1 {
-  font-size: clamp(24px, 4vw, 36px);
+  font-size: 24px;
   letter-spacing: -0.03em;
 }
 .workbench .eyebrow {
@@ -153,15 +195,15 @@ h1 {
 }
 .task-card,
 .task-form {
-  margin-top: 24px;
-  padding: 20px;
+  margin-top: 16px;
+  padding: 24px;
   border: 1px solid var(--color-border);
   border-radius: 12px;
   background: var(--color-surface);
 }
 .task-card h3 {
-  margin: 24px 0 12px;
-  font-size: 16px;
+  margin: 0 0 10px;
+  font-size: 14px;
   overflow-wrap: anywhere;
 }
 .task-id,
@@ -190,13 +232,23 @@ h1 {
   overflow-wrap: anywhere;
 }
 .task-steps {
-  padding-left: 24px;
+  list-style: none;
+  padding: 0;
+  margin: 16px 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
 }
 .task-steps li {
-  margin: 16px 0;
+  display: flex;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  font-size: 13px;
 }
 .task-assignee {
-  margin-left: 12px;
+  margin: 6px 0 0;
   font-size: 12px;
 }
 .task-attempt {
@@ -220,6 +272,11 @@ h1 {
   display: grid;
   gap: 16px;
 }
+.task-form {
+  margin: 0;
+  align-content: start;
+  gap: 22px;
+}
 .task-form label,
 .artifact-form label {
   display: grid;
@@ -239,6 +296,22 @@ h1 {
   color: var(--color-foreground);
   font: inherit;
 }
+.task-form input:focus,
+.task-form select:focus,
+.task-form textarea:focus,
+.artifact-form input:focus {
+  border-color: var(--color-primary);
+}
+.task-form input:disabled,
+.task-form select:disabled,
+.task-form textarea:disabled {
+  opacity: 0.6;
+}
+.task-form input::placeholder,
+.task-form textarea::placeholder,
+.artifact-form input::placeholder {
+  color: #7d8996;
+}
 .task-form textarea {
   resize: vertical;
 }
@@ -254,8 +327,10 @@ h1 {
 .task-artifacts li {
   display: grid;
   gap: 8px;
-  padding: 16px 0;
-  border-bottom: 1px solid var(--color-border);
+  padding: 16px;
+  margin-top: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
 }
 .task-artifacts .badge {
   margin-left: 10px;
@@ -264,7 +339,14 @@ h1 {
   justify-self: start;
 }
 .artifact-form {
-  margin: 20px 0;
+  margin: 16px 0 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.artifact-form small {
+  grid-column: 1 / -1;
+}
+.artifact-form button {
+  justify-self: start;
 }
 .artifact-preview pre {
   max-height: 420px;
@@ -275,6 +357,308 @@ h1 {
   background: var(--color-background);
   font-size: 12px;
   line-height: 1.6;
+}
+
+.workbench-header,
+.workbench-toolbar,
+.section-heading,
+.artifact-topline,
+.action-row,
+.task-end {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.workbench-toolbar,
+.action-row {
+  flex-wrap: wrap;
+}
+.action-row {
+  justify-content: flex-start;
+  margin-top: 16px;
+}
+.occupancy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-muted);
+}
+.status-dot.occupied {
+  background: var(--color-primary);
+}
+.sync-status {
+  min-height: 18px;
+  margin: 10px 0 18px;
+  font-size: 11px;
+  color: var(--color-muted);
+}
+.plan-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 230px;
+  gap: 24px;
+  align-items: start;
+}
+.plan-guide {
+  padding: 20px 0;
+  font-size: 13px;
+}
+.plan-guide ol {
+  padding-left: 20px;
+}
+.plan-guide li {
+  margin-bottom: 24px;
+  padding-left: 5px;
+}
+.plan-guide li::marker {
+  color: var(--color-primary);
+}
+.plan-guide p,
+.setup-card p {
+  color: var(--color-muted);
+  line-height: 1.75;
+}
+.availability-note {
+  margin-top: 28px;
+  padding: 16px;
+  border: 1px dashed var(--color-border);
+  border-radius: 10px;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.availability-note p {
+  margin-bottom: 0;
+}
+.project-picker {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+.project-picker label {
+  flex: 1;
+  min-width: 0;
+}
+.project-picker button {
+  min-height: 40px;
+  flex-shrink: 0;
+}
+.primary-button {
+  min-height: 40px;
+  padding: 10px 18px;
+  border: 1px solid #8cdec2;
+  border-radius: 8px;
+  background: #8cdec2;
+  color: #122c25;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.primary-button:hover:not(:disabled) {
+  background: #a6ead3;
+  border-color: #a6ead3;
+}
+.primary-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.plan-options,
+.task-details {
+  font-size: 12px;
+  color: var(--color-muted);
+}
+summary {
+  cursor: pointer;
+  line-height: 1.6;
+  width: fit-content;
+}
+.plan-options summary,
+.artifact-add summary {
+  padding: 6px 0;
+}
+.form-options-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 16px 0 10px;
+}
+.form-submit {
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+}
+.form-submit span,
+.task-end span,
+.section-caption {
+  color: var(--color-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.setup-card {
+  max-width: 640px;
+  padding: 36px;
+  margin: 24px auto;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-surface);
+}
+.setup-mark {
+  display: inline-block;
+  margin-bottom: 24px;
+  color: var(--color-primary);
+  font-size: 12px;
+}
+.setup-card h2 {
+  font-size: 22px;
+}
+.setup-card button {
+  margin-top: 16px;
+}
+.feedback {
+  margin: 16px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.feedback p {
+  margin: 6px 0 10px;
+}
+.feedback-error {
+  background: #291e20;
+  border-color: #654044;
+  color: #ffd1cc;
+}
+.feedback-success {
+  background: #172a24;
+  border-color: #345849;
+  color: #ace2c9;
+}
+.form-error {
+  margin: 0;
+  color: #ffaaa1;
+  font-size: 13px;
+}
+.task-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.task-heading h2 {
+  font-size: 21px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.task-heading .badge {
+  margin-top: 4px;
+}
+.task-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin: 12px 0 20px;
+  color: var(--color-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.task-notice {
+  padding: 16px 18px;
+  background: #192720;
+  border: 1px solid #354c40;
+  border-radius: 10px;
+}
+.task-notice p,
+.confirmation-panel p {
+  margin: 6px 0 0;
+  color: var(--color-muted);
+  font-size: 13px;
+  line-height: 1.75;
+}
+.notice-attention,
+.confirmation-panel {
+  background: #2a251b;
+  border: 1px solid #5c4e30;
+}
+.badge-attention {
+  color: #e8c98c;
+  border-color: #5c4e30;
+  background: #2a251b;
+}
+.task-section {
+  margin-top: 24px;
+  padding-top: 24px;
+  border-top: 1px solid var(--color-border);
+}
+.step-number {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #222c36;
+  color: var(--color-muted);
+  font-size: 11px;
+}
+.step-saved .step-number {
+  background: #264337;
+  color: #ace2c9;
+}
+.step-body {
+  min-width: 0;
+}
+.task-details {
+  margin-top: 12px;
+  overflow-wrap: anywhere;
+}
+.artifact-empty {
+  padding: 20px;
+  border: 1px dashed var(--color-border);
+  border-radius: 10px;
+  color: var(--color-muted);
+  font-size: 13px;
+  margin: 16px 0;
+}
+.artifact-empty p {
+  margin: 8px 0 0;
+  line-height: 1.7;
+}
+.artifact-add {
+  margin-top: 20px;
+  font-size: 13px;
+}
+.artifact-topline .ghost-button {
+  flex-shrink: 0;
+}
+.task-end {
+  justify-content: flex-start;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--color-border);
+}
+.confirmation-panel {
+  padding: 20px;
+  margin-top: 16px;
+  border-radius: 10px;
+}
+.project-reconnect {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  font-size: 13px;
+  color: var(--color-muted);
+  margin-top: 16px;
 }
 
 .tools {
@@ -547,13 +931,52 @@ h2 {
   padding: 8px;
 }
 
+@media (max-width: 780px) {
+  .plan-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .plan-guide {
+    padding: 0 4px;
+  }
+  .plan-guide ol {
+    display: none;
+  }
+  .plan-guide .eyebrow {
+    display: none;
+  }
+  .availability-note {
+    margin-top: 0;
+  }
+  .workbench-header,
+  .task-heading {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .task-steps {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 @media (max-width: 600px) {
   .app-shell {
-    padding: 24px;
+    padding: 16px;
   }
-
-  .status-card {
-    padding: 32px 0 8px;
+  .task-card,
+  .task-form,
+  .setup-card {
+    padding: 18px;
+  }
+  .artifact-form,
+  .form-options-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .footer span {
+    display: none;
+  }
+  .workbench-toolbar,
+  .task-end,
+  .project-reconnect {
+    flex-wrap: wrap;
   }
 }
 

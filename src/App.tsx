@@ -7,12 +7,14 @@ import SessionPanel from "./terminal/SessionPanel";
 import { useLauncher } from "./terminal/useLauncher";
 import ToolList from "./tools/ToolList";
 import { useTools } from "./tools/useTools";
+import { emptyPlan } from "./workbenchState";
 
 export default function App() {
   const tools = useTools();
   const projects = useProjects();
   const launcher = useLauncher();
   const [page, setPage] = useState<"workbench" | "terminal">("workbench");
+  const [draft, setDraft] = useState(emptyPlan);
 
   return (
     <main className="app-shell">
@@ -20,7 +22,11 @@ export default function App() {
         <span className="brand-mark" aria-hidden="true">
           &gt;_
         </span>
-        <span>{PRODUCT_NAME}</span>
+        <div className="brand-copy">
+          <span>{PRODUCT_NAME}</span>
+          <small>数据开发工作台</small>
+        </div>
+        <span className="local-badge">本地工作区</span>
       </header>
 
       <nav className="app-tabs" aria-label="工作区">
@@ -36,14 +42,19 @@ export default function App() {
           aria-current={page === "terminal" ? "page" : undefined}
           onClick={() => setPage("terminal")}
         >
-          项目与独立终端
+          项目与终端
         </button>
       </nav>
 
       {page === "workbench" ? (
         <TaskWorkbench
           projects={projects.projects}
-          onProjects={() => setPage("terminal")}
+          projectBusy={projects.busy || projects.loading}
+          projectError={projects.error}
+          draft={draft}
+          onDraftChange={setDraft}
+          onAddProject={projects.add}
+          onRefreshProjects={projects.refresh}
         />
       ) : launcher.session ? (
         <SessionPanel
@@ -58,11 +69,10 @@ export default function App() {
       ) : (
         <div className="launcher-content">
           <section className="status-card" aria-labelledby="foundation-title">
-            <p className="eyebrow">MILESTONE 1</p>
-            <h1 id="foundation-title">一个入口，管理你的 AI 终端。</h1>
+            <p className="eyebrow">项目与工具</p>
+            <h1 id="foundation-title">独立终端</h1>
             <p className="description">
-              选择项目，再选择 AI
-              工具，即可在内置终端里开始工作。关闭窗口只会收起 AgentTerm。
+              选择项目与工具，打开交互终端。这里的会话由你手动操作，不会自动推进任务工作台中的计划。
             </p>
             <div className="target-list" aria-label="支持的平台">
               {SUPPORTED_TARGETS.map((target) => (
@@ -76,7 +86,7 @@ export default function App() {
           <ProjectList
             projects={projects.projects}
             tools={tools.tools}
-            busy={projects.busy || launcher.busy}
+            busy={projects.busy || projects.loading || launcher.busy}
             error={projects.error}
             startError={launcher.startError}
             pendingRemoval={projects.pendingRemoval}
@@ -96,7 +106,9 @@ export default function App() {
         </div>
       )}
 
-      <footer className="footer">Tauri 2 · Rust · React</footer>
+      <footer className="footer">
+        计划与交付保存在本机<span>关闭窗口会收起应用</span>
+      </footer>
     </main>
   );
 }
