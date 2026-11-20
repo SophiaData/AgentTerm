@@ -1,23 +1,32 @@
 name: Build packages
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to package
+        type: choice
+        options: [all, windows, macos]
+        default: all
+      include_tui:
+        description: Build the TUI after desktop packages
+        type: boolean
+        default: true
 
 permissions:
   contents: read
+
+env:
+  CARGO_BUILD_JOBS: '1'
+  RUST_TEST_THREADS: '1'
 
 jobs:
   desktop:
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-            args: --target aarch64-apple-darwin --bundles dmg
-          - platform: windows-latest
-            target: ''
-            args: --bundles nsis
+        platform: ${{ fromJSON(inputs.platform == 'windows' && '["windows-latest"]' || inputs.platform == 'macos' && '["macos-latest"]' || '["macos-latest","windows-latest"]') }}
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 45
     steps:
@@ -29,7 +38,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - name: Enable pnpm
         run: corepack enable
@@ -40,20 +49,17 @@ jobs:
       - name: Build desktop package
         uses: tauri-apps/tauri-action@v1
         with:
-          args: ${{ matrix.args }}
+          args: ${{ matrix.platform == 'macos-latest' && '--target aarch64-apple-darwin --bundles dmg' || '--bundles nsis' }}
           uploadWorkflowArtifacts: true
 
   tui:
+    needs: desktop
+    if: ${{ inputs.include_tui }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        include:
-          - platform: macos-latest
-            artifact: agentterm-macos-arm64
-            binary: agentterm
-          - platform: windows-latest
-            artifact: agentterm-windows-x64
-            binary: agentterm.exe
+        platform: ${{ fromJSON(inputs.platform == 'windows' && '["windows-latest"]' || inputs.platform == 'macos' && '["macos-latest"]' || '["macos-latest","windows-latest"]') }}
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 20
     steps:
@@ -67,6 +73,6 @@ jobs:
       - name: Upload TUI binary
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: agentterm-tui/target/release/${{ matrix.binary }}
+          name: ${{ matrix.platform == 'macos-latest' && 'agentterm-macos-arm64' || 'agentterm-windows-x64' }}
+          path: agentterm-tui/target/release/${{ matrix.platform == 'macos-latest' && 'agentterm' || 'agentterm.exe' }}
           if-no-files-found: error
