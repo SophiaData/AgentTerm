@@ -313,7 +313,14 @@ export default function App() {
           activeId={launcher.activeId}
           focusRequest={launcher.focusRequest}
           closingId={launcher.closingId}
-          onFocus={launcher.focus}
+          onFocus={(id) => {
+            const session = launcher.sessions.find((s) => s.info.id === id);
+            const project = projects.projects.find(
+              (p) => p.path === session?.info.projectPath,
+            );
+            if (project) setProjectId(project.id);
+            launcher.focus(id);
+          }}
           onClose={(id) => void launcher.close(id)}
           onExit={launcher.handleExit}
         />
