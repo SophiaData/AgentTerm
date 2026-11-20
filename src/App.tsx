@@ -43,6 +43,11 @@ export default function App() {
           onClick={() => setPage("terminal")}
         >
           项目与终端
+          {launcher.session
+            ? launcher.session.running
+              ? " · 运行中"
+              : " · 已结束"
+            : ""}
         </button>
       </nav>
 
@@ -56,9 +61,12 @@ export default function App() {
           onAddProject={projects.add}
           onRefreshProjects={projects.refresh}
         />
-      ) : launcher.session ? (
+      ) : null}
+      {launcher.session ? (
         <SessionPanel
+          key={launcher.session.info.id}
           session={launcher.session.info}
+          active={page === "terminal"}
           running={launcher.session.running}
           exitReason={launcher.session.exitReason}
           busy={launcher.busy}
@@ -66,7 +74,7 @@ export default function App() {
           onClose={launcher.close}
           onExit={launcher.handleExit}
         />
-      ) : (
+      ) : page === "terminal" ? (
         <div className="launcher-content">
           <section className="status-card" aria-labelledby="foundation-title">
             <p className="eyebrow">项目与工具</p>
@@ -104,7 +112,7 @@ export default function App() {
             onRefresh={tools.refresh}
           />
         </div>
-      )}
+      ) : null}
 
       <footer className="footer">
         计划与交付保存在本机<span>关闭窗口会收起应用</span>

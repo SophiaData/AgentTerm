@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { Project } from "../projects/types";
 import type { ToolStatus } from "../tools/types";
 import { newSessionId, type SessionInfo } from "./types";
@@ -19,10 +19,15 @@ export function useLauncher() {
   const [busy, setBusy] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [closeError, setCloseError] = useState<string | null>(null);
+  const currentSession = useRef<ActiveSession | null>(null);
+  const operation = useRef(false);
 
   const start = useCallback(async (project: Project, tool: ToolStatus) => {
+    if (operation.current || currentSession.current) return;
+    operation.current = true;
     setBusy(true);
     setStartError(null);
+    setCloseError(null);
 
     const id = newSessionId();
     try {
@@ -34,44 +39,63 @@ export function useLauncher() {
         rows: DEFAULT_ROWS,
         cols: DEFAULT_COLS,
       });
-      setSession({ info, running: true, exitReason: null });
+      const next = { info, running: true, exitReason: null };
+      currentSession.current = next;
+      setSession(next);
     } catch (error) {
       setStartError(`无法启动会话：${errorMessage(error)}`);
     } finally {
+      operation.current = false;
       setBusy(false);
     }
   }, []);
 
   const handleExit = useCallback((id: string, reason: string) => {
-    setSession((previous) =>
-      previous && previous.info.id === id
-        ? { ...previous, running: false, exitReason: reason }
-        : previous,
-    );
+    const previous = currentSession.current;
+    if (!previous || previous.info.id !== id) return;
+    const next = { ...previous, running: false, exitReason: reason };
+    currentSession.current = next;
+    setSession(next);
   }, []);
 
   const close = useCallback(async () => {
-    if (!session) {
+    const previous = currentSession.current;
+    if (!previous || operation.current) {
       return;
     }
 
+    operation.current = true;
     setBusy(true);
     setCloseError(null);
     try {
-      if (session.running) {
+      if (previous.running) {
         const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("stop_session", { sessionId: session.info.id });
+        try {
+          await invoke("stop_session", { sessionId: previous.info.id });
+        } catch (error) {
+          // Natural exit can race the stop request. Require a backend snapshot
+          // before treating a failed stop as an already-ended session.
+          const snapshot = await invoke<{ running: boolean }>(
+            "session_snapshot",
+            {
+              sessionId: previous.info.id,
+            },
+          );
+          if (snapshot.running) throw error;
+        }
       }
       // Only leave the view once the backend actually released the session.
+      currentSession.current = null;
       setSession(null);
     } catch (error) {
       // Keep the session open so the user can see the failure and retry, rather
       // than silently dropping a session whose process may still be running (#17).
       setCloseError(`无法关闭会话：${errorMessage(error)}。请重试。`);
     } finally {
+      operation.current = false;
       setBusy(false);
     }
-  }, [session]);
+  }, []);
 
   return {
     session,

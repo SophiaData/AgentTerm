@@ -1,22 +1,43 @@
-import { useEffect, useRef } from "react";
-import { advance } from "./offsetStitch";
+import { useEffect, useRef, useState } from "react";
+import { connectSession, type ConnectionPhase } from "./sessionTransport";
 import type { SessionInfo } from "./types";
 
 type Props = {
   session: SessionInfo;
+  active: boolean;
+  running: boolean;
+  busy: boolean;
   onExit: (id: string, reason: string) => void;
 };
 
-export default function TerminalView({ session, onExit }: Props) {
+export default function TerminalView({
+  session,
+  active,
+  running,
+  busy,
+  onExit,
+}: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const onExitRef = useRef(onExit);
-  onExitRef.current = onExit;
+  const current = useRef({ active, running, busy, onExit });
+  current.current = { active, running, busy, onExit };
+  const controls = useRef<{
+    focus: () => void;
+    scroll: () => void;
+    layout: () => void;
+    input: () => void;
+  } | null>(null);
+  const [phase, setPhase] = useState<ConnectionPhase>("connecting");
+  const [problem, setProblem] = useState<string | null>(null);
+  const [connection, setConnection] = useState(0);
 
   useEffect(() => {
     let disposed = false;
-    let unlistenOutput: (() => void) | null = null;
-    let unlistenExit: (() => void) | null = null;
-    let resizeObserver: ResizeObserver | null = null;
+    let localPhase: ConnectionPhase = "connecting";
+    const cleanups: (() => void)[] = [];
+    const frames: number[] = [];
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+    setPhase("connecting");
+    setProblem(null);
 
     async function mount() {
       const [{ Terminal }, { FitAddon }, { listen }, { invoke }] =
@@ -26,191 +47,199 @@ export default function TerminalView({ session, onExit }: Props) {
           import("@tauri-apps/api/event"),
           import("@tauri-apps/api/core"),
         ]);
-
-      if (disposed || !hostRef.current) {
-        return;
-      }
+      if (disposed || !hostRef.current) return;
 
       const terminal = new Terminal({
         fontFamily: "'SFMono-Regular', Consolas, 'Liberation Mono', monospace",
-        fontSize: 13,
+        fontSize: 14,
+        scrollback: 5000,
+        cursorBlink: true,
+        disableStdin: true,
         theme: {
           background: "#0d1117",
           foreground: "#e6edf3",
-          cursor: "#00ff41",
+          cursor: "#8cdec2",
           selectionBackground: "#26404f",
         },
-        allowProposedApi: true,
       });
+      cleanups.push(() => terminal.dispose());
       const fit = new FitAddon();
       terminal.loadAddon(fit);
       terminal.open(hostRef.current);
-
-      terminal.onData((data) => {
-        void invoke("write_session_input", {
-          sessionId: session.id,
-          data,
-        }).catch(() => {});
-      });
-
-      // Only push a size to the PTY once the container has a real layout.
-      // A premature fit() on an unlaid-out element yields absurd row counts
-      // (e.g. 964 rows) and makes full-screen TUIs like Claude Code render blank.
-      const proposeResize = () => {
-        if (disposed) {
-          return;
-        }
+      const input = () => {
+        terminal.options.disableStdin =
+          localPhase !== "ready" ||
+          !current.current.running ||
+          current.current.busy;
+      };
+      const focus = () => {
+        if (current.current.active && localPhase === "ready") terminal.focus();
+      };
+      let lastSize = "";
+      const resize = () => {
         const host = hostRef.current;
-        if (!host || host.clientHeight < 120 || host.clientWidth < 200) {
+        if (
+          disposed ||
+          !current.current.active ||
+          !host ||
+          host.clientHeight < 80 ||
+          host.clientWidth < 160
+        )
           return;
-        }
         fit.fit();
-        const rows = terminal.rows;
-        const cols = terminal.cols;
-        if (!Number.isFinite(rows) || !Number.isFinite(cols)) {
+        const { rows, cols } = terminal;
+        if (
+          !Number.isFinite(rows) ||
+          !Number.isFinite(cols) ||
+          rows < 3 ||
+          rows > 300 ||
+          cols < 10 ||
+          cols > 500 ||
+          localPhase !== "ready" ||
+          !current.current.running
+        )
           return;
-        }
-        if (rows < 4 || rows > 300 || cols < 20 || cols > 500) {
-          return;
-        }
+        const size = `${rows}:${cols}`;
+        if (size === lastSize) return;
+        lastSize = size;
         void invoke("resize_session", {
           sessionId: session.id,
           rows,
           cols,
-        }).catch(() => {});
+        }).catch(() => {
+          if (!disposed && localPhase === "ready" && current.current.running) {
+            lastSize = "";
+            setProblem("终端尺寸同步失败。请重新连接显示后再继续操作。");
+          }
+        });
       };
-
-      // Wait two animation frames so the flex layout has settled before the
-      // first measurement.
-      requestAnimationFrame(() => {
-        requestAnimationFrame(proposeResize);
-      });
-
-      let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-      resizeObserver = new ResizeObserver(() => {
-        if (resizeTimer) {
-          clearTimeout(resizeTimer);
-        }
-        resizeTimer = setTimeout(proposeResize, 60);
-      });
-      resizeObserver.observe(hostRef.current);
-
-      // Output stitching via a shared byte offset:
-      //  - The backend tags every live chunk with `endOffset` (bytes emitted so
-      //    far) and the snapshot with the offset of its last byte.
-      //  - We write the snapshot, remember how many bytes it covered, then write
-      //    each live chunk only for the bytes beyond that point. Overlap is
-      //    dropped; anything after the snapshot is written in full and in order.
-      // This replaces the old "buffer then flush" approach, which could not tell
-      // whether a buffered chunk was already inside the snapshot (#8).
-
-      // Guards against reporting the exit twice (e.g. the exit event arrives and
-      // the snapshot also says the process already ended).
-      let exitReported = false;
-      const reportExit = (id: string, reason: string) => {
-        if (exitReported) {
-          return;
-        }
-        exitReported = true;
-        onExitRef.current(id, reason);
+      const layout = () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(resize, 60);
       };
+      controls.current = {
+        focus,
+        scroll: () => terminal.scrollToBottom(),
+        layout,
+        input,
+      };
+      const observer = new ResizeObserver(layout);
+      observer.observe(hostRef.current);
+      cleanups.push(() => observer.disconnect());
 
-      unlistenExit = await listen<{ id: string; reason: string }>(
-        `session-exit-${session.id}`,
-        (event) => {
-          terminal.write(
-            `\r\n\x1b[33m[会话结束：${event.payload.reason}]\x1b[0m\r\n`,
-          );
-          reportExit(event.payload.id, event.payload.reason);
+      const transport = connectSession(
+        session.id,
+        { listen, invoke },
+        {
+          output: (text) => {
+            if (!disposed) terminal.write(text);
+          },
+          phase: (next, error) => {
+            if (disposed) return;
+            localPhase = next;
+            setPhase(next);
+            setProblem(error);
+            input();
+            if (next === "ready") {
+              frames.push(
+                requestAnimationFrame(() => {
+                  if (disposed) return;
+                  resize();
+                  focus();
+                }),
+              );
+            }
+          },
+          exit: (id, reason) => {
+            if (!disposed) current.current.onExit(id, reason);
+          },
         },
       );
-
-      // Bytes already handed to the terminal. Starts at -1 meaning "unknown yet"
-      // (before the snapshot arrives); we only compare offsets after that.
-      let writtenOffset = -1;
-      // Live chunks that arrived before the snapshot, held until we know the
-      // snapshot's end offset so we can trim precisely.
-      const pendingBeforeSnapshot: { data: string; endOffset: number }[] = [];
-
-      const handleChunk = (payload: { data: string; endOffset: number }) => {
-        if (writtenOffset < 0) {
-          pendingBeforeSnapshot.push(payload);
-          return;
-        }
-        const result = advance(payload, writtenOffset);
-        if (result.text) {
-          terminal.write(result.text);
-        }
-        writtenOffset = result.offset;
-      };
-
-      unlistenOutput = await listen<{ data: string; endOffset: number }>(
-        `session-output-${session.id}`,
-        (event) => handleChunk(event.payload),
+      cleanups.push(transport.dispose);
+      const data = terminal.onData((text) => {
+        if (current.current.running && !current.current.busy)
+          transport.send(text);
+      });
+      cleanups.push(() => data.dispose());
+      frames.push(
+        requestAnimationFrame(() => {
+          if (!disposed) frames.push(requestAnimationFrame(resize));
+        }),
       );
-
-      // Replay everything the PTY produced before this view mounted. Without
-      // this, the first screen of a full-screen TUI (Claude Code, Codex) is
-      // lost and the terminal looks blank even though the process is running.
-      try {
-        const snapshot = await invoke<{
-          data: string;
-          offset: number;
-          running: boolean;
-        }>("session_snapshot", { sessionId: session.id });
-        if (snapshot.data) {
-          terminal.write(snapshot.data);
-        }
-        writtenOffset = snapshot.offset;
-        // Now reconcile chunks that raced in before the snapshot: write only
-        // their bytes beyond the snapshot's end.
-        for (const chunk of pendingBeforeSnapshot) {
-          handleChunk(chunk);
-        }
-        pendingBeforeSnapshot.length = 0;
-        if (!snapshot.running) {
-          // The process already exited before this view appeared; show the final
-          // state instead of a stuck "running" indicator.
-          terminal.write("\r\n\x1b[33m[会话已结束]\x1b[0m\r\n");
-          reportExit(session.id, "进程已结束");
-        }
-      } catch {
-        // The session may have already exited; the exit listener handles that.
-        // Let any buffered chunks through now that we know there is no snapshot.
-        writtenOffset = 0;
-        for (const chunk of pendingBeforeSnapshot) {
-          handleChunk(chunk);
-        }
-        pendingBeforeSnapshot.length = 0;
-      }
-
-      if (disposed) {
-        unlistenOutput();
-        unlistenExit();
-        resizeObserver?.disconnect();
-        terminal.dispose();
-        return;
-      }
-
-      cleanup = () => {
-        unlistenOutput?.();
-        unlistenExit?.();
-        resizeObserver?.disconnect();
-        if (resizeTimer) {
-          clearTimeout(resizeTimer);
-        }
-        terminal.dispose();
-      };
+      await transport.ready;
     }
 
-    let cleanup: (() => void) | null = null;
-    void mount();
-
+    void mount().catch(() => {
+      if (!disposed) {
+        setPhase("error");
+        setProblem("终端界面未能加载。请重新连接显示；不会重新启动 CLI。");
+      }
+    });
     return () => {
       disposed = true;
-      cleanup?.();
+      controls.current = null;
+      clearTimeout(resizeTimer);
+      for (const frame of frames) cancelAnimationFrame(frame);
+      for (const cleanup of cleanups.reverse()) cleanup();
     };
-  }, [session.id]);
+  }, [session.id, connection]);
 
-  return <div className="terminal-host" ref={hostRef} />;
+  useEffect(() => {
+    controls.current?.input();
+    if (active) {
+      controls.current?.layout();
+      controls.current?.focus();
+    }
+  }, [active, running, busy]);
+
+  return (
+    <div className="terminal-view">
+      <div className="terminal-toolbar">
+        <span role="status">
+          {phase === "connecting"
+            ? "正在连接终端…"
+            : phase === "error"
+              ? "终端连接需要处理"
+              : !running || phase === "exited"
+                ? "进程已结束，输出保留在下方"
+                : "可直接输入 · Ctrl+C 中断当前命令"}
+        </span>
+        <div className="terminal-actions">
+          <button
+            type="button"
+            className="ghost-button"
+            disabled={phase !== "ready" || !running || busy}
+            onClick={() => controls.current?.focus()}
+          >
+            输入终端
+          </button>
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => controls.current?.scroll()}
+          >
+            回到底部
+          </button>
+        </div>
+      </div>
+      {problem ? (
+        <div className="terminal-problem" role="alert">
+          <span>{problem}</span>
+          <button
+            type="button"
+            className="ghost-button"
+            disabled={busy}
+            onClick={() => setConnection((value) => value + 1)}
+          >
+            重新连接显示
+          </button>
+        </div>
+      ) : null}
+      <div
+        className="terminal-host"
+        ref={hostRef}
+        aria-label="CLI 输入与输出"
+      />
+    </div>
+  );
 }

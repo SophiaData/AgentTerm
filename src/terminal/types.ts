@@ -11,7 +11,7 @@ export type SessionExit = {
 };
 
 export function sessionTitle(session: SessionInfo): string {
-  const parts = session.projectPath.split("/");
+  const parts = session.projectPath.split(/[\\/]/).filter(Boolean);
   const folder = parts[parts.length - 1] || session.projectPath;
 
   return `${folder} · ${session.toolName}`;

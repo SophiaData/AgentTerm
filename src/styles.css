@@ -894,8 +894,65 @@ h2 {
   min-height: 0;
   flex: 1;
   flex-direction: column;
-  gap: 12px;
-  margin-top: 24px;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.session-panel[hidden] {
+  display: none;
+}
+
+.session-context {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-confirm,
+.terminal-problem {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid #a16f47;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.session-confirm span,
+.terminal-problem span {
+  flex: 1 1 220px;
+}
+
+.terminal-problem {
+  border-color: #ff7b72;
+  color: #ffb0a8;
+}
+
+.terminal-view {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.terminal-toolbar,
+.terminal-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.terminal-toolbar {
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--color-muted);
 }
 
 .session-header {
@@ -921,8 +978,7 @@ h2 {
 }
 
 .terminal-host {
-  height: 100%;
-  min-height: 360px;
+  min-height: 80px;
   flex: 1;
   overflow: hidden;
   border: 1px solid var(--color-border);
@@ -976,6 +1032,10 @@ h2 {
   .workbench-toolbar,
   .task-end,
   .project-reconnect {
+    flex-wrap: wrap;
+  }
+  .session-header,
+  .session-title-group {
     flex-wrap: wrap;
   }
 }

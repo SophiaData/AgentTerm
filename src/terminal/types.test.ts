@@ -21,4 +21,16 @@ describe("session helpers", () => {
     expect(second).toMatch(/^session-/);
     expect(first).not.toBe(second);
   });
+
+  it("uses a Windows folder name instead of the full path", () => {
+    expect(
+      sessionTitle({ ...SESSION, projectPath: "E:\\work\\数据开发\\" }),
+    ).toBe("数据开发 · Claude Code");
+  });
+
+  it("retains a root path as a recognizable session title", () => {
+    expect(sessionTitle({ ...SESSION, projectPath: "/" })).toBe(
+      "/ · Claude Code",
+    );
+  });
 });

@@ -1,8 +1,10 @@
+import { useState } from "react";
 import TerminalView from "./TerminalView";
 import { sessionTitle, type SessionInfo } from "./types";
 
 type Props = {
   session: SessionInfo;
+  active: boolean;
   running: boolean;
   exitReason: string | null;
   busy: boolean;
@@ -13,6 +15,7 @@ type Props = {
 
 export default function SessionPanel({
   session,
+  active,
   running,
   exitReason,
   busy,
@@ -20,8 +23,9 @@ export default function SessionPanel({
   onClose,
   onExit,
 }: Props) {
+  const [confirmClose, setConfirmClose] = useState(false);
   return (
-    <section className="session-panel" aria-label="终端会话">
+    <section className="session-panel" aria-label="终端会话" hidden={!active}>
       <div className="session-header">
         <div className="session-title-group">
           <span className="session-title">{sessionTitle(session)}</span>
@@ -36,18 +40,49 @@ export default function SessionPanel({
         <button
           type="button"
           className="ghost-button"
-          onClick={onClose}
+          onClick={() => (running ? setConfirmClose(true) : onClose())}
           disabled={busy}
         >
-          关闭会话
+          {busy ? "正在结束…" : running ? "结束会话" : "返回启动页"}
         </button>
       </div>
+      <p className="session-context" title={session.projectPath}>
+        {session.projectPath} · 切换页面后保留会话
+      </p>
+      {confirmClose && running ? (
+        <div className="session-confirm" role="group" aria-label="确认结束会话">
+          <span>结束会停止这个 CLI。尚未提交的输入可能丢失。</span>
+          <button
+            type="button"
+            className="ghost-button"
+            autoFocus
+            disabled={busy}
+            onClick={() => setConfirmClose(false)}
+          >
+            继续使用
+          </button>
+          <button
+            type="button"
+            className="danger-button"
+            disabled={busy}
+            onClick={onClose}
+          >
+            确认结束
+          </button>
+        </div>
+      ) : null}
       {closeError ? (
         <p className="session-close-error" role="alert">
           {closeError}
         </p>
       ) : null}
-      <TerminalView session={session} onExit={onExit} />
+      <TerminalView
+        session={session}
+        active={active}
+        running={running}
+        busy={busy}
+        onExit={onExit}
+      />
     </section>
   );
 }
