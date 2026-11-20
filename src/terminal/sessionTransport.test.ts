@@ -21,7 +21,7 @@ function fixture() {
   });
   const bridge: SessionBridge = {
     invoke,
-    listen: async <T,>(
+    listen: async <T>(
       name: string,
       listener: (event: { payload: T }) => void,
     ) => {

@@ -79,7 +79,7 @@ export function connectSession(
     if (next.text) callbacks.output(next.text);
     offset = next.offset;
   };
-  const subscribe = async <T,>(
+  const subscribe = async <T>(
     name: string,
     listener: (event: { payload: T }) => void,
   ) => {
