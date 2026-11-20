@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -87,6 +88,65 @@ struct ProjectFile {
     projects: Vec<Project>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectRecord {
+    schema: u32,
+    revision: u64,
+    projects: Vec<Project>,
+    sha256: String,
+}
+
+fn project_hash(revision: u64, projects: &[Project]) -> Result<String, String> {
+    let bytes = serde_json::to_vec(&(revision, projects)).map_err(|_| invalid_store())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn invalid_store() -> String {
+    "项目列表版本未知、记录截断或校验失败；保留原文件，需核实".into()
+}
+
+fn read_projects(bytes: &[u8]) -> Result<(u64, Vec<Project>, bool), String> {
+    // Read the first candidate's single JSON file without modifying it.
+    // A subsequent write appends v2 snapshots; older clients then fail closed.
+    if let Ok(saved) = serde_json::from_slice::<ProjectFile>(bytes) {
+        if saved.schema != 1 {
+            return Err(invalid_store());
+        }
+        validate_projects(&saved.projects)?;
+        return Ok((0, saved.projects, !bytes.ends_with(b"\n")));
+    }
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err(invalid_store());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_store())?;
+    let mut revision = 0u64;
+    let mut projects = Vec::new();
+    for (index, line) in text.split_terminator('\n').enumerate() {
+        if index == 0
+            && let Ok(saved) = serde_json::from_str::<ProjectFile>(line)
+        {
+            if saved.schema != 1 {
+                return Err(invalid_store());
+            }
+            validate_projects(&saved.projects)?;
+            projects = saved.projects;
+            continue;
+        }
+        let record: ProjectRecord = serde_json::from_str(line).map_err(|_| invalid_store())?;
+        if record.schema != 2
+            || revision.checked_add(1) != Some(record.revision)
+            || record.sha256 != project_hash(record.revision, &record.projects)?
+        {
+            return Err(invalid_store());
+        }
+        validate_projects(&record.projects)?;
+        revision = record.revision;
+        projects = record.projects;
+    }
+    Ok((revision, projects, false))
+}
+
 struct ProjectLock(File);
 impl Drop for ProjectLock {
     fn drop(&mut self) {
@@ -166,49 +226,49 @@ fn persisted<T>(
     if regular_or_missing(&pending)? {
         return Err("项目列表有未完成写入；保留原件与pending文件，需核实".into());
     }
-    let mut projects = if regular_or_missing(path)? {
+    let mut existing = Vec::new();
+    let (revision, mut projects, add_newline) = if regular_or_missing(path)? {
         let file = File::open(path).map_err(storage_error)?;
         if file.metadata().map_err(storage_error)?.len() > PROJECT_BYTES {
             return Err("项目存储超过1 MiB上限".into());
         }
-        let mut bytes = Vec::new();
         file.take(PROJECT_BYTES + 1)
-            .read_to_end(&mut bytes)
+            .read_to_end(&mut existing)
             .map_err(storage_error)?;
-        if bytes.len() as u64 > PROJECT_BYTES {
+        if existing.len() as u64 > PROJECT_BYTES {
             return Err("项目存储超过1 MiB上限".into());
         }
-        let saved: ProjectFile = serde_json::from_slice(&bytes)
-            .map_err(|_| "项目列表版本未知或内容损坏；保留原文件，需核实".to_string())?;
-        if saved.schema != 1 {
-            return Err("项目列表版本未知；保留原文件，需核实".into());
-        }
-        validate_projects(&saved.projects)?;
-        saved.projects
+        read_projects(&existing)?
     } else {
-        Vec::new()
+        (0, Vec::new(), false)
     };
     let result = operation(&mut projects)?;
     if write {
         validate_projects(&projects)?;
-        let bytes = serde_json::to_vec(&ProjectFile {
-            schema: 1,
+        let revision = revision.checked_add(1).ok_or_else(invalid_store)?;
+        let mut bytes = serde_json::to_vec(&ProjectRecord {
+            schema: 2,
+            revision,
+            sha256: project_hash(revision, &projects)?,
             projects,
         })
         .map_err(|_| "项目列表无法序列化".to_string())?;
-        if bytes.len() as u64 > PROJECT_BYTES {
+        if add_newline {
+            bytes.insert(0, b'\n');
+        }
+        bytes.push(b'\n');
+        if existing.len() as u64 + bytes.len() as u64 > PROJECT_BYTES {
             return Err("项目存储超过1 MiB上限".into());
         }
+        // Append complete snapshots under the same stable lock. A partial tail
+        // blocks all later operations, never rolls back or pretends to be empty.
         let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&pending)
+            .append(true)
+            .create_new(existing.is_empty())
+            .open(path)
             .map_err(storage_error)?;
         file.write_all(&bytes).map_err(storage_error)?;
         file.sync_all().map_err(storage_error)?;
-        drop(file);
-        // Same-directory atomic replacement. No project directory/file is moved.
-        fs::rename(&pending, path).map_err(storage_error)?;
         #[cfg(unix)]
         File::open(
             path.parent()
@@ -443,7 +503,7 @@ mod tests {
         assert_eq!(two.list().unwrap(), vec![project.clone()]);
         assert!(two.add(&dir.to_string_lossy()).is_err());
         assert!(!companion(&path, ".pending").exists());
-        two.remove(&project.id).unwrap(); // Windows replace-existing path tested
+        two.remove(&project.id).unwrap();
         assert!(one.list().unwrap().is_empty());
         assert!(persistent(&path).list().unwrap().is_empty());
         assert!(dir.is_dir());
@@ -472,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_atomic_write_preserves_original_and_blocks_further_writes() {
+    fn previous_candidate_pending_file_is_never_silently_ignored() {
         let path = store_path();
         let store = persistent(&path);
         let project = store.add(&std::env::temp_dir().to_string_lossy()).unwrap();
@@ -483,6 +543,61 @@ mod tests {
         assert!(store.remove(&project.id).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(std::fs::read(&pending).unwrap(), b"partial replacement");
+    }
+
+    #[test]
+    fn truncated_or_corrupted_append_never_reverts_to_an_old_snapshot() {
+        let path = store_path();
+        let store = persistent(&path);
+        let project = store.add(&std::env::temp_dir().to_string_lossy()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut truncated = original.clone();
+        truncated.extend_from_slice(b"{\"schema\":2");
+        let mut checksum = original.clone();
+        let index = checksum.iter().position(|b| *b == b'2').unwrap();
+        checksum[index] = b'9';
+        for bytes in [truncated, checksum, original[..original.len() - 1].to_vec()] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(store.list().is_err());
+            assert!(store.remove(&project.id).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn legacy_json_is_readable_and_preserved_as_first_record_on_change() {
+        let path = store_path();
+        let store = persistent(&path);
+        let project = store.add(&std::env::temp_dir().to_string_lossy()).unwrap();
+        let legacy = serde_json::to_vec(&super::ProjectFile {
+            schema: 1,
+            projects: vec![project.clone()],
+        })
+        .unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+        assert_eq!(store.list().unwrap(), vec![project.clone()]);
+        store.remove(&project.id).unwrap();
+        assert!(std::fs::read(&path).unwrap().starts_with(&legacy));
+        assert!(persistent(&path).list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_revision_and_checksum_tampering_fail_closed() {
+        let path = store_path();
+        let store = persistent(&path);
+        let project = store.add(&std::env::temp_dir().to_string_lossy()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let duplicate = [original.clone(), original.clone()].concat();
+        let mut record: super::ProjectRecord = serde_json::from_slice(&original).unwrap();
+        record.projects.clear();
+        let mut tampered = serde_json::to_vec(&record).unwrap();
+        tampered.push(b'\n');
+        for bytes in [duplicate, tampered] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(store.list().is_err());
+            assert!(store.remove(&project.id).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]

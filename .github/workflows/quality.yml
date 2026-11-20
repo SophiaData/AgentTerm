@@ -47,7 +47,7 @@ jobs:
 
   windows-frontend:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -70,6 +70,11 @@ jobs:
 
       - name: Typecheck and build frontend on Windows
         run: pnpm build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test native persistence and recovery on Windows
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
       - name: Upload frontend for interaction acceptance
         uses: actions/upload-artifact@v4
