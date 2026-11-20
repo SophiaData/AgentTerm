@@ -106,3 +106,7 @@ AgentTerm本轮在多会话基础上增加可调双终端分屏：204px项目侧
 - TUI截图：https://github.com/herdrdev/herdr/blob/master/assets/screenshot.png
 - 桌面语义：https://github.com/herdrdev/herdr-app/blob/master/README.md
 - Code示例边界：https://github.com/herdrdev/herdr-layout-examples/blob/master/code/RECIPE.md
+
+### 真实CLI展示边界
+
+面向用户演示和验收必须使用本机真实CLI，核对实际可执行路径与版本。离线回显/模拟进程只用于底层自动测试，不得作为Claude Code或其他Agent的界面交付；即便标题/按钮相同也不能代替真实CLI。2026-11-20分屏包已安装，并用真实Claude Code 2.1.326取得启动、切换、布局与独立关闭证据；未发任务，真实输入、审批与恢复仍按testing.md单列未验。
