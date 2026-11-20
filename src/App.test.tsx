@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { isSupportedTarget, PRODUCT_NAME, SUPPORTED_TARGETS } from "./meta";
 import * as launcherModule from "./terminal/useLauncher";
+import * as historyModule from "./terminal/useSessionHistory";
+import * as toolsModule from "./tools/useTools";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -85,5 +87,99 @@ describe("AgentTerm application shell", () => {
       launcherHtml.match(/role="tabpanel" aria-labelledby="[^"]+" hidden=""/g),
     ).toHaveLength(2);
     expect(launcherHtml).toContain("从一个项目开始");
+  });
+
+  it("shows recent closed sessions on launcher with honest reopen controls and error recovery", async () => {
+    vi.spyOn(toolsModule, "useTools").mockReturnValue({
+      tools: [
+        {
+          id: "claude",
+          name: "Claude Code",
+          state: { kind: "installed", path: "claude.exe", version: "2.1.326" },
+        },
+        {
+          id: "codex",
+          name: "Codex",
+          state: { kind: "missing" },
+        },
+      ],
+      loading: false,
+      error: null,
+      refresh: vi.fn(),
+    });
+    const store = launcherModule.createSessionStore(
+      async <T,>(_command: string, args: Record<string, unknown>) =>
+        ({
+          id: args.sessionId,
+          toolId: args.toolId,
+          toolName: "Claude Code",
+          projectPath: args.projectPath,
+        }) as T,
+    );
+    const project = { id: "E:\\Data", name: "Data", path: "E:\\Data" };
+    const claudeTool = {
+      id: "claude",
+      name: "Claude Code",
+      state: { kind: "installed" as const, path: "claude.exe", version: null },
+    };
+    await store.start(project, claudeTool);
+    const activeId = store.getSnapshot().sessions[0].info.id;
+    store.showLauncher();
+    const current = store.getSnapshot();
+    vi.spyOn(launcherModule, "useLauncher").mockReturnValue({
+      ...store,
+      ...current,
+      session: null,
+      busy: false,
+    });
+    vi.spyOn(historyModule, "useSessionHistory").mockReturnValue({
+      records: [
+        {
+          id: activeId,
+          toolId: "claude",
+          toolName: "Claude Code",
+          projectPath: "E:\\Data",
+          startedAtMs: 1_763_650_000_000,
+          endedAtMs: null,
+          exitReason: null,
+          outputBytes: null,
+        },
+        {
+          id: "closed-ok",
+          toolId: "claude",
+          toolName: "Claude Code",
+          projectPath: "E:\\AgentTerm",
+          startedAtMs: 1_763_649_000_000,
+          endedAtMs: 1_763_649_500_000,
+          exitReason: "已停止",
+          outputBytes: null,
+        },
+        {
+          id: "crashed-missing",
+          toolId: "codex",
+          toolName: "Codex",
+          projectPath: "E:\\Other",
+          startedAtMs: 1_763_648_000_000,
+          endedAtMs: null,
+          exitReason: null,
+          outputBytes: null,
+        },
+      ],
+      loading: false,
+      error: "无法读取最近会话：历史校验失败",
+      reload: vi.fn(),
+    });
+
+    const html = renderToStaticMarkup(<App />);
+    expect(html).toContain('aria-label="最近会话"');
+    expect(html).toContain("无法读取最近会话：历史校验失败");
+    expect(html).toContain("重新读取");
+    expect(html).toContain("Claude Code · AgentTerm");
+    expect(html).toContain("已结束 · 已停止");
+    expect(html).toContain("Codex · Other");
+    expect(html).toContain("上次未正常退出");
+    expect(html).not.toContain("Claude Code · Data");
+    expect(html).toContain("再次打开会按原项目与工具新开终端");
+    expect(html).toContain('title="Codex未安装"');
   });
 });

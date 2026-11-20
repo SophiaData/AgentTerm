@@ -1,9 +1,18 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PRODUCT_NAME } from "./meta";
 import TaskWorkbench from "./TaskWorkbench";
 import { useProjects } from "./projects/useProjects";
 import SessionWorkspace from "./terminal/SessionWorkspace";
+import {
+  folderName,
+  formatSessionTime,
+  historyStatusText,
+  installedToolForRecord,
+  projectFromRecord,
+  recentClosedHistory,
+} from "./terminal/sessionHistory";
 import { useLauncher, type ActiveSession } from "./terminal/useLauncher";
+import { useSessionHistory } from "./terminal/useSessionHistory";
 import { badgeLabel, detailText } from "./tools/types";
 import { useTools } from "./tools/useTools";
 import { emptyPlan } from "./workbenchState";
@@ -12,6 +21,7 @@ export default function App() {
   const tools = useTools();
   const projects = useProjects();
   const launcher = useLauncher();
+  const history = useSessionHistory();
   const [projectId, setProjectId] = useState<string | null>(null);
   const [toolId, setToolId] = useState<string | null>(null);
   const [recordsOpen, setRecordsOpen] = useState(false);
@@ -23,6 +33,25 @@ export default function App() {
     tools.tools.find((t) => t.state.kind === "installed");
   const currentSession = launcher.session;
   const projectBusy = projects.loading || projects.busy || launcher.busy;
+  const activeSessionIds = new Set(launcher.sessions.map((s) => s.info.id));
+  const recentHistory = recentClosedHistory(history.records, activeSessionIds);
+  const runningCount = launcher.sessions.filter((s) => s.running).length;
+  const historyReloaded = useRef(false);
+  const reloadHistory = history.reload;
+  useEffect(() => {
+    if (!historyReloaded.current) {
+      historyReloaded.current = true;
+      return;
+    }
+    if (launcher.activeId === null) {
+      void reloadHistory();
+    }
+  }, [
+    launcher.activeId,
+    launcher.sessions.length,
+    runningCount,
+    reloadHistory,
+  ]);
   const selectSession = (session: ActiveSession) => {
     const project = projects.projects.find(
       (p) => p.path === session.info.projectPath,
@@ -418,6 +447,94 @@ export default function App() {
                 <p className="tools-error" role="alert">
                   {tools.error}
                 </p>
+              ) : null}
+              {history.error || recentHistory.length ? (
+                <section className="workspace-history" aria-label="最近会话">
+                  <div className="workspace-history-heading">
+                    <h2>最近会话</h2>
+                    <span>按原项目与工具新开</span>
+                  </div>
+                  {history.error ? (
+                    <div className="workspace-history-error">
+                      <p className="tools-error" role="alert">
+                        {history.error}
+                      </p>
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        disabled={history.loading}
+                        onClick={() => void history.reload()}
+                      >
+                        重新读取
+                      </button>
+                    </div>
+                  ) : null}
+                  {recentHistory.length ? (
+                    <>
+                      <ul className="workspace-history-list">
+                        {recentHistory.map((record) => {
+                          const reopenTool = installedToolForRecord(
+                            record,
+                            tools.tools,
+                          );
+                          const registeredTool = tools.tools.find(
+                            (item) => item.id === record.toolId,
+                          );
+                          const reasonTitle = reopenTool
+                            ? record.projectPath
+                            : registeredTool
+                              ? `${record.toolName}${badgeLabel(registeredTool.state)}`
+                              : `未找到 ${record.toolName}`;
+                          return (
+                            <li
+                              key={record.id}
+                              className="workspace-history-item"
+                            >
+                              <div className="workspace-history-meta">
+                                <strong>
+                                  {record.toolName} ·{" "}
+                                  {folderName(record.projectPath)}
+                                </strong>
+                                <span title={record.projectPath}>
+                                  {historyStatusText(record)} ·{" "}
+                                  {formatSessionTime(record.startedAtMs)}
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                className="ghost-button"
+                                disabled={
+                                  launcher.busy || tools.loading || !reopenTool
+                                }
+                                title={reasonTitle}
+                                onClick={() => {
+                                  if (!reopenTool) return;
+                                  const existingProject =
+                                    projects.projects.find(
+                                      (p) => p.path === record.projectPath,
+                                    );
+                                  if (existingProject) {
+                                    setProjectId(existingProject.id);
+                                  }
+                                  void launcher.start(
+                                    existingProject ??
+                                      projectFromRecord(record),
+                                    reopenTool,
+                                  );
+                                }}
+                              >
+                                再次打开
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                      <p className="workspace-history-note">
+                        历史记录只保存项目位置、时间与结束状态；再次打开会按原项目与工具新开终端。
+                      </p>
+                    </>
+                  ) : null}
+                </section>
               ) : null}
               <p className="workspace-entry-boundary">
                 此入口新开 CLI 会话；外部终端中的已有会话尚未接管。

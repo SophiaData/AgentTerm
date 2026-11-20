@@ -206,3 +206,9 @@ OS确认旧PID不存在或句柄已结束后，在同一账本锁下CAS追加恢
 SessionWorkspace始终在同一父节点按sessionId挂载全部SessionPanel，分屏、单屏和新建页只改变grid位置与hidden，避免重建xterm。TerminalView的visible负责输入可用性和尺寸同步，focused/focusRequest只控制显式切换时的输入焦点；点击面板按钮更新当前面板但不把键盘焦点抢回终端。两个可见终端各自观察尺寸，隐藏终端不提交零尺寸，后台退出保持最后屏幕。
 
 分隔线采用Pointer Capture，指针up/cancel释放；容器小于720px改上下排列，比例30～70%，键盘Home/End/方向键和双击/Enter可调整或复位。布局在本次窗口内保留，不写全局配置；不宣称应用重启恢复或后台服务存活。原生测试不得全局注入键盘，不以CI或模拟IPC替代真实CLI审批验收。
+
+### 手动会话历史与再次打开（2026-11-21）
+
+手动终端会话的启动与结束（自然退出、显式停止、应用退出清理）由 `session_history.rs` 写入 OS `local_data_dir()` 下的 `agentterm-session-history.json`，采用伴随 `.lock` 文件锁与 SHA-256 校验追加事件（schema=2、2 MiB 上限、最近 50 条读取窗口），损坏、缺锁或截断尾部均失败关闭且保留原文件。历史记录仅存会话 ID、工具 ID/名称、规范项目路径、起止时间戳、退出原因与可选输出字节数，不存屏幕内容、环境变量或凭据。
+
+历史写入失败只打印标准错误而不中断或丢失正在运行的 CLI；前端 `useSessionHistory` 经 `session_history` 命令在新建页显示最近 5 条未存活会话，读取失败保持可见并提供重新读取入口，工具缺失或未安装时禁用“再次打开”并说明原因。点击“再次打开”会按原项目与原工具调用 `start_session` 启动全新终端进程；明确标注不恢复原进程内存、滚动缓存或 CLI 内部上下文。该机制独立于 `task_ledger` 与 `task_document`，不占用单主任务槽，也不表示已支持外部终端接管或 CLI 原生 `resume` 协议。

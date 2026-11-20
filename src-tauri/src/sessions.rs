@@ -1,7 +1,10 @@
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use crate::session_history::{now_ms, SessionHistory, SessionRecord};
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
@@ -366,6 +369,10 @@ pub struct SessionManager {
     /// Kept so a view that mounts *after* the process died can still replay the
     /// final screen and learn the process is gone (instead of seeing "running").
     finished: Arc<Mutex<HashMap<String, (String, u64)>>>,
+    /// Persisted identity/end-state history, configured once before commands
+    /// are served. Recording is best-effort: a history write failure must not
+    /// orphan a running CLI, so callers keep the session and log the failure.
+    history: Arc<Mutex<Option<SessionHistory>>>,
 }
 
 impl Default for SessionManager {
@@ -373,6 +380,7 @@ impl Default for SessionManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             finished: Arc::new(Mutex::new(HashMap::new())),
+            history: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -382,6 +390,60 @@ impl SessionManager {
         self.sessions
             .lock()
             .map_err(|_| "会话管理暂时不可用，请重试".to_string())
+    }
+
+    /// Backend-only path, fixed before serving commands; never creates a
+    /// directory. History is optional only until this is called.
+    pub fn configure_history(&self, path: PathBuf) -> Result<(), String> {
+        let mut history = self
+            .history
+            .lock()
+            .map_err(|_| "会话历史暂时不可用，请重试".to_string())?;
+        if history.is_some() {
+            return Err("会话历史已经配置，不能切换".to_string());
+        }
+        *history = Some(SessionHistory::configure(path)?);
+        Ok(())
+    }
+
+    fn record_start(&self, record: SessionRecord) {
+        let recorded = self
+            .history
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .map(|history| history.record_start(record));
+        if let Some(Err(error)) = recorded {
+            eprintln!("AgentTerm could not persist session history: {error}");
+        }
+    }
+
+    fn record_end(
+        &self,
+        id: &str,
+        reason: Option<String>,
+        output_bytes: Option<u64>,
+    ) {
+        let recorded = self
+            .history
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .map(|history| history.record_end(id, now_ms(), reason, output_bytes));
+        if let Some(Err(error)) = recorded {
+            eprintln!("AgentTerm could not persist session end for {id}: {error}");
+        }
+    }
+
+    pub fn list_history(&self) -> Result<Vec<SessionRecord>, String> {
+        let guard = self
+            .history
+            .lock()
+            .map_err(|_| "会话历史暂时不可用，请重试".to_string())?;
+        match guard.as_ref() {
+            Some(history) => history.list(),
+            None => Err("会话历史尚未配置".to_string()),
+        }
     }
 
     pub fn start(
@@ -460,6 +522,17 @@ impl SessionManager {
 
         self.lock()?.insert(session_id.to_string(), session);
 
+        self.record_start(SessionRecord {
+            id: session_id.to_string(),
+            tool_id: tool.id.to_string(),
+            tool_name: tool.name.to_string(),
+            project_path: info.project_path.clone(),
+            started_at_ms: now_ms(),
+            ended_at_ms: None,
+            exit_reason: None,
+            output_bytes: None,
+        });
+
         let sessions = Arc::clone(&self.sessions);
         let finished_buffers = Arc::clone(&self.finished);
         let read_done_reader = Arc::clone(&read_done);
@@ -470,6 +543,7 @@ impl SessionManager {
         let exit_id = session_id.to_string();
         let app_output = app.clone();
         let app_exit = app;
+        let history_writer = Arc::clone(&self.history);
 
         // Reader thread: streams PTY output to the frontend as UTF-8 text and
         // keeps a replayable copy in the session buffer. The loop itself lives in
@@ -534,12 +608,25 @@ impl SessionManager {
                     archived_watcher.store(true, std::sync::atomic::Ordering::Release);
                     // Preserve the final buffer before releasing the session so a
                     // late-mounting view can replay it and see the exit state.
+                    let mut archived_bytes = None;
                     if let Ok(mut guard) = sessions.lock()
                         && let Some(session) = guard.remove(&exit_id)
                         && let Ok(buffer) = session.buffer.lock()
                         && let Ok(mut done) = finished_buffers.lock()
                     {
+                        archived_bytes = Some(buffer.data.len() as u64);
                         done.insert(exit_id.clone(), (buffer.data.clone(), buffer.end_offset));
+                    }
+                    if let Ok(history_guard) = history_writer.lock()
+                        && let Some(history) = history_guard.as_ref()
+                    {
+                        if let Err(error) =
+                            history.record_end(&exit_id, now_ms(), Some(reason.clone()), archived_bytes)
+                        {
+                            eprintln!(
+                                "AgentTerm could not persist session end for {exit_id}: {error}"
+                            );
+                        }
                     }
                     break reason;
                 }
@@ -640,6 +727,7 @@ impl SessionManager {
             done.remove(session_id);
         }
         drop(session);
+        self.record_end(session_id, Some("已停止".to_string()), None);
         Ok(())
     }
 
@@ -658,10 +746,19 @@ impl SessionManager {
     }
 
     pub fn stop_all(&self) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            for (_, mut session) in sessions.drain() {
-                let _ = session.child.kill();
-            }
+        let killed: Vec<String> = if let Ok(mut sessions) = self.sessions.lock() {
+            sessions
+                .drain()
+                .filter_map(|(id, mut session)| {
+                    let _ = session.child.kill();
+                    Some(id)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for id in killed {
+            self.record_end(&id, Some("应用退出".to_string()), None);
         }
     }
 
@@ -730,9 +827,17 @@ pub fn stop_session(
     state.stop(&session_id)
 }
 
+#[tauri::command]
+pub fn session_history(
+    state: tauri::State<'_, SessionManager>,
+) -> Result<Vec<SessionRecord>, String> {
+    state.list_history()
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use super::SessionManager;
@@ -1412,5 +1517,88 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn history_store(label: &str) -> PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "agentterm-session-history-{label}-{}-{}-{}.json",
+            std::process::id(),
+            super::now_ms(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn history_is_rejected_until_configured() {
+        let manager = SessionManager::default();
+        let error = manager.list_history().unwrap_err();
+        assert!(error.contains("尚未配置"), "got: {error}");
+    }
+
+    #[test]
+    fn history_can_only_be_configured_once() {
+        let manager = SessionManager::default();
+        let path = history_store("sessions");
+        manager.configure_history(path.clone()).unwrap();
+        let error = manager.configure_history(path).unwrap_err();
+        assert!(error.contains("已经配置"), "got: {error}");
+    }
+
+    #[test]
+    fn explicit_stop_records_history_end() {
+        let manager = SessionManager::default();
+        let path = history_store("stop");
+        manager.configure_history(path).unwrap();
+        insert_fake_session(&manager, "s-stop", false);
+        manager.record_start(super::SessionRecord {
+            id: "s-stop".to_string(),
+            tool_id: "claude".to_string(),
+            tool_name: "Claude Code".to_string(),
+            project_path: "E:\\AgentTerm".to_string(),
+            started_at_ms: 10,
+            ended_at_ms: None,
+            exit_reason: None,
+            output_bytes: None,
+        });
+
+        manager.stop("s-stop").unwrap();
+
+        let listed = manager.list_history().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "s-stop");
+        assert_eq!(listed[0].exit_reason.as_deref(), Some("已停止"));
+        assert!(listed[0].ended_at_ms.is_some());
+    }
+
+    #[test]
+    fn stop_all_records_app_exit_for_every_session() {
+        let manager = SessionManager::default();
+        let path = history_store("exit");
+        manager.configure_history(path).unwrap();
+        insert_fake_session(&manager, "s-exit-1", false);
+        insert_fake_session(&manager, "s-exit-2", false);
+        for id in ["s-exit-1", "s-exit-2"] {
+            manager.record_start(super::SessionRecord {
+                id: id.to_string(),
+                tool_id: "claude".to_string(),
+                tool_name: "Claude Code".to_string(),
+                project_path: "E:\\AgentTerm".to_string(),
+                started_at_ms: 10,
+                ended_at_ms: None,
+                exit_reason: None,
+                output_bytes: None,
+            });
+        }
+
+        manager.stop_all();
+
+        let listed = manager.list_history().unwrap();
+        assert_eq!(listed.len(), 2);
+        for record in listed {
+            assert_eq!(record.exit_reason.as_deref(), Some("应用退出"));
+            assert!(record.ended_at_ms.is_some());
+        }
+        assert!(manager.sessions.lock().unwrap().is_empty());
     }
 }

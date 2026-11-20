@@ -1,4 +1,5 @@
 mod projects;
+mod session_history;
 mod sessions;
 mod task_commands;
 pub mod task_document;
@@ -29,6 +30,7 @@ pub fn run() {
             sessions::resize_session,
             sessions::stop_session,
             sessions::forget_session,
+            sessions::session_history,
             task_commands::task_ledger_initialize,
             task_commands::task_ledger_snapshot,
             task_commands::claim_main_task,
@@ -51,6 +53,9 @@ pub fn run() {
                 .map_err(std::io::Error::other)?;
             app.state::<task_commands::TaskLedgerState>()
                 .configure(directory.join("agentterm-main-task-ledger.log"))
+                .map_err(std::io::Error::other)?;
+            app.state::<sessions::SessionManager>()
+                .configure_history(directory.join("agentterm-session-history.json"))
                 .map_err(std::io::Error::other)?;
 
             let window = app
