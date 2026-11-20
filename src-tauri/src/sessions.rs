@@ -643,6 +643,20 @@ impl SessionManager {
         Ok(())
     }
 
+    pub fn forget(&self, session_id: &str) -> Result<(), String> {
+        // Hold the live-session lock while releasing replay data. A caller may
+        // forget an ended tab, but must never detach a running process.
+        let sessions = self.lock()?;
+        if sessions.contains_key(session_id) {
+            return Err("会话仍在运行，请先结束会话".to_string());
+        }
+        self.finished
+            .lock()
+            .map_err(|_| "无法释放会话输出".to_string())?
+            .remove(session_id);
+        Ok(())
+    }
+
     pub fn stop_all(&self) {
         if let Ok(mut sessions) = self.sessions.lock() {
             for (_, mut session) in sessions.drain() {
@@ -698,6 +712,14 @@ pub fn resize_session(
     cols: u16,
 ) -> Result<(), String> {
     state.resize(&session_id, rows, cols)
+}
+
+#[tauri::command]
+pub fn forget_session(
+    state: tauri::State<'_, SessionManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state.forget(&session_id)
 }
 
 #[tauri::command]
@@ -1075,6 +1097,43 @@ mod tests {
         let manager = SessionManager::default();
 
         assert_eq!(manager.stop("missing").unwrap_err(), "会话不存在或已结束");
+    }
+
+    #[test]
+    fn forgetting_an_ended_tab_releases_only_its_output_and_is_idempotent() {
+        let manager = SessionManager::default();
+        manager.finished.lock().unwrap().extend([
+            ("a".to_string(), ("first".to_string(), 5)),
+            ("b".to_string(), ("second".to_string(), 6)),
+        ]);
+        manager.forget("a").unwrap();
+        manager.forget("a").unwrap();
+        assert!(manager.snapshot("a").is_err());
+        assert_eq!(manager.snapshot("b").unwrap().data, "second");
+    }
+
+    #[test]
+    fn forgetting_a_live_tab_is_rejected_and_preserves_the_process() {
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "live", false);
+        assert_eq!(
+            manager.forget("live").unwrap_err(),
+            "会话仍在运行，请先结束会话"
+        );
+        assert!(manager.is_running("live"));
+        assert!(manager.snapshot("live").unwrap().running);
+    }
+
+    #[test]
+    fn closing_one_live_session_keeps_another_running() {
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "a", false);
+        insert_fake_session(&manager, "b", false);
+        manager.stop("a").unwrap();
+        manager.forget("a").unwrap();
+        assert!(!manager.is_running("a"));
+        assert!(manager.is_running("b"));
+        assert!(manager.write("b", "continue\r").is_ok());
     }
 
     #[cfg(unix)]

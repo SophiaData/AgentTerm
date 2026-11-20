@@ -3,7 +3,7 @@ import { PRODUCT_NAME } from "./meta";
 import TaskWorkbench from "./TaskWorkbench";
 import { useProjects } from "./projects/useProjects";
 import SessionPanel from "./terminal/SessionPanel";
-import { useLauncher } from "./terminal/useLauncher";
+import { useLauncher, type ActiveSession } from "./terminal/useLauncher";
 import { badgeLabel, detailText } from "./tools/types";
 import { useTools } from "./tools/useTools";
 import { emptyPlan } from "./workbenchState";
@@ -23,6 +23,30 @@ export default function App() {
     tools.tools.find((t) => t.state.kind === "installed");
   const currentSession = launcher.session;
   const projectBusy = projects.loading || projects.busy || launcher.busy;
+  const selectSession = (session: ActiveSession) => {
+    const project = projects.projects.find(
+      (p) => p.path === session.info.projectPath,
+    );
+    if (project) setProjectId(project.id);
+    launcher.select(session.info.id);
+  };
+  const sessionLink = (session: ActiveSession) => (
+    <button
+      type="button"
+      key={session.info.id}
+      className="workspace-session-link"
+      aria-current={launcher.activeId === session.info.id ? "true" : undefined}
+      onClick={() => selectSession(session)}
+      title={session.info.projectPath}
+    >
+      <span
+        className={`session-dot${session.running ? " is-running" : ""}`}
+        aria-hidden="true"
+      />
+      <span>{session.label}</span>
+      <small>{session.running ? "运行中" : "已结束"}</small>
+    </button>
+  );
 
   return (
     <main className={`session-workspace${recordsOpen ? " with-records" : ""}`}>
@@ -47,6 +71,14 @@ export default function App() {
             ＋
           </button>
         </div>
+        <button
+          type="button"
+          className="workspace-new-session"
+          onClick={launcher.showLauncher}
+          disabled={launcher.starting}
+        >
+          ＋ 新建会话
+        </button>
         {projects.loading ? (
           <p className="sidebar-message">正在读取项目…</p>
         ) : null}
@@ -65,25 +97,21 @@ export default function App() {
                   selectedProject?.id === project.id ? "true" : undefined
                 }
                 title={project.path}
-                onClick={() => setProjectId(project.id)}
+                onClick={() => {
+                  setProjectId(project.id);
+                  const recent = launcher.sessions
+                    .filter((s) => s.info.projectPath === project.path)
+                    .slice(-1)[0];
+                  if (recent) launcher.select(recent.info.id);
+                  else launcher.showLauncher();
+                }}
               >
                 <span aria-hidden="true">▱</span>
                 <span>{project.name}</span>
               </button>
-              {currentSession?.info.projectPath === project.path ? (
-                <button
-                  type="button"
-                  className="workspace-session-link"
-                  onClick={() => setRecordsOpen(false)}
-                >
-                  <span
-                    className={`session-dot${currentSession.running ? " is-running" : ""}`}
-                    aria-hidden="true"
-                  />
-                  <span>{currentSession.info.toolName}</span>
-                  <small>{currentSession.running ? "运行中" : "已结束"}</small>
-                </button>
-              ) : null}
+              {launcher.sessions
+                .filter((s) => s.info.projectPath === project.path)
+                .map(sessionLink)}
             </li>
           ))}
         </ul>
@@ -92,27 +120,17 @@ export default function App() {
             添加已有目录，在项目里打开 Agent 会话。
           </p>
         ) : null}
-        {currentSession &&
-        !projects.projects.some(
-          (project) => project.path === currentSession.info.projectPath,
+        {launcher.sessions.some(
+          (s) => !projects.projects.some((p) => p.path === s.info.projectPath),
         ) ? (
           <div className="sidebar-current-session">
-            <h2>当前会话</h2>
-            <button
-              type="button"
-              className="workspace-session-link"
-              onClick={() => setRecordsOpen(false)}
-            >
-              <span
-                className={`session-dot${currentSession.running ? " is-running" : ""}`}
-                aria-hidden="true"
-              />
-              <span>{currentSession.info.toolName}</span>
-              <small>{currentSession.running ? "运行中" : "已结束"}</small>
-            </button>
-            <p className="sidebar-message">
-              查看其他项目会保留当前会话。结束后可以在另一项目启动。
-            </p>
+            <h2>其他已打开会话</h2>
+            {launcher.sessions
+              .filter(
+                (s) =>
+                  !projects.projects.some((p) => p.path === s.info.projectPath),
+              )
+              .map(sessionLink)}
           </div>
         ) : null}
         <div className="sidebar-bottom">
@@ -147,7 +165,12 @@ export default function App() {
                 <button
                   type="button"
                   className="ghost-button"
-                  disabled={projectBusy || !!currentSession}
+                  disabled={
+                    projectBusy ||
+                    launcher.sessions.some(
+                      (s) => s.info.projectPath === selectedProject.path,
+                    )
+                  }
                   onClick={() => projects.requestRemove(selectedProject.id)}
                 >
                   移除项目记录
@@ -174,7 +197,11 @@ export default function App() {
               {tools.loading ? "检测中…" : "重新检测"}
             </button>
           </details>
-          <p className="workspace-note">单个活动 CLI 会话 · 本机执行</p>
+          <p className="workspace-note">
+            {launcher.sessions.length
+              ? `${launcher.sessions.length} 个会话 · ${launcher.sessions.filter((s) => s.running).length} 个进程运行中`
+              : "本机 CLI 会话工作区"}
+          </p>
         </div>
       </aside>
 
@@ -183,7 +210,9 @@ export default function App() {
           <div className="workspace-context">
             <span>
               {currentSession
-                ? currentSession.info.toolName
+                ? (projects.projects.find(
+                    (p) => p.path === currentSession.info.projectPath,
+                  )?.name ?? currentSession.info.toolName)
                 : (selectedProject?.name ?? "工作区")}
             </span>
             <span className="workspace-context-separator">/</span>
@@ -199,21 +228,92 @@ export default function App() {
             {recordsOpen ? "收起任务记录" : "任务记录"}
           </button>
         </header>
-        {currentSession ? (
-          <div className="workspace-terminal-stage">
+        {launcher.sessions.length ? (
+          <div
+            className="workspace-tabs"
+            role="tablist"
+            aria-label="已打开的会话"
+          >
+            {launcher.sessions.map((session) => (
+              <button
+                type="button"
+                role="tab"
+                id={`tab-${session.info.id}`}
+                aria-controls={`pane-${session.info.id}`}
+                aria-selected={launcher.activeId === session.info.id}
+                tabIndex={
+                  launcher.activeId === session.info.id ||
+                  (!launcher.activeId && launcher.sessions[0] === session)
+                    ? 0
+                    : -1
+                }
+                className="workspace-tab"
+                key={session.info.id}
+                title={session.info.projectPath}
+                onClick={() => selectSession(session)}
+                onKeyDown={(event) => {
+                  const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+                  if (!keys.includes(event.key)) return;
+                  event.preventDefault();
+                  const tabs = Array.from(
+                    event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                      '[role="tab"]',
+                    ) ?? [],
+                  );
+                  const index = tabs.indexOf(event.currentTarget);
+                  const next =
+                    event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? tabs.length - 1
+                        : (index +
+                            (event.key === "ArrowRight" ? 1 : -1) +
+                            tabs.length) %
+                          tabs.length;
+                  tabs[next]?.focus();
+                }}
+              >
+                <span
+                  className={`session-dot${session.running ? " is-running" : ""}`}
+                  aria-hidden="true"
+                />
+                {session.label}
+              </button>
+            ))}
+            <button
+              type="button"
+              className="workspace-tab-add"
+              aria-label="新建会话"
+              onClick={launcher.showLauncher}
+              disabled={launcher.starting}
+            >
+              ＋
+            </button>
+          </div>
+        ) : null}
+        {launcher.sessions.map((session) => (
+          <div
+            key={session.info.id}
+            className="workspace-terminal-stage"
+            id={`pane-${session.info.id}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${session.info.id}`}
+            hidden={launcher.activeId !== session.info.id}
+          >
             <SessionPanel
-              key={currentSession.info.id}
-              session={currentSession.info}
-              active
-              running={currentSession.running}
-              exitReason={currentSession.exitReason}
-              busy={launcher.busy}
-              closeError={launcher.closeError}
-              onClose={launcher.close}
+              session={session.info}
+              label={session.label}
+              active={launcher.activeId === session.info.id}
+              running={session.running}
+              exitReason={session.exitReason}
+              busy={launcher.closingId === session.info.id}
+              closeError={session.closeError}
+              onClose={() => void launcher.close(session.info.id)}
               onExit={launcher.handleExit}
             />
           </div>
-        ) : (
+        ))}
+        {!currentSession ? (
           <div className="workspace-start">
             <div className="workspace-start-content">
               <span className="workspace-start-mark" aria-hidden="true">
@@ -227,7 +327,7 @@ export default function App() {
               </h1>
               <p className="workspace-start-description">
                 {selectedProject
-                  ? "在完整的 CLI 中对话、执行命令和处理审批。会话会留在这个工作区。"
+                  ? "打开一个独立的 CLI 会话。已有会话继续保留，随时切换回来。"
                   : "选择已有项目目录，把 Agent 的终端会话放在一起管理。"}
               </p>
               {selectedProject ? (
@@ -313,7 +413,7 @@ export default function App() {
               </p>
             </div>
           </div>
-        )}
+        ) : null}
       </section>
       {recordsOpen ? (
         <aside

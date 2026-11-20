@@ -28,6 +28,7 @@ pub fn run() {
             sessions::write_session_input,
             sessions::resize_session,
             sessions::stop_session,
+            sessions::forget_session,
             task_commands::task_ledger_initialize,
             task_commands::task_ledger_snapshot,
             task_commands::claim_main_task,

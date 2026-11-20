@@ -1,7 +1,10 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { isSupportedTarget, PRODUCT_NAME, SUPPORTED_TARGETS } from "./meta";
+import * as launcherModule from "./terminal/useLauncher";
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("AgentTerm application shell", () => {
   it("starts with projects and an agent session, keeping records optional", () => {
@@ -32,5 +35,55 @@ describe("AgentTerm application shell", () => {
     ]);
     expect(isSupportedTarget("macos-arm64")).toBe(true);
     expect(isSupportedTarget("macos-x64")).toBe(false);
+  });
+
+  it("keeps both terminal panels mounted and hides only the unselected session", async () => {
+    const store = launcherModule.createSessionStore(
+      async <T,>(_command: string, args: Record<string, unknown>) =>
+        ({
+          id: args.sessionId,
+          toolId: args.toolId,
+          toolName: "Claude Code",
+          projectPath: args.projectPath,
+        }) as T,
+    );
+    const project = { id: "project", name: "Data", path: "E:\\Data" };
+    const tool = {
+      id: "claude",
+      name: "Claude Code",
+      state: { kind: "installed" as const, path: "claude.exe", version: null },
+    };
+    await store.start(project, tool);
+    await store.start(project, tool);
+    const state = store.getSnapshot();
+    const [first, second] = state.sessions;
+    const mock = vi.spyOn(launcherModule, "useLauncher");
+    const render = () => {
+      const current = store.getSnapshot();
+      mock.mockReturnValue({
+        ...store,
+        ...current,
+        session:
+          current.sessions.find((s) => s.info.id === current.activeId) ?? null,
+        busy: false,
+      });
+      return renderToStaticMarkup(<App />);
+    };
+    const html = render();
+    expect(html.match(/role="tabpanel"/g)).toHaveLength(2);
+    expect(html).toContain(
+      `id="pane-${first.info.id}" role="tabpanel" aria-labelledby="tab-${first.info.id}" hidden=""`,
+    );
+    expect(html).toContain(
+      `id="pane-${second.info.id}" role="tabpanel" aria-labelledby="tab-${second.info.id}"`,
+    );
+    expect(html.match(/aria-selected="true"/g)).toHaveLength(1);
+    store.showLauncher();
+    const launcherHtml = render();
+    expect(launcherHtml.match(/role="tabpanel"/g)).toHaveLength(2);
+    expect(
+      launcherHtml.match(/role="tabpanel" aria-labelledby="[^"]+" hidden=""/g),
+    ).toHaveLength(2);
+    expect(launcherHtml).toContain("从一个项目开始");
   });
 });

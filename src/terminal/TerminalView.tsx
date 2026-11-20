@@ -69,6 +69,7 @@ export default function TerminalView({
       const input = () => {
         terminal.options.disableStdin =
           localPhase !== "ready" ||
+          !current.current.active ||
           !current.current.running ||
           current.current.busy;
       };
@@ -157,7 +158,11 @@ export default function TerminalView({
       );
       cleanups.push(transport.dispose);
       const data = terminal.onData((text) => {
-        if (current.current.running && !current.current.busy)
+        if (
+          current.current.active &&
+          current.current.running &&
+          !current.current.busy
+        )
           transport.send(text);
       });
       cleanups.push(() => data.dispose());

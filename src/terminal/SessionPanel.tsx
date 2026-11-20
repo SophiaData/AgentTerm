@@ -4,6 +4,7 @@ import { sessionTitle, type SessionInfo } from "./types";
 
 type Props = {
   session: SessionInfo;
+  label: string;
   active: boolean;
   running: boolean;
   exitReason: string | null;
@@ -15,6 +16,7 @@ type Props = {
 
 export default function SessionPanel({
   session,
+  label,
   active,
   running,
   exitReason,
@@ -28,7 +30,9 @@ export default function SessionPanel({
     <section className="session-panel" aria-label="终端会话" hidden={!active}>
       <div className="session-header">
         <div className="session-title-group">
-          <span className="session-title">{sessionTitle(session)}</span>
+          <span className="session-title" title={sessionTitle(session)}>
+            {label}
+          </span>
           <span className={`badge ${running ? "badge-installed" : ""}`}>
             {running
               ? "运行中"
@@ -43,11 +47,11 @@ export default function SessionPanel({
           onClick={() => (running ? setConfirmClose(true) : onClose())}
           disabled={busy}
         >
-          {busy ? "正在结束…" : running ? "结束会话" : "返回启动页"}
+          {busy ? "正在结束…" : running ? "结束会话" : "关闭会话"}
         </button>
       </div>
       <p className="session-context" title={session.projectPath}>
-        {session.projectPath} · 切换页面后保留会话
+        {session.projectPath} · 切换会话后继续保留
       </p>
       {confirmClose && running ? (
         <div className="session-confirm" role="group" aria-label="确认结束会话">
