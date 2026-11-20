@@ -158,8 +158,7 @@ impl SessionHistory {
             if line.trim().is_empty() {
                 return Err(invalid_store());
             }
-            let saved: HistoryLine =
-                serde_json::from_str(line).map_err(|_| invalid_store())?;
+            let saved: HistoryLine = serde_json::from_str(line).map_err(|_| invalid_store())?;
             if saved.schema != 2
                 || revision.checked_add(1) != Some(saved.revision)
                 || saved.sha256 != history_hash(saved.revision, &saved.event)?
@@ -280,12 +279,9 @@ fn apply_event(
 }
 
 fn validate_record(record: &SessionRecord) -> Result<(), String> {
-    let reason_ok = record
-        .exit_reason
-        .as_deref()
-        .is_none_or(|reason| {
-            !reason.is_empty() && reason.len() <= 1024 && !reason.chars().any(char::is_control)
-        });
+    let reason_ok = record.exit_reason.as_deref().is_none_or(|reason| {
+        !reason.is_empty() && reason.len() <= 1024 && !reason.chars().any(char::is_control)
+    });
     let ended_ok = record
         .ended_at_ms
         .is_none_or(|ended| ended >= record.started_at_ms);
@@ -364,7 +360,9 @@ mod tests {
 
     #[test]
     fn configure_rejects_missing_parent() {
-        let missing = std::env::temp_dir().join("agentterm-missing-parent-dir").join("history.json");
+        let missing = std::env::temp_dir()
+            .join("agentterm-missing-parent-dir")
+            .join("history.json");
         let error = SessionHistory::configure(missing).unwrap_err();
         assert!(error.contains("父目录必须已经存在"), "got: {error}");
     }
@@ -401,9 +399,7 @@ mod tests {
     fn end_requires_existing_record() {
         let path = temp_store("end-missing");
         let history = SessionHistory::configure(path).unwrap();
-        let error = history
-            .record_end("nope", 20, None, None)
-            .unwrap_err();
+        let error = history.record_end("nope", 20, None, None).unwrap_err();
         assert!(error.contains("不存在"), "got: {error}");
     }
 
@@ -434,7 +430,10 @@ mod tests {
             .unwrap()
             .write_all(b"not-json\n")
             .unwrap();
-        let error = SessionHistory::configure(path.clone()).unwrap().list().unwrap_err();
+        let error = SessionHistory::configure(path.clone())
+            .unwrap()
+            .list()
+            .unwrap_err();
         assert!(error.contains("校验失败"), "got: {error}");
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after[..before.len()]);
@@ -449,7 +448,11 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let mut damaged = bytes.clone();
         let position = damaged.len() - 3;
-        damaged[position] = if damaged[position] == b'0' { b'1' } else { b'0' };
+        damaged[position] = if damaged[position] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
         std::fs::write(&path, &damaged).unwrap();
         let error = SessionHistory::configure(path).unwrap().list().unwrap_err();
         assert!(error.contains("校验失败"), "got: {error}");
@@ -493,8 +496,14 @@ mod tests {
             .unwrap()
             .write_all(b"{\"schema\":2")
             .unwrap();
-        let error = SessionHistory::configure(path.clone()).unwrap().list().unwrap_err();
+        let error = SessionHistory::configure(path.clone())
+            .unwrap()
+            .list()
+            .unwrap_err();
         assert!(error.contains("校验失败"), "got: {error}");
-        assert_eq!(&std::fs::read(&path).unwrap()[..before.len()], before.as_slice());
+        assert_eq!(
+            &std::fs::read(&path).unwrap()[..before.len()],
+            before.as_slice()
+        );
     }
 }

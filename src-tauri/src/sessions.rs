@@ -2,7 +2,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::session_history::{now_ms, SessionHistory, SessionRecord};
+use crate::session_history::{SessionHistory, SessionRecord, now_ms};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -418,12 +418,7 @@ impl SessionManager {
         }
     }
 
-    fn record_end(
-        &self,
-        id: &str,
-        reason: Option<String>,
-        output_bytes: Option<u64>,
-    ) {
+    fn record_end(&self, id: &str, reason: Option<String>, output_bytes: Option<u64>) {
         let recorded = self
             .history
             .lock()
@@ -620,9 +615,12 @@ impl SessionManager {
                     if let Ok(history_guard) = history_writer.lock()
                         && let Some(history) = history_guard.as_ref()
                     {
-                        if let Err(error) =
-                            history.record_end(&exit_id, now_ms(), Some(reason.clone()), archived_bytes)
-                        {
+                        if let Err(error) = history.record_end(
+                            &exit_id,
+                            now_ms(),
+                            Some(reason.clone()),
+                            archived_bytes,
+                        ) {
                             eprintln!(
                                 "AgentTerm could not persist session end for {exit_id}: {error}"
                             );
