@@ -1540,6 +1540,15 @@ mod tests {
         assert!(error.contains("已经配置"), "got: {error}");
     }
 
+    fn history_project() -> String {
+        if cfg!(windows) {
+            "E:\\AgentTerm"
+        } else {
+            "/tmp/agentterm"
+        }
+        .to_string()
+    }
+
     #[test]
     fn explicit_stop_records_history_end() {
         let manager = SessionManager::default();
@@ -1550,7 +1559,7 @@ mod tests {
             id: "s-stop".to_string(),
             tool_id: "claude".to_string(),
             tool_name: "Claude Code".to_string(),
-            project_path: "E:\\AgentTerm".to_string(),
+            project_path: history_project(),
             started_at_ms: 10,
             ended_at_ms: None,
             exit_reason: None,
@@ -1578,7 +1587,7 @@ mod tests {
                 id: id.to_string(),
                 tool_id: "claude".to_string(),
                 tool_name: "Claude Code".to_string(),
-                project_path: "E:\\AgentTerm".to_string(),
+                project_path: history_project(),
                 started_at_ms: 10,
                 ended_at_ms: None,
                 exit_reason: None,

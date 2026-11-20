@@ -350,7 +350,12 @@ mod tests {
             id: id.to_string(),
             tool_id: "claude".to_string(),
             tool_name: "Claude Code".to_string(),
-            project_path: "E:\\AgentTerm".to_string(),
+            project_path: if cfg!(windows) {
+                "E:\\AgentTerm"
+            } else {
+                "/tmp/agentterm"
+            }
+            .to_string(),
             started_at_ms: started,
             ended_at_ms: None,
             exit_reason: None,
