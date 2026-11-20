@@ -94,3 +94,15 @@
 - [Orca](https://github.com/stablyai/orca)：参考其多 CLI 接入、任务派发、结果回报、差异审查与恢复能力，按上述范围缩小产品面。
 - [Orca 编排指南](https://github.com/stablyai/orca/blob/main/skill-guides/orchestration.md)：参考任务与执行尝试的区分、明确回报及异常处理。
 - [项目工程模板](https://github.com/SophiaData/agent-project-template)：提供模型无关的规划、验证和独立审查规范。
+
+### Herdr界面核对（2026-11-20）
+
+本轮实际查看herdrdev/herdr的`assets/screenshot.png`与herdrdev/herdr-layout-examples的`code/preview.png`，并核对Herdr桌面README及Code示例RECIPE。查看的是官方仓库截图与演示资料，没有安装实测Herdr。
+
+优先借鉴TUI截图的组织：窄侧栏显示项目/分支与Agent状态，主要空间留给原始CLI分屏，薄边框标记当前输入面板。桌面的space→tab→pane层级提供项目、任务与终端对应关系。Code示例包含固定只读CSS视图，文件菜单并非完整编辑器，不能把展示样式当作已实现能力复制。
+
+当前AgentTerm仅完成多会话源码和标签切换，尚无分屏、Agent语义状态或独立会话服务；这些是与参考界面的明确差距。下一交互切片先实现可调双终端分屏与当前输入面板，再补有协议依据的待输入/工作中状态。关闭窗口后的会话存活与应用重启恢复须通过后台会话服务/CLI原生resume单独验收，不能由隐藏窗口代替。受管单主任务策略与开发时主Agent串行执行保持独立。
+
+- TUI截图：https://github.com/herdrdev/herdr/blob/master/assets/screenshot.png
+- 桌面语义：https://github.com/herdrdev/herdr-app/blob/master/README.md
+- Code示例边界：https://github.com/herdrdev/herdr-layout-examples/blob/master/code/RECIPE.md
