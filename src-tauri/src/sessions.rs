@@ -769,6 +769,11 @@ mod tests {
         fn process_id(&self) -> Option<u32> {
             Some(999_999)
         }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
     }
 
     /// Minimal `MasterPty` so a `PtySession` can be constructed in tests without a
