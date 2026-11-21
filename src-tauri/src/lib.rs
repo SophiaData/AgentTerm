@@ -80,8 +80,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("AgentTerm should build")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                app.state::<sessions::SessionManager>().stop_all();
+            if let tauri::RunEvent::ExitRequested { api, .. } = event
+                && let Err(error) = app.state::<sessions::SessionManager>().stop_all()
+            {
+                api.prevent_exit();
+                tray::report_shutdown_error(app, &error);
             }
         });
 }
