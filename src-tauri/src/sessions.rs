@@ -1001,24 +1001,29 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn stop_all(&self) {
-        let killed: Vec<String> = if let Ok(mut sessions) = self.sessions.lock() {
-            sessions
-                .drain()
-                .map(|(id, mut session)| {
-                    let _ = session.child.kill();
-                    #[cfg(windows)]
-                    if let Some(job) = session.job.as_ref() {
-                        job.terminate();
-                    }
-                    id
-                })
-                .collect()
+    /// Stop every live session before allowing the process to exit.
+    /// A failed kill keeps that session in the map so the caller can retry;
+    /// silently draining the map would orphan the child process.
+    pub fn stop_all(&self) -> Result<(), String> {
+        let ids = self
+            .sessions
+            .lock()
+            .map_err(|_| "会话管理暂时不可用，请重试".to_string())?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for id in ids {
+            match self.stop(&id) {
+                Ok(()) => {}
+                Err(error) if error == "会话不存在或已结束" => {}
+                Err(error) => failures.push(format!("{id}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
         } else {
-            Vec::new()
-        };
-        for id in killed {
-            self.record_end(&id, Some("应用退出".to_string()), None);
+            Err(format!("无法安全结束所有终端：{}", failures.join("；")))
         }
     }
 
