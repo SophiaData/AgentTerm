@@ -1869,7 +1869,11 @@ h2 {
 }
 
 .status-installed {
-  border-color: color-mix(in srgb, var(--at-accent) 55%, var(--at-border-default));
+  border-color: color-mix(
+    in srgb,
+    var(--at-accent) 55%,
+    var(--at-border-default)
+  );
   background: var(--at-accent-quiet);
   color: var(--at-accent);
 }
@@ -1879,7 +1883,11 @@ h2 {
 }
 
 .status-notExecutable {
-  border-color: color-mix(in srgb, var(--at-status-warning) 55%, var(--at-border-default));
+  border-color: color-mix(
+    in srgb,
+    var(--at-status-warning) 55%,
+    var(--at-border-default)
+  );
   background: rgb(251 146 60 / 12%);
   color: var(--at-status-warning);
 }
