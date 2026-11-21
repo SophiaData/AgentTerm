@@ -1,6 +1,7 @@
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Manager, Runtime};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 const SHOW_WINDOW: &str = "show-window";
 const HIDE_WINDOW: &str = "hide-window";
@@ -38,6 +39,22 @@ pub fn hide_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     window.hide().map_err(|error| error.to_string())
 }
 
+/// Report a blocked normal exit with a native dialog instead of silently
+/// leaving managed child processes without an owner.
+pub fn report_shutdown_error<R: Runtime>(app: &AppHandle<R>, error: &str) {
+    eprintln!("AgentTerm safe shutdown blocked: {error}");
+    if let Err(show_error) = show_main_window(app) {
+        eprintln!("Unable to show AgentTerm after failed shutdown: {show_error}");
+    }
+    app.dialog()
+        .message(format!(
+            "终端进程可能仍在运行，已取消退出。请重试退出或手动关闭会话。\n{error}"
+        ))
+        .title("AgentTerm 无法安全退出")
+        .kind(MessageDialogKind::Error)
+        .show(|_| {});
+}
+
 pub fn install_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItem::with_id(app, SHOW_WINDOW, "显示 AgentTerm", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, HIDE_WINDOW, "隐藏窗口", true, None::<&str>)?;
@@ -64,7 +81,12 @@ pub fn install_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Unable to hide AgentTerm: {error}");
                 }
             }
-            Some(TrayCommand::Quit) => app.exit(0),
+            Some(TrayCommand::Quit) => {
+                match app.state::<crate::sessions::SessionManager>().stop_all() {
+                    Ok(()) => app.exit(0),
+                    Err(error) => report_shutdown_error(app, &error),
+                }
+            }
             None => {}
         })
         .on_tray_icon_event(|tray, event| {
