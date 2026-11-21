@@ -17,6 +17,8 @@ describe("AgentTerm application shell", () => {
     expect(html).toContain("Agent 会话工作区");
     expect(html).toContain("从一个项目开始");
     expect(html).toContain("任务记录");
+    expect(html).toContain("工具状态");
+    expect(html).toContain("重新检测 CLI 工具");
     expect(html).not.toContain("启用任务记录");
     expect(html).not.toContain("保存任务计划");
     expect(html).not.toContain("正在读取任务");
