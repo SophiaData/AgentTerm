@@ -383,27 +383,26 @@ fn pump_reader(
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => {
-                if archived.load(std::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
                 let text = decoder.push(&chunk[..count]);
                 if text.is_empty() {
                     continue; // only a partial character so far
                 }
-                let end_offset = if let Ok(mut guard) = buffer.lock() {
-                    guard.end_offset += text.len() as u64;
-                    guard.data.push_str(&text);
-                    trim_buffer_front(&mut guard.data, MAX_BUFFER_CHARS);
-                    guard.end_offset
-                } else {
-                    0
+                // Keep the archive decision, buffer update, and live delivery in
+                // one critical section. The watcher takes this same lock before
+                // marking the session archived, so it cannot snapshot old output
+                // or emit the exit event ahead of an in-flight chunk (#19).
+                let Ok(mut guard) = buffer.lock() else {
+                    break;
                 };
                 if archived.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
+                guard.end_offset += text.len() as u64;
+                guard.data.push_str(&text);
+                trim_buffer_front(&mut guard.data, MAX_BUFFER_CHARS);
                 let event = SessionOutput {
                     data: text,
-                    end_offset,
+                    end_offset: guard.end_offset,
                 };
                 if !sink(event) {
                     break;
@@ -415,18 +414,18 @@ fn pump_reader(
     // Flush any character left incomplete at EOF so it is not silently lost (it
     // is genuinely truncated by then, so lossy is correct).
     let tail = decoder.finish();
-    if !tail.is_empty() && !archived.load(std::sync::atomic::Ordering::Acquire) {
-        let end_offset = if let Ok(mut guard) = buffer.lock() {
+    if !tail.is_empty() {
+        let Ok(mut guard) = buffer.lock() else {
+            return;
+        };
+        if !archived.load(std::sync::atomic::Ordering::Acquire) {
             guard.end_offset += tail.len() as u64;
             guard.data.push_str(&tail);
-            guard.end_offset
-        } else {
-            0
-        };
-        let _ = sink(SessionOutput {
-            data: tail,
-            end_offset,
-        });
+            let _ = sink(SessionOutput {
+                data: tail,
+                end_offset: guard.end_offset,
+            });
+        }
     }
 }
 
@@ -844,20 +843,30 @@ impl SessionManager {
                             job.terminate();
                         }
                     }
-                    // Mark archived BEFORE releasing the session: the reader
-                    // checks this flag and stops emitting, so late output from a
-                    // descendant cannot reach a finished session (#15).
-                    archived_watcher.store(true, std::sync::atomic::Ordering::Release);
-                    // Preserve the final buffer before releasing the session so a
-                    // late-mounting view can replay it and see the exit state.
+                    // Lock the output buffer before marking the session archived.
+                    // `pump_reader` holds this lock through live delivery, so the
+                    // snapshot and the last emitted chunk cannot diverge (#19).
                     let mut archived_bytes = None;
-                    if let Ok(mut guard) = sessions.lock()
-                        && let Some(session) = guard.remove(&exit_id)
-                        && let Ok(buffer) = session.buffer.lock()
-                        && let Ok(mut done) = finished_buffers.lock()
+                    if let Ok(mut sessions_guard) = sessions.lock()
+                        && let Some(session) = sessions_guard.get(&exit_id)
                     {
-                        archived_bytes = Some(buffer.data.len() as u64);
-                        done.insert(exit_id.clone(), (buffer.data.clone(), buffer.end_offset));
+                        let buffer = Arc::clone(&session.buffer);
+                        if let Ok(buffer_guard) = buffer.lock() {
+                            archived_watcher.store(true, std::sync::atomic::Ordering::Release);
+
+                            let archived_data = buffer_guard.data.clone();
+                            let archived_offset = buffer_guard.end_offset;
+                            archived_bytes = Some(buffer_guard.data.len() as u64);
+                            drop(buffer_guard);
+                            sessions_guard.remove(&exit_id);
+                            if let Ok(mut done) = finished_buffers.lock() {
+                                done.insert(exit_id.clone(), (archived_data, archived_offset));
+                            }
+                        } else {
+                            archived_watcher.store(true, std::sync::atomic::Ordering::Release);
+
+                            sessions_guard.remove(&exit_id);
+                        }
                     }
                     if let Ok(history_guard) = history_writer.lock()
                         && let Some(history) = history_guard.as_ref()
@@ -1411,6 +1420,45 @@ mod tests {
             !events.iter().any(|e| e.contains("AFTER-ARCHIVE")),
             "late output must not be emitted after archive"
         );
+    }
+
+    #[test]
+    fn archive_waits_for_in_flight_output_before_snapshotting() {
+        let mut reader = ScriptedReader {
+            chunks: vec![b"TAIL".to_vec()].into(),
+        };
+        let buffer = std::sync::Arc::new(super::Mutex::new(super::OutputBuffer::default()));
+        let archived = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let archive_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let snapshot = std::sync::Arc::new(super::Mutex::new(None));
+        let mut events = Vec::new();
+        let mut archive_thread = None;
+
+        let mut sink = |event: super::SessionOutput| {
+            let buffer_for_archive = std::sync::Arc::clone(&buffer);
+            let archived_for_archive = std::sync::Arc::clone(&archived);
+            let archive_started_for_thread = std::sync::Arc::clone(&archive_started);
+            let snapshot_for_archive = std::sync::Arc::clone(&snapshot);
+            archive_thread = Some(std::thread::spawn(move || {
+                archive_started_for_thread.store(true, std::sync::atomic::Ordering::Release);
+                let guard = buffer_for_archive.lock().unwrap();
+                archived_for_archive.store(true, std::sync::atomic::Ordering::Release);
+                *snapshot_for_archive.lock().unwrap() =
+                    Some((guard.data.clone(), guard.end_offset));
+            }));
+            while !archive_started.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            events.push(event.data);
+            true
+        };
+
+        super::pump_reader(&mut reader, &buffer, &archived, &mut sink);
+        archive_thread.unwrap().join().unwrap();
+
+        assert_eq!(events, vec!["TAIL".to_string()]);
+        assert_eq!(snapshot.lock().unwrap().as_ref().unwrap().0, "TAIL");
+        assert_eq!(snapshot.lock().unwrap().as_ref().unwrap().1, 4);
     }
 
     #[test]
