@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  RUST_TEST_THREADS: '1'
+  CARGO_BUILD_JOBS: '1'
+
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -44,3 +48,43 @@ jobs:
 
       - name: Run all project quality checks
         run: pnpm check
+
+  windows-frontend:
+    needs: quality
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13'
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test frontend on Windows
+        run: pnpm test
+
+      - name: Typecheck and build frontend on Windows
+        run: pnpm build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test native persistence and recovery on Windows
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Upload frontend for interaction acceptance
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-windows-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

@@ -1,5 +1,11 @@
 mod projects;
+mod session_history;
 mod sessions;
+mod task_commands;
+pub mod task_document;
+pub mod task_ledger;
+mod task_process;
+pub mod task_relay;
 mod tools;
 mod tray;
 
@@ -12,6 +18,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(projects::ProjectStore::default())
         .manage(sessions::SessionManager::default())
+        .manage(task_commands::TaskLedgerState::default())
         .invoke_handler(tauri::generate_handler![
             tools::detect_tools,
             projects::list_projects,
@@ -21,10 +28,39 @@ pub fn run() {
             sessions::session_snapshot,
             sessions::write_session_input,
             sessions::resize_session,
-            sessions::stop_session
+            sessions::stop_session,
+            sessions::forget_session,
+            sessions::session_history,
+            task_commands::task_ledger_initialize,
+            task_commands::task_ledger_snapshot,
+            task_commands::claim_main_task,
+            task_commands::cancel_main_task_reservation,
+            task_commands::recover_main_task_reservation,
+            task_commands::resume_main_task_after_recovery,
+            task_commands::workbench_snapshot,
+            task_commands::create_workbench_task,
+            task_commands::attach_task_plan,
+            task_commands::reference_task_artifact,
+            task_commands::associate_task_session,
+            task_commands::dispatch_controlled_task,
+            task_commands::request_stop_controlled_task,
+            task_commands::preview_task_artifact
         ])
         .setup(|app| {
             tray::install_tray(app)?;
+
+            // Fixed existing OS data directory: projects and windows cannot
+            // select separate ledgers. No directory or ledger is auto-created.
+            let directory = app.path().local_data_dir()?;
+            app.state::<projects::ProjectStore>()
+                .configure(directory.join("agentterm-projects.json"))
+                .map_err(std::io::Error::other)?;
+            app.state::<task_commands::TaskLedgerState>()
+                .configure(directory.join("agentterm-main-task-ledger.log"))
+                .map_err(std::io::Error::other)?;
+            app.state::<sessions::SessionManager>()
+                .configure_history(directory.join("agentterm-session-history.json"))
+                .map_err(std::io::Error::other)?;
 
             let window = app
                 .get_webview_window("main")

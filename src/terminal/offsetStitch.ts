@@ -15,6 +15,16 @@ export function byteLength(text: string): number {
   return encoder.encode(text).length;
 }
 
+function validUtf8SuffixStart(bytes: Uint8Array, offset: number): number {
+  let index = Math.max(0, Math.min(offset, bytes.length));
+  // UTF-8 continuation bytes always match 10xxxxxx (0x80..0xBF); skip past any
+  // partial leading byte when slicing inside a multi-byte character.
+  while (index < bytes.length && (bytes[index] & 0xc0) === 0x80) {
+    index += 1;
+  }
+  return index;
+}
+
 /**
  * Given a snapshot ending at `snapshotOffset`, decide what part of `chunk` still
  * needs writing. Returns "" when the chunk is fully covered by the snapshot,
@@ -38,7 +48,8 @@ export function sliceChunkAfter(
     return chunk.data;
   }
   const bytes = encoder.encode(chunk.data);
-  return new TextDecoder().decode(bytes.subarray(skip));
+  const safeStart = validUtf8SuffixStart(bytes, skip);
+  return new TextDecoder().decode(bytes.subarray(safeStart));
 }
 
 /**

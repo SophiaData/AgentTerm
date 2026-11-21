@@ -13,7 +13,7 @@
     "dev:app": "tauri dev",
     "tauri": "tauri",
     "check": "python3 scripts/verify_project.py && python3 scripts/run_quality.py",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=1 --no-file-parallelism",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --max-warnings=0",
     "format": "prettier --write README.md CLAUDE.md CHANGELOG.md docs src index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json",

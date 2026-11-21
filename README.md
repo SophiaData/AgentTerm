@@ -1,6 +1,12 @@
 # AgentTerm
 
-集中管理 Claude Code、Codex、Agy 等命令行 AI 工具的轻量桌面应用。采用 Tauri 2、Rust、React 与 TypeScript，目标平台为 macOS Apple Silicon 和 Windows x64。
+AgentTerm 的产品方向是本地优先的轻量数据开发 Agent 工作台：接入任务，安排专业 Agent，组织交接与独立验收，集中展示产物和证据。
+
+**当前代码包含 CLI 管理底座，以及单主任务预留账本的 Rust 后端。** 账本提供初始化、查看、预留和取消未执行预留的命令；尚未连接任务页面、CLI 派发或 Teambition，手动终端仍不受它控制。原有功能的验收状态见 [功能台账](docs/tasks.md)，不能把规划中的完整工作台当作已经实现。
+
+下一阶段参考 Orca 的任务派发、结果回报与恢复能力，复用现有 CLI、数仓工具和检查器。主 Agent 在整个本地工作台内同时最多推进一个主任务；首版执行者与验收者顺序接力。具体范围、完成条件与恢复规则见 [产品需求](docs/PRD.md) 和 [架构约束](docs/architecture.md)。
+
+桌面底座采用 Tauri 2、Rust、React 与 TypeScript，目标平台为 macOS Apple Silicon 和 Windows x64。现有 TUI 保留为工具启动入口；工作台首先以现有桌面界面承载任务页。
 
 ## 本地启动
 

@@ -1,12 +1,18 @@
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use crate::session_history::{SessionHistory, SessionRecord, now_ms};
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
 use crate::projects::normalize_project_dir;
-use crate::tools::{ResolveResult, TOOL_DEFINITIONS, candidate_search_dirs, resolve_binary};
+use crate::tools::{
+    ResolveResult, TOOL_DEFINITIONS, candidate_search_dirs, is_windows_batch, resolve_binary,
+    windows_cmd_executable,
+};
 
 const READ_BUFFER_SIZE: usize = 8192;
 
@@ -86,12 +92,15 @@ const MAX_BUFFER_CHARS: usize = 512 * 1024;
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct PtySession {
+    info: SessionInfo,
     master: Box<dyn portable_pty::MasterPty + Send>,
     /// Foreground process group of the PTY, captured while the child is alive.
     /// Used to terminate descendants that keep the PTY open after the child
     /// exits, so the reader thread can reach EOF and release its handle (#15).
     #[cfg(unix)]
     pgid: Option<libc::pid_t>,
+    #[cfg(windows)]
+    job: Option<WinJob>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn std::io::Write + Send>,
     /// Everything the PTY has emitted so far (with its monotonic offset). The
@@ -108,6 +117,76 @@ pub struct SpawnedPty {
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
     pub writer: Box<dyn std::io::Write + Send>,
     pub reader: Box<dyn Read + Send>,
+    #[cfg(windows)]
+    pub job: Option<WinJob>,
+}
+
+fn has_utf8_locale(value: Option<&std::ffi::OsStr>) -> bool {
+    value.and_then(|item| item.to_str()).is_some_and(|text| {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("utf-8") || lower.contains("utf8")
+    })
+}
+
+#[cfg(windows)]
+fn windows_console_codepage_utf8() {
+    unsafe extern "system" {
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+        fn SetConsoleCP(code_page: u32) -> i32;
+    }
+    const CP_UTF8: u32 = 65001;
+    unsafe {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+    }
+}
+
+/// Builds the command and environment for `spawn_pty` so command selection
+/// (including Windows `.cmd`/`.bat` wrappers), verbatim path stripping, and
+/// UTF-8 locale setup can be unit-tested without opening a ConPTY host.
+fn build_pty_command(binary: &std::path::Path, cwd: &std::path::Path) -> CommandBuilder {
+    let clean_binary = strip_windows_verbatim(binary);
+    let clean_cwd = strip_windows_verbatim(cwd);
+    let mut command = if is_windows_batch(&clean_binary) {
+        let mut wrapped = CommandBuilder::new(windows_cmd_executable());
+        wrapped.arg("/D");
+        wrapped.arg("/C");
+        wrapped.arg(&clean_binary);
+        wrapped
+    } else {
+        CommandBuilder::new(&clean_binary)
+    };
+    command.cwd(clean_cwd.as_os_str());
+    for (key, _) in std::env::vars() {
+        if ENV_BLOCKLIST.contains(&key.as_str()) {
+            command.env_remove(&key);
+        }
+    }
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("PYTHONUTF8", "1");
+    command.env("PYTHONIOENCODING", "utf-8");
+    if !has_utf8_locale(std::env::var_os("LANG").as_deref()) {
+        command.env("LANG", "C.UTF-8");
+    }
+    if !has_utf8_locale(std::env::var_os("LC_ALL").as_deref()) {
+        command.env("LC_ALL", "C.UTF-8");
+    }
+    command
+}
+
+fn strip_windows_verbatim(path: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path.to_path_buf()
 }
 
 pub fn spawn_pty(
@@ -116,6 +195,8 @@ pub fn spawn_pty(
     rows: u16,
     cols: u16,
 ) -> Result<SpawnedPty, String> {
+    #[cfg(windows)]
+    windows_console_codepage_utf8();
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -126,21 +207,18 @@ pub fn spawn_pty(
         })
         .map_err(|error| format!("无法创建终端：{error}"))?;
 
-    let mut command = CommandBuilder::new(binary);
-    command.cwd(cwd.as_os_str());
-    for (key, _) in std::env::vars() {
-        if ENV_BLOCKLIST.contains(&key.as_str()) {
-            command.env_remove(&key);
-        }
-    }
-    command.env("TERM", "xterm-256color");
-    command.env("COLORTERM", "truecolor");
+    let command = build_pty_command(binary, cwd);
 
     let child = pair
         .slave
         .spawn_command(command)
         .map_err(|error| format!("无法启动终端进程：{error}"))?;
     drop(pair.slave);
+
+    #[cfg(windows)]
+    let job = child
+        .as_raw_handle()
+        .and_then(|handle| WinJob::attach(handle).ok());
 
     let reader = pair
         .master
@@ -156,6 +234,8 @@ pub fn spawn_pty(
         child,
         writer,
         reader,
+        #[cfg(windows)]
+        job,
     })
 }
 
@@ -221,6 +301,66 @@ impl Utf8Stream {
     }
 }
 
+fn trim_buffer_front(data: &mut String, max_bytes: usize) {
+    if data.len() <= max_bytes {
+        return;
+    }
+    let cut = data.len() - max_bytes;
+    let mut boundary = data
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= cut)
+        .unwrap_or(data.len());
+    // Prefer starting on a fresh line shortly after `cut` so we never slice
+    // through an ANSI CSI/OSC escape sequence and leave raw control garbage.
+    let search_end = data
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= boundary.saturating_add(16 * 1024))
+        .unwrap_or(data.len());
+    if let Some(newline_rel) = data[boundary..search_end].find('\n') {
+        boundary = boundary + newline_rel + 1;
+    } else if let Some(esc_rel) = data[..boundary].rfind('\x1b') {
+        let between = &data.as_bytes()[esc_rel..boundary];
+        if between.len() <= 256 && !escape_sequence_complete(between) {
+            // Skip the incomplete escape payload rather than replaying `[38;2;...m`.
+            if let Some(tail_end) = find_escape_end(&data.as_bytes()[boundary..]) {
+                let candidate = boundary + tail_end;
+                if data.is_char_boundary(candidate) {
+                    boundary = candidate;
+                }
+            }
+        }
+    }
+    data.drain(..boundary);
+}
+
+fn escape_sequence_complete(slice: &[u8]) -> bool {
+    if slice.len() < 2 || slice[0] != 0x1b {
+        return true;
+    }
+    match slice[1] {
+        b'[' => slice[2..].iter().any(|byte| (0x40..=0x7e).contains(byte)),
+        b']' => {
+            slice[2..].contains(&0x07) || slice[2..].windows(2).any(|pair| pair == [0x1b, b'\\'])
+        }
+        _ => slice.len() >= 3,
+    }
+}
+
+fn find_escape_end(rest: &[u8]) -> Option<usize> {
+    let limit = rest.len().min(256);
+    for (index, byte) in rest[..limit].iter().enumerate() {
+        if *byte == 0x07 || (0x40..=0x7e).contains(byte) {
+            return Some(index + 1);
+        }
+        if *byte == b'\n' {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
 /// The PTY read loop, extracted from the spawned thread so the exact product
 /// code path can be unit-tested with a controlled reader and event ordering.
 ///
@@ -253,16 +393,7 @@ fn pump_reader(
                 let end_offset = if let Ok(mut guard) = buffer.lock() {
                     guard.end_offset += text.len() as u64;
                     guard.data.push_str(&text);
-                    if guard.data.len() > MAX_BUFFER_CHARS {
-                        let cut = guard.data.len() - MAX_BUFFER_CHARS;
-                        let boundary = guard
-                            .data
-                            .char_indices()
-                            .map(|(index, _)| index)
-                            .find(|index| *index >= cut)
-                            .unwrap_or(cut);
-                        guard.data.drain(..boundary);
-                    }
+                    trim_buffer_front(&mut guard.data, MAX_BUFFER_CHARS);
                     guard.end_offset
                 } else {
                     0
@@ -320,8 +451,115 @@ fn kill_process_group(pgid: Option<libc::pid_t>) {
     }
 }
 
-#[cfg(not(unix))]
-fn kill_process_group(_pgid: Option<i32>) {}
+#[cfg(windows)]
+pub struct WinJob {
+    handle: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+unsafe impl Send for WinJob {}
+#[cfg(windows)]
+unsafe impl Sync for WinJob {}
+
+#[cfg(windows)]
+impl WinJob {
+    fn attach(process_handle: std::os::windows::io::RawHandle) -> std::io::Result<Self> {
+        use std::ffi::c_void;
+        #[repr(C)]
+        #[derive(Default)]
+        struct BasicLimits {
+            process_time: i64,
+            job_time: i64,
+            flags: u32,
+            min_ws: usize,
+            max_ws: usize,
+            active_limit: u32,
+            affinity: usize,
+            priority: u32,
+            scheduling: u32,
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct IoCounters {
+            data: [u64; 6],
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct ExtendedLimits {
+            basic: BasicLimits,
+            io: IoCounters,
+            process_mem: usize,
+            job_mem: usize,
+            peak_process_mem: usize,
+            peak_job_mem: usize,
+        }
+        const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+        const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+        type Handle = *mut c_void;
+        unsafe extern "system" {
+            fn CreateJobObjectW(attributes: Handle, name: *const u16) -> Handle;
+            fn SetInformationJobObject(
+                job: Handle,
+                class: i32,
+                data: *const c_void,
+                size: u32,
+            ) -> i32;
+            fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+            fn CloseHandle(handle: Handle) -> i32;
+        }
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut limits = ExtendedLimits::default();
+        limits.basic.flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION as i32,
+                (&limits as *const ExtendedLimits).cast(),
+                std::mem::size_of::<ExtendedLimits>() as u32,
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+        if unsafe { AssignProcessToJobObject(job, process_handle.cast()) } == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+        Ok(Self { handle: job })
+    }
+
+    fn terminate(&self) {
+        unsafe extern "system" {
+            fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+        }
+        if !self.handle.is_null() {
+            unsafe {
+                TerminateJobObject(self.handle, 1);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WinJob {
+    fn drop(&mut self) {
+        unsafe extern "system" {
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        if !self.handle.is_null() {
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
 
 /// Terminate a child, distinguishing "already exited" from "termination failed".
 /// Extracted so the failure path can be exercised with a fake child (#17).
@@ -366,6 +604,10 @@ pub struct SessionManager {
     /// Kept so a view that mounts *after* the process died can still replay the
     /// final screen and learn the process is gone (instead of seeing "running").
     finished: Arc<Mutex<HashMap<String, (String, u64)>>>,
+    /// Persisted identity/end-state history, configured once before commands
+    /// are served. Recording is best-effort: a history write failure must not
+    /// orphan a running CLI, so callers keep the session and log the failure.
+    history: Arc<Mutex<Option<SessionHistory>>>,
 }
 
 impl Default for SessionManager {
@@ -373,6 +615,7 @@ impl Default for SessionManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             finished: Arc::new(Mutex::new(HashMap::new())),
+            history: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -382,6 +625,55 @@ impl SessionManager {
         self.sessions
             .lock()
             .map_err(|_| "会话管理暂时不可用，请重试".to_string())
+    }
+
+    /// Backend-only path, fixed before serving commands; never creates a
+    /// directory. History is optional only until this is called.
+    pub fn configure_history(&self, path: PathBuf) -> Result<(), String> {
+        let mut history = self
+            .history
+            .lock()
+            .map_err(|_| "会话历史暂时不可用，请重试".to_string())?;
+        if history.is_some() {
+            return Err("会话历史已经配置，不能切换".to_string());
+        }
+        *history = Some(SessionHistory::configure(path)?);
+        Ok(())
+    }
+
+    fn record_start(&self, record: SessionRecord) {
+        let recorded = self
+            .history
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .map(|history| history.record_start(record));
+        if let Some(Err(error)) = recorded {
+            eprintln!("AgentTerm could not persist session history: {error}");
+        }
+    }
+
+    fn record_end(&self, id: &str, reason: Option<String>, output_bytes: Option<u64>) {
+        let recorded = self
+            .history
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .map(|history| history.record_end(id, now_ms(), reason, output_bytes));
+        if let Some(Err(error)) = recorded {
+            eprintln!("AgentTerm could not persist session end for {id}: {error}");
+        }
+    }
+
+    pub fn list_history(&self) -> Result<Vec<SessionRecord>, String> {
+        let guard = self
+            .history
+            .lock()
+            .map_err(|_| "会话历史暂时不可用，请重试".to_string())?;
+        match guard.as_ref() {
+            Some(history) => history.list(),
+            None => Err("会话历史尚未配置".to_string()),
+        }
     }
 
     pub fn start(
@@ -427,6 +719,8 @@ impl SessionManager {
             child,
             writer,
             reader,
+            #[cfg(windows)]
+            job,
         } = spawned;
 
         let info = SessionInfo {
@@ -439,9 +733,12 @@ impl SessionManager {
         #[cfg(unix)]
         let pgid = master.process_group_leader();
         let session = PtySession {
+            info: info.clone(),
             master,
             #[cfg(unix)]
             pgid,
+            #[cfg(windows)]
+            job,
             child,
             writer,
             buffer: Arc::new(Mutex::new(OutputBuffer::default())),
@@ -460,6 +757,17 @@ impl SessionManager {
 
         self.lock()?.insert(session_id.to_string(), session);
 
+        self.record_start(SessionRecord {
+            id: session_id.to_string(),
+            tool_id: tool.id.to_string(),
+            tool_name: tool.name.to_string(),
+            project_path: info.project_path.clone(),
+            started_at_ms: now_ms(),
+            ended_at_ms: None,
+            exit_reason: None,
+            output_bytes: None,
+        });
+
         let sessions = Arc::clone(&self.sessions);
         let finished_buffers = Arc::clone(&self.finished);
         let read_done_reader = Arc::clone(&read_done);
@@ -470,6 +778,7 @@ impl SessionManager {
         let exit_id = session_id.to_string();
         let app_output = app.clone();
         let app_exit = app;
+        let history_writer = Arc::clone(&self.history);
 
         // Reader thread: streams PTY output to the frontend as UTF-8 text and
         // keeps a replayable copy in the session buffer. The loop itself lives in
@@ -527,6 +836,13 @@ impl SessionManager {
                             drop(guard);
                             kill_process_group(pgid);
                         }
+                        #[cfg(windows)]
+                        if let Ok(guard) = sessions.lock()
+                            && let Some(session) = guard.get(&exit_id)
+                            && let Some(job) = session.job.as_ref()
+                        {
+                            job.terminate();
+                        }
                     }
                     // Mark archived BEFORE releasing the session: the reader
                     // checks this flag and stops emitting, so late output from a
@@ -534,12 +850,25 @@ impl SessionManager {
                     archived_watcher.store(true, std::sync::atomic::Ordering::Release);
                     // Preserve the final buffer before releasing the session so a
                     // late-mounting view can replay it and see the exit state.
+                    let mut archived_bytes = None;
                     if let Ok(mut guard) = sessions.lock()
                         && let Some(session) = guard.remove(&exit_id)
                         && let Ok(buffer) = session.buffer.lock()
                         && let Ok(mut done) = finished_buffers.lock()
                     {
+                        archived_bytes = Some(buffer.data.len() as u64);
                         done.insert(exit_id.clone(), (buffer.data.clone(), buffer.end_offset));
+                    }
+                    if let Ok(history_guard) = history_writer.lock()
+                        && let Some(history) = history_guard.as_ref()
+                        && let Err(error) = history.record_end(
+                            &exit_id,
+                            now_ms(),
+                            Some(reason.clone()),
+                            archived_bytes,
+                        )
+                    {
+                        eprintln!("AgentTerm could not persist session end for {exit_id}: {error}");
                     }
                     break reason;
                 }
@@ -591,6 +920,16 @@ impl SessionManager {
         }
     }
 
+    /// Returns metadata owned by the backend for a live session. Renderer
+    /// supplied labels and paths are never authoritative for task binding.
+    pub fn session_info(&self, session_id: &str) -> Result<SessionInfo, String> {
+        let sessions = self.lock()?;
+        sessions
+            .get(session_id)
+            .map(|session| session.info.clone())
+            .ok_or_else(|| "会话不存在或已结束".to_string())
+    }
+
     pub fn write(&self, session_id: &str, data: &str) -> Result<(), String> {
         let mut sessions = self.lock()?;
         let session = sessions
@@ -631,6 +970,10 @@ impl SessionManager {
             // A failed kill returns early here, leaving the session in the map so
             // the user can retry (#17).
             terminate_child(&mut *session.child)?;
+            #[cfg(windows)]
+            if let Some(job) = session.job.as_ref() {
+                job.terminate();
+            }
         }
 
         // Kill succeeded (or the process was already gone): now release it.
@@ -640,14 +983,42 @@ impl SessionManager {
             done.remove(session_id);
         }
         drop(session);
+        self.record_end(session_id, Some("已停止".to_string()), None);
+        Ok(())
+    }
+
+    pub fn forget(&self, session_id: &str) -> Result<(), String> {
+        // Hold the live-session lock while releasing replay data. A caller may
+        // forget an ended tab, but must never detach a running process.
+        let sessions = self.lock()?;
+        if sessions.contains_key(session_id) {
+            return Err("会话仍在运行，请先结束会话".to_string());
+        }
+        self.finished
+            .lock()
+            .map_err(|_| "无法释放会话输出".to_string())?
+            .remove(session_id);
         Ok(())
     }
 
     pub fn stop_all(&self) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            for (_, mut session) in sessions.drain() {
-                let _ = session.child.kill();
-            }
+        let killed: Vec<String> = if let Ok(mut sessions) = self.sessions.lock() {
+            sessions
+                .drain()
+                .map(|(id, mut session)| {
+                    let _ = session.child.kill();
+                    #[cfg(windows)]
+                    if let Some(job) = session.job.as_ref() {
+                        job.terminate();
+                    }
+                    id
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for id in killed {
+            self.record_end(&id, Some("应用退出".to_string()), None);
         }
     }
 
@@ -701,6 +1072,14 @@ pub fn resize_session(
 }
 
 #[tauri::command]
+pub fn forget_session(
+    state: tauri::State<'_, SessionManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state.forget(&session_id)
+}
+
+#[tauri::command]
 pub fn stop_session(
     state: tauri::State<'_, SessionManager>,
     session_id: String,
@@ -708,9 +1087,21 @@ pub fn stop_session(
     state.stop(&session_id)
 }
 
+#[tauri::command]
+pub fn session_history(
+    state: tauri::State<'_, SessionManager>,
+) -> Result<Vec<SessionRecord>, String> {
+    state.list_history()
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::io::Read;
+    #[cfg(windows)]
+    use std::path::Path;
+    use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::Duration;
 
     use super::SessionManager;
@@ -768,6 +1159,11 @@ mod tests {
 
         fn process_id(&self) -> Option<u32> {
             Some(999_999)
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
         }
     }
 
@@ -838,9 +1234,17 @@ mod tests {
         map.insert(
             id.to_string(),
             super::PtySession {
+                info: super::SessionInfo {
+                    id: id.to_string(),
+                    tool_id: "claude".into(),
+                    tool_name: "Claude Code".into(),
+                    project_path: std::env::current_dir().unwrap().to_string_lossy().into(),
+                },
                 master: Box::new(FakeMaster),
                 #[cfg(unix)]
                 pgid: None,
+                #[cfg(windows)]
+                job: None,
                 child: Box::new(FakeChild {
                     exited: false,
                     kill_fails,
@@ -1072,6 +1476,43 @@ mod tests {
         assert_eq!(manager.stop("missing").unwrap_err(), "会话不存在或已结束");
     }
 
+    #[test]
+    fn forgetting_an_ended_tab_releases_only_its_output_and_is_idempotent() {
+        let manager = SessionManager::default();
+        manager.finished.lock().unwrap().extend([
+            ("a".to_string(), ("first".to_string(), 5)),
+            ("b".to_string(), ("second".to_string(), 6)),
+        ]);
+        manager.forget("a").unwrap();
+        manager.forget("a").unwrap();
+        assert!(manager.snapshot("a").is_err());
+        assert_eq!(manager.snapshot("b").unwrap().data, "second");
+    }
+
+    #[test]
+    fn forgetting_a_live_tab_is_rejected_and_preserves_the_process() {
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "live", false);
+        assert_eq!(
+            manager.forget("live").unwrap_err(),
+            "会话仍在运行，请先结束会话"
+        );
+        assert!(manager.is_running("live"));
+        assert!(manager.snapshot("live").unwrap().running);
+    }
+
+    #[test]
+    fn closing_one_live_session_keeps_another_running() {
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "a", false);
+        insert_fake_session(&manager, "b", false);
+        manager.stop("a").unwrap();
+        manager.forget("a").unwrap();
+        assert!(!manager.is_running("a"));
+        assert!(manager.is_running("b"));
+        assert!(manager.write("b", "continue\r").is_ok());
+    }
+
     #[cfg(unix)]
     fn read_until(reader: &mut dyn Read, needle: &str, limit: Duration) -> String {
         let deadline = std::time::Instant::now() + limit;
@@ -1164,6 +1605,16 @@ mod tests {
     fn snapshot_of_unknown_session_errors() {
         let manager = super::SessionManager::default();
         assert!(manager.snapshot("never-existed").is_err());
+    }
+
+    #[test]
+    fn session_info_reads_backend_owned_metadata_for_live_session() {
+        let manager = super::SessionManager::default();
+        insert_fake_session(&manager, "owned", false);
+        let info = manager.session_info("owned").unwrap();
+        assert_eq!(info.id, "owned");
+        assert_eq!(info.tool_id, "claude");
+        assert!(manager.session_info("missing").is_err());
     }
 
     #[test]
@@ -1348,5 +1799,149 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn history_store(label: &str) -> PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "agentterm-session-history-{label}-{}-{}-{}.json",
+            std::process::id(),
+            super::now_ms(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn history_is_rejected_until_configured() {
+        let manager = SessionManager::default();
+        let error = manager.list_history().unwrap_err();
+        assert!(error.contains("尚未配置"), "got: {error}");
+    }
+
+    #[test]
+    fn history_can_only_be_configured_once() {
+        let manager = SessionManager::default();
+        let path = history_store("sessions");
+        manager.configure_history(path.clone()).unwrap();
+        let error = manager.configure_history(path).unwrap_err();
+        assert!(error.contains("已经配置"), "got: {error}");
+    }
+
+    fn history_project() -> String {
+        if cfg!(windows) {
+            "E:\\AgentTerm"
+        } else {
+            "/tmp/agentterm"
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn explicit_stop_records_history_end() {
+        let manager = SessionManager::default();
+        let path = history_store("stop");
+        manager.configure_history(path).unwrap();
+        insert_fake_session(&manager, "s-stop", false);
+        manager.record_start(super::SessionRecord {
+            id: "s-stop".to_string(),
+            tool_id: "claude".to_string(),
+            tool_name: "Claude Code".to_string(),
+            project_path: history_project(),
+            started_at_ms: 10,
+            ended_at_ms: None,
+            exit_reason: None,
+            output_bytes: None,
+        });
+
+        manager.stop("s-stop").unwrap();
+
+        let listed = manager.list_history().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "s-stop");
+        assert_eq!(listed[0].exit_reason.as_deref(), Some("已停止"));
+        assert!(listed[0].ended_at_ms.is_some());
+    }
+
+    #[test]
+    fn stop_all_records_app_exit_for_every_session() {
+        let manager = SessionManager::default();
+        let path = history_store("exit");
+        manager.configure_history(path).unwrap();
+        insert_fake_session(&manager, "s-exit-1", false);
+        insert_fake_session(&manager, "s-exit-2", false);
+        for id in ["s-exit-1", "s-exit-2"] {
+            manager.record_start(super::SessionRecord {
+                id: id.to_string(),
+                tool_id: "claude".to_string(),
+                tool_name: "Claude Code".to_string(),
+                project_path: history_project(),
+                started_at_ms: 10,
+                ended_at_ms: None,
+                exit_reason: None,
+                output_bytes: None,
+            });
+        }
+
+        manager.stop_all();
+
+        let listed = manager.list_history().unwrap();
+        assert_eq!(listed.len(), 2);
+        for record in listed {
+            assert_eq!(record.exit_reason.as_deref(), Some("应用退出"));
+            assert!(record.ended_at_ms.is_some());
+        }
+        assert!(manager.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn trim_buffer_front_avoids_splitting_ansi_escape_sequences() {
+        let mut data = format!(
+            "\x1b[38;2;140;222;194m{}\x1b[0m\n第二行正常输出",
+            "x".repeat(40)
+        );
+        super::trim_buffer_front(&mut data, 32);
+        assert!(
+            !data.starts_with('[') && !data.starts_with(';'),
+            "must not start inside an ANSI sequence, got: {data:?}"
+        );
+        assert!(data.contains("第二行正常输出"), "got: {data:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_pty_strips_verbatim_paths_and_sets_utf8_env() {
+        let clean = super::strip_windows_verbatim(Path::new(r"\\?\E:\AgentTerm"));
+        assert_eq!(clean, PathBuf::from(r"E:\AgentTerm"));
+        let unc = super::strip_windows_verbatim(Path::new(r"\\?\UNC\server\share\proj"));
+        assert_eq!(unc, PathBuf::from(r"\\server\share\proj"));
+        assert!(super::has_utf8_locale(Some(std::ffi::OsStr::new(
+            "zh_CN.UTF-8"
+        ))));
+        assert!(!super::has_utf8_locale(Some(std::ffi::OsStr::new("C"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_pty_command_wraps_windows_cmd_and_strips_verbatim_cwd() {
+        let cmd = super::build_pty_command(
+            Path::new(r"\\?\C:\Users\Administrator\AppData\Roaming\npm\codex.cmd"),
+            Path::new(r"\\?\E:\AgentTerm"),
+        );
+        let args: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.len(), 4);
+        assert!(args[0].to_ascii_lowercase().ends_with("cmd.exe"));
+        assert_eq!(args[1], "/D");
+        assert_eq!(args[2], "/C");
+        assert_eq!(
+            args[3],
+            r"C:\Users\Administrator\AppData\Roaming\npm\codex.cmd"
+        );
+        assert_eq!(cmd.get_cwd().unwrap().to_string_lossy(), r"E:\AgentTerm");
+        assert_eq!(cmd.get_env("PYTHONUTF8").unwrap(), "1");
+        assert_eq!(cmd.get_env("PYTHONIOENCODING").unwrap(), "utf-8");
     }
 }

@@ -39,6 +39,12 @@ describe("sliceChunkAfter", () => {
     expect(out).not.toContain("\uFFFD");
   });
 
+  it("skips partial UTF-8 continuation bytes instead of emitting U+FFFD", () => {
+    const out = sliceChunkAfter({ data: "你好", endOffset: 6 }, 1);
+    expect(out).toBe("好");
+    expect(out).not.toContain("\uFFFD");
+  });
+
   it("rewriting sequentially reproduces the full stream exactly once", () => {
     // Simulate: snapshot covers "hello", then live chunks " world" and "!".
     let written = byteLength("hello"); // 5
