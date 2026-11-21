@@ -7,6 +7,11 @@ use std::time::{Duration, Instant};
 const VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_VERSION_OUTPUT: usize = 500;
 const MAX_NVM_VERSIONS: usize = 16;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const WINDOWS_NATIVE_EXTENSIONS: &[&str] = &["exe", "com"];
+const WINDOWS_BATCH_EXTENSIONS: &[&str] = &["cmd", "bat"];
 
 pub struct ToolDefinition {
     pub id: &'static str,
@@ -91,22 +96,83 @@ pub fn resolve_binary(binaries: &[&str], dirs: &[PathBuf]) -> ResolveResult {
 }
 
 fn candidate_file_names(binary: &str) -> Vec<String> {
-    let mut names = vec![binary.to_string()];
+    #[cfg(not(windows))]
+    {
+        vec![binary.to_string()]
+    }
 
-    if cfg!(windows) {
-        let extensions =
-            env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM;.PS1".to_string());
+    #[cfg(windows)]
+    {
+        // Never select extensionless POSIX shell shims (e.g. npm `codex`) or `.ps1`
+        // files on Windows; accept an explicit `.exe` name, and otherwise prefer
+        // native executables over `.cmd`/`.bat` wrappers.
+        let mut names = Vec::new();
+        if Path::new(binary)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                WINDOWS_NATIVE_EXTENSIONS
+                    .iter()
+                    .chain(WINDOWS_BATCH_EXTENSIONS.iter())
+                    .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+            })
+        {
+            names.push(binary.to_string());
+        }
+        let mut native = Vec::new();
+        let mut batch = Vec::new();
+        let mut seen = Vec::new();
+        let extensions = env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.COM;.CMD;.BAT".to_string());
         for extension in extensions
             .split(';')
             .map(str::trim)
             .filter(|item| !item.is_empty())
         {
-            names.push(format!("{binary}{}", extension.to_ascii_lowercase()));
-            names.push(format!("{binary}{extension}"));
+            let lower = extension.trim_start_matches('.').to_ascii_lowercase();
+            if seen.contains(&lower) {
+                continue;
+            }
+            if WINDOWS_NATIVE_EXTENSIONS.contains(&lower.as_str()) {
+                seen.push(lower.clone());
+                native.push(format!("{binary}.{lower}"));
+            } else if WINDOWS_BATCH_EXTENSIONS.contains(&lower.as_str()) {
+                seen.push(lower.clone());
+                batch.push(format!("{binary}.{lower}"));
+            }
         }
-    }
+        for fallback in ["exe", "com", "cmd", "bat"] {
+            if !seen.contains(&fallback.to_string()) {
+                if WINDOWS_NATIVE_EXTENSIONS.contains(&fallback) {
+                    native.push(format!("{binary}.{fallback}"));
+                } else {
+                    batch.push(format!("{binary}.{fallback}"));
+                }
+            }
+        }
 
-    names
+        names.extend(native);
+        names.extend(batch);
+        names
+    }
+}
+
+pub fn is_windows_batch(path: &Path) -> bool {
+    cfg!(windows)
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                WINDOWS_BATCH_EXTENSIONS
+                    .iter()
+                    .any(|item| ext.eq_ignore_ascii_case(item))
+            })
+}
+
+pub fn windows_cmd_executable() -> PathBuf {
+    env::var_os("ComSpec")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"))
 }
 
 #[cfg(unix)]
@@ -121,6 +187,15 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                WINDOWS_NATIVE_EXTENSIONS
+                    .iter()
+                    .chain(WINDOWS_BATCH_EXTENSIONS.iter())
+                    .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+            })
 }
 
 pub fn candidate_search_dirs() -> Vec<PathBuf> {
@@ -234,8 +309,21 @@ fn normalize_version(token: &str) -> Option<String> {
 }
 
 fn read_version(path: &Path, args: &[&str]) -> Option<String> {
-    let mut child = Command::new(path)
-        .args(args)
+    let mut command = if is_windows_batch(path) {
+        let mut wrapped = Command::new(windows_cmd_executable());
+        wrapped.arg("/D").arg("/C").arg(path).args(args);
+        wrapped
+    } else {
+        let mut direct = Command::new(path);
+        direct.args(args);
+        direct
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -479,6 +567,44 @@ mod tests {
             statuses
                 .iter()
                 .all(|status| status.state == ToolState::Missing)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_skips_extensionless_and_ps1_shims_and_prefers_exe_over_cmd() {
+        let dir = TempDir::new("win-shim");
+        std::fs::write(dir.path().join("codex"), "#!/bin/sh\necho 0.0.1\n").unwrap();
+        std::fs::write(dir.path().join("codex.ps1"), "Write-Output 0.0.1\n").unwrap();
+        assert_eq!(
+            resolve_binary(&["codex"], &[dir.path()]),
+            ResolveResult::Missing
+        );
+
+        let cmd_path = dir.path().join("codex.cmd");
+        std::fs::write(&cmd_path, "@echo off\r\necho codex-cli 0.169.0\r\n").unwrap();
+        assert_eq!(
+            resolve_binary(&["codex"], &[dir.path()]),
+            ResolveResult::Found(cmd_path.clone())
+        );
+        let codex_def = TOOL_DEFINITIONS
+            .iter()
+            .find(|item| item.id == "codex")
+            .expect("codex definition should exist");
+        let status = detect_tool(codex_def, &[dir.path()]);
+        assert_eq!(
+            status.state,
+            ToolState::Installed {
+                path: cmd_path.display().to_string(),
+                version: Some("0.169.0".to_string()),
+            }
+        );
+
+        let exe_path = dir.path().join("codex.exe");
+        std::fs::write(&exe_path, b"MZ").unwrap();
+        assert_eq!(
+            resolve_binary(&["codex"], &[dir.path()]),
+            ResolveResult::Found(exe_path)
         );
     }
 }

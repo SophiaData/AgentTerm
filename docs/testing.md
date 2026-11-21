@@ -10,6 +10,11 @@
 - 本机工具链限制：Windows 未安装 `rustfmt`/`clippy` 组件，这两项静态门禁须待推送后由 Ubuntu CI 执行；本切片尚未打 Windows 安装包做桌面重启后真实“再次打开”原生验证。
 - 前序真实 Claude Code 2.1.326 补验补充（绑定已安装 6a0615d4 包 / PR #30 `2779327b` CI44757159573 成功）：定向 `WM_CHAR` 输入中文、数字 `1234567890` 与标点均完整回显，切标签未提交内容保留，退格与 `/help` 自动补全有效；合成 Enter/CR 未触发提交且会话 JSONL 无新记录，提交、方向键定位、物理键盘/IME、审批与分隔线拖动仍为 NOT RUN。
 
+### Windows Codex 解析与乱码修复（2026-11-21，本地单测通过，CI/真机待验）
+
+- 本地验证：`cargo test -- --test-threads=1` 132 passed / 2 ignored（新增 `tools::tests::windows_skips_extensionless_and_ps1_shims_and_prefers_exe_over_cmd`、`sessions::tests::trim_buffer_front_avoids_splitting_ansi_escape_sequences`、`sessions::tests::spawn_pty_strips_verbatim_paths_and_sets_utf8_env`、`sessions::tests::build_pty_command_wraps_windows_cmd_and_strips_verbatim_cwd`）；前端 Vitest 83 passed（新增 `offsetStitch` UTF-8 continuation bytes 对齐测试），`eslint`、`tsc --noEmit`、`vite build`、TUI 15 passed、模板治理 13 项通过。
+- 过程教训与限制：在无控制台句柄（`GetConsoleWindow()==0`）测试进程中直接从单元测试启动真实 ConPTY `cmd.exe /D /C` 会挂起或异常退出（`0xFFFFFFFF`/`0xC000013A`），因此将命令构建与路径/UTF-8 规则抽为纯函数单元覆盖；真机桌面窗口下的 Codex 启动对话与中文无乱码渲染待打新包后实测。
+
 前序多会话切片（9eea1dc5）：从单个会话改为多个独立CLI会话；以下保留该切片的历史自动测试结果，原生现状以上方最新分屏段为准。新回归覆盖两个会话独立身份/选择、重复启动保护、后台退出归属、关闭互不影响、停止失败保留、退出竞争、自然退出释放缓存、关闭过程中切换与启动失败重试；App检查切换/新建页仍保留所有终端面板，后端检查运行会话禁止forget、已结束输出按ID释放。代码9eea1dc54dd9a2ba3693baf6d03b7086465447e0通过串行CI44726264171：前端61（两端）、Linux Rust123、Windows Rust114、TUI17；13项质量门通过。两端各2个ignored仍为既有子进程测试入口。新增10项前端和3项后端回归；当时原生未安装/验收，主Agent自检不能冒充独立审查。
 
 ### 双终端原生补验（真实Claude Code）

@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
 use crate::projects::normalize_project_dir;
-use crate::tools::{ResolveResult, TOOL_DEFINITIONS, candidate_search_dirs, resolve_binary};
+use crate::tools::{
+    ResolveResult, TOOL_DEFINITIONS, candidate_search_dirs, is_windows_batch, resolve_binary,
+    windows_cmd_executable,
+};
 
 const READ_BUFFER_SIZE: usize = 8192;
 
@@ -95,6 +98,8 @@ struct PtySession {
     /// exits, so the reader thread can reach EOF and release its handle (#15).
     #[cfg(unix)]
     pgid: Option<libc::pid_t>,
+    #[cfg(windows)]
+    job: Option<WinJob>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn std::io::Write + Send>,
     /// Everything the PTY has emitted so far (with its monotonic offset). The
@@ -111,6 +116,78 @@ pub struct SpawnedPty {
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
     pub writer: Box<dyn std::io::Write + Send>,
     pub reader: Box<dyn Read + Send>,
+    #[cfg(windows)]
+    pub job: Option<WinJob>,
+}
+
+fn has_utf8_locale(value: Option<&std::ffi::OsStr>) -> bool {
+    value
+        .and_then(|item| item.to_str())
+        .is_some_and(|text| {
+            let lower = text.to_ascii_lowercase();
+            lower.contains("utf-8") || lower.contains("utf8")
+        })
+}
+
+#[cfg(windows)]
+fn windows_console_codepage_utf8() {
+    unsafe extern "system" {
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+        fn SetConsoleCP(code_page: u32) -> i32;
+    }
+    const CP_UTF8: u32 = 65001;
+    unsafe {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+    }
+}
+
+/// Builds the command and environment for `spawn_pty` so command selection
+/// (including Windows `.cmd`/`.bat` wrappers), verbatim path stripping, and
+/// UTF-8 locale setup can be unit-tested without opening a ConPTY host.
+fn build_pty_command(binary: &std::path::Path, cwd: &std::path::Path) -> CommandBuilder {
+    let clean_binary = strip_windows_verbatim(binary);
+    let clean_cwd = strip_windows_verbatim(cwd);
+    let mut command = if is_windows_batch(&clean_binary) {
+        let mut wrapped = CommandBuilder::new(windows_cmd_executable());
+        wrapped.arg("/D");
+        wrapped.arg("/C");
+        wrapped.arg(&clean_binary);
+        wrapped
+    } else {
+        CommandBuilder::new(&clean_binary)
+    };
+    command.cwd(clean_cwd.as_os_str());
+    for (key, _) in std::env::vars() {
+        if ENV_BLOCKLIST.contains(&key.as_str()) {
+            command.env_remove(&key);
+        }
+    }
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("PYTHONUTF8", "1");
+    command.env("PYTHONIOENCODING", "utf-8");
+    if !has_utf8_locale(std::env::var_os("LANG").as_deref()) {
+        command.env("LANG", "C.UTF-8");
+    }
+    if !has_utf8_locale(std::env::var_os("LC_ALL").as_deref()) {
+        command.env("LC_ALL", "C.UTF-8");
+    }
+    command
+}
+
+fn strip_windows_verbatim(path: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path.to_path_buf()
 }
 
 pub fn spawn_pty(
@@ -119,6 +196,8 @@ pub fn spawn_pty(
     rows: u16,
     cols: u16,
 ) -> Result<SpawnedPty, String> {
+    #[cfg(windows)]
+    windows_console_codepage_utf8();
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -129,21 +208,18 @@ pub fn spawn_pty(
         })
         .map_err(|error| format!("无法创建终端：{error}"))?;
 
-    let mut command = CommandBuilder::new(binary);
-    command.cwd(cwd.as_os_str());
-    for (key, _) in std::env::vars() {
-        if ENV_BLOCKLIST.contains(&key.as_str()) {
-            command.env_remove(&key);
-        }
-    }
-    command.env("TERM", "xterm-256color");
-    command.env("COLORTERM", "truecolor");
+    let command = build_pty_command(binary, cwd);
 
     let child = pair
         .slave
         .spawn_command(command)
         .map_err(|error| format!("无法启动终端进程：{error}"))?;
     drop(pair.slave);
+
+    #[cfg(windows)]
+    let job = child
+        .as_raw_handle()
+        .and_then(|handle| WinJob::attach(handle).ok());
 
     let reader = pair
         .master
@@ -159,6 +235,8 @@ pub fn spawn_pty(
         child,
         writer,
         reader,
+        #[cfg(windows)]
+        job,
     })
 }
 
@@ -224,6 +302,69 @@ impl Utf8Stream {
     }
 }
 
+fn trim_buffer_front(data: &mut String, max_bytes: usize) {
+    if data.len() <= max_bytes {
+        return;
+    }
+    let cut = data.len() - max_bytes;
+    let mut boundary = data
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= cut)
+        .unwrap_or(data.len());
+    // Prefer starting on a fresh line shortly after `cut` so we never slice
+    // through an ANSI CSI/OSC escape sequence and leave raw control garbage.
+    let search_end = data
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= boundary.saturating_add(16 * 1024))
+        .unwrap_or(data.len());
+    if let Some(newline_rel) = data[boundary..search_end].find('\n') {
+        boundary = boundary + newline_rel + 1;
+    } else if let Some(esc_rel) = data[..boundary].rfind('\x1b') {
+        let between = &data.as_bytes()[esc_rel..boundary];
+        if between.len() <= 256 && !escape_sequence_complete(between) {
+            // Skip the incomplete escape payload rather than replaying `[38;2;...m`.
+            if let Some(tail_end) = find_escape_end(&data.as_bytes()[boundary..]) {
+                let candidate = boundary + tail_end;
+                if data.is_char_boundary(candidate) {
+                    boundary = candidate;
+                }
+            }
+        }
+    }
+    data.drain(..boundary);
+}
+
+fn escape_sequence_complete(slice: &[u8]) -> bool {
+    if slice.len() < 2 || slice[0] != 0x1b {
+        return true;
+    }
+    match slice[1] {
+        b'[' => slice[2..]
+            .iter()
+            .any(|byte| (0x40..=0x7e).contains(byte)),
+        b']' => {
+            slice[2..].contains(&0x07)
+                || slice[2..].windows(2).any(|pair| pair == [0x1b, b'\\'])
+        }
+        _ => slice.len() >= 3,
+    }
+}
+
+fn find_escape_end(rest: &[u8]) -> Option<usize> {
+    let limit = rest.len().min(256);
+    for (index, byte) in rest[..limit].iter().enumerate() {
+        if *byte == 0x07 || (0x40..=0x7e).contains(byte) {
+            return Some(index + 1);
+        }
+        if *byte == b'\n' {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
 /// The PTY read loop, extracted from the spawned thread so the exact product
 /// code path can be unit-tested with a controlled reader and event ordering.
 ///
@@ -256,16 +397,7 @@ fn pump_reader(
                 let end_offset = if let Ok(mut guard) = buffer.lock() {
                     guard.end_offset += text.len() as u64;
                     guard.data.push_str(&text);
-                    if guard.data.len() > MAX_BUFFER_CHARS {
-                        let cut = guard.data.len() - MAX_BUFFER_CHARS;
-                        let boundary = guard
-                            .data
-                            .char_indices()
-                            .map(|(index, _)| index)
-                            .find(|index| *index >= cut)
-                            .unwrap_or(cut);
-                        guard.data.drain(..boundary);
-                    }
+                    trim_buffer_front(&mut guard.data, MAX_BUFFER_CHARS);
                     guard.end_offset
                 } else {
                     0
@@ -323,8 +455,115 @@ fn kill_process_group(pgid: Option<libc::pid_t>) {
     }
 }
 
-#[cfg(not(unix))]
-fn kill_process_group(_pgid: Option<i32>) {}
+#[cfg(windows)]
+pub struct WinJob {
+    handle: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+unsafe impl Send for WinJob {}
+#[cfg(windows)]
+unsafe impl Sync for WinJob {}
+
+#[cfg(windows)]
+impl WinJob {
+    fn attach(process_handle: std::os::windows::io::RawHandle) -> std::io::Result<Self> {
+        use std::ffi::c_void;
+        #[repr(C)]
+        #[derive(Default)]
+        struct BasicLimits {
+            process_time: i64,
+            job_time: i64,
+            flags: u32,
+            min_ws: usize,
+            max_ws: usize,
+            active_limit: u32,
+            affinity: usize,
+            priority: u32,
+            scheduling: u32,
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct IoCounters {
+            data: [u64; 6],
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct ExtendedLimits {
+            basic: BasicLimits,
+            io: IoCounters,
+            process_mem: usize,
+            job_mem: usize,
+            peak_process_mem: usize,
+            peak_job_mem: usize,
+        }
+        const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+        const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+        type Handle = *mut c_void;
+        unsafe extern "system" {
+            fn CreateJobObjectW(attributes: Handle, name: *const u16) -> Handle;
+            fn SetInformationJobObject(
+                job: Handle,
+                class: i32,
+                data: *const c_void,
+                size: u32,
+            ) -> i32;
+            fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+            fn CloseHandle(handle: Handle) -> i32;
+        }
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut limits = ExtendedLimits::default();
+        limits.basic.flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION as i32,
+                (&limits as *const ExtendedLimits).cast(),
+                std::mem::size_of::<ExtendedLimits>() as u32,
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+        if unsafe { AssignProcessToJobObject(job, process_handle.cast()) } == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+        Ok(Self { handle: job })
+    }
+
+    fn terminate(&self) {
+        unsafe extern "system" {
+            fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+        }
+        if !self.handle.is_null() {
+            unsafe {
+                TerminateJobObject(self.handle, 1);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WinJob {
+    fn drop(&mut self) {
+        unsafe extern "system" {
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        if !self.handle.is_null() {
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
 
 /// Terminate a child, distinguishing "already exited" from "termination failed".
 /// Extracted so the failure path can be exercised with a fake child (#17).
@@ -484,6 +723,8 @@ impl SessionManager {
             child,
             writer,
             reader,
+            #[cfg(windows)]
+            job,
         } = spawned;
 
         let info = SessionInfo {
@@ -499,6 +740,8 @@ impl SessionManager {
             master,
             #[cfg(unix)]
             pgid,
+            #[cfg(windows)]
+            job,
             child,
             writer,
             buffer: Arc::new(Mutex::new(OutputBuffer::default())),
@@ -595,6 +838,13 @@ impl SessionManager {
                             let pgid = session.pgid;
                             drop(guard);
                             kill_process_group(pgid);
+                        }
+                        #[cfg(windows)]
+                        if let Ok(guard) = sessions.lock()
+                            && let Some(session) = guard.get(&exit_id)
+                            && let Some(job) = session.job.as_ref()
+                        {
+                            job.terminate();
                         }
                     }
                     // Mark archived BEFORE releasing the session: the reader
@@ -713,6 +963,10 @@ impl SessionManager {
             // A failed kill returns early here, leaving the session in the map so
             // the user can retry (#17).
             terminate_child(&mut *session.child)?;
+            #[cfg(windows)]
+            if let Some(job) = session.job.as_ref() {
+                job.terminate();
+            }
         }
 
         // Kill succeeded (or the process was already gone): now release it.
@@ -746,6 +1000,10 @@ impl SessionManager {
                 .drain()
                 .map(|(id, mut session)| {
                     let _ = session.child.kill();
+                    #[cfg(windows)]
+                    if let Some(job) = session.job.as_ref() {
+                        job.terminate();
+                    }
                     id
                 })
                 .collect()
@@ -832,7 +1090,7 @@ pub fn session_history(
 #[cfg(test)]
 mod tests {
     use std::io::Read;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::SessionManager;
@@ -968,6 +1226,8 @@ mod tests {
                 master: Box::new(FakeMaster),
                 #[cfg(unix)]
                 pgid: None,
+                #[cfg(windows)]
+                job: None,
                 child: Box::new(FakeChild {
                     exited: false,
                     kill_fails,
@@ -1604,5 +1864,55 @@ mod tests {
             assert!(record.ended_at_ms.is_some());
         }
         assert!(manager.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn trim_buffer_front_avoids_splitting_ansi_escape_sequences() {
+        let mut data = format!("\x1b[38;2;140;222;194m{}\x1b[0m\n第二行正常输出", "x".repeat(40));
+        super::trim_buffer_front(&mut data, 32);
+        assert!(
+            !data.starts_with('[') && !data.starts_with(';'),
+            "must not start inside an ANSI sequence, got: {data:?}"
+        );
+        assert!(data.contains("第二行正常输出"), "got: {data:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_pty_strips_verbatim_paths_and_sets_utf8_env() {
+        let clean = super::strip_windows_verbatim(Path::new(r"\\?\E:\AgentTerm"));
+        assert_eq!(clean, PathBuf::from(r"E:\AgentTerm"));
+        let unc = super::strip_windows_verbatim(Path::new(r"\\?\UNC\server\share\proj"));
+        assert_eq!(unc, PathBuf::from(r"\\server\share\proj"));
+        assert!(super::has_utf8_locale(Some(std::ffi::OsStr::new("zh_CN.UTF-8"))));
+        assert!(!super::has_utf8_locale(Some(std::ffi::OsStr::new("C"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_pty_command_wraps_windows_cmd_and_strips_verbatim_cwd() {
+        let cmd = super::build_pty_command(
+            Path::new(r"\\?\C:\Users\Administrator\AppData\Roaming\npm\codex.cmd"),
+            Path::new(r"\\?\E:\AgentTerm"),
+        );
+        let args: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.len(), 4);
+        assert!(args[0].to_ascii_lowercase().ends_with("cmd.exe"));
+        assert_eq!(args[1], "/D");
+        assert_eq!(args[2], "/C");
+        assert_eq!(
+            args[3],
+            r"C:\Users\Administrator\AppData\Roaming\npm\codex.cmd"
+        );
+        assert_eq!(
+            cmd.get_cwd().unwrap().to_string_lossy(),
+            r"E:\AgentTerm"
+        );
+        assert_eq!(cmd.get_env("PYTHONUTF8").unwrap(), "1");
+        assert_eq!(cmd.get_env("PYTHONIOENCODING").unwrap(), "utf-8");
     }
 }

@@ -54,8 +54,14 @@ export default function TerminalView({
       if (disposed || !hostRef.current) return;
 
       const terminal = new Terminal({
-        fontFamily: "'SFMono-Regular', Consolas, 'Liberation Mono', monospace",
+        fontFamily:
+          "'Cascadia Mono', 'Cascadia Code', 'SFMono-Regular', Consolas, 'Microsoft YaHei', 'Noto Sans SC', monospace",
         fontSize: 14,
+        windowsPty:
+          typeof navigator !== "undefined" &&
+          /Windows/i.test(navigator.userAgent)
+            ? { backend: "conpty", buildNumber: 22621 }
+            : undefined,
         scrollback: 5000,
         cursorBlink: true,
         disableStdin: true,
