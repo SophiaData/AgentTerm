@@ -852,10 +852,9 @@ impl SessionManager {
                     {
                         let buffer = Arc::clone(&session.buffer);
                         if let Ok(buffer_guard) = buffer.lock() {
-                            archived_watcher.store(
-                                true,
-                                std::sync::atomic::Ordering::Release,
-                            );
+
+                            archived_watcher.store(true, std::sync::atomic::Ordering::Release);
+
                             let archived_data = buffer_guard.data.clone();
                             let archived_offset = buffer_guard.end_offset;
                             archived_bytes = Some(buffer_guard.data.len() as u64);
@@ -865,10 +864,9 @@ impl SessionManager {
                                 done.insert(exit_id.clone(), (archived_data, archived_offset));
                             }
                         } else {
-                            archived_watcher.store(
-                                true,
-                                std::sync::atomic::Ordering::Release,
-                            );
+
+                            archived_watcher.store(true, std::sync::atomic::Ordering::Release);
+
                             sessions_guard.remove(&exit_id);
                         }
                     }
