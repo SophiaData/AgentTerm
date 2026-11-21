@@ -8,7 +8,10 @@
 - 本地 Windows：`pnpm check` 的 13 项全部通过；前端 89 passed，Rust 后端 157 passed / 2 ignored，TUI 15 passed，模板契约 13 passed。两个 ignored 是现有由父测试调用的子进程入口。全部串行、单 worker / 单 Rust job。
 - 新覆盖：执行/验收/暂停/等待阶段崩溃后接回、读评估不改账本、活协调进程阻止接管、旧票据拒绝、会话历史持久化与换绑冲突、UI 恢复换绑入口、已持久化用户停止原因不被后台替换。
 - 本机 `python3` 与 Python 子进程对 `pnpm` 的解析缺失，通过本轮临时原生命令入口调用既有 Python/Node 解决，不更改全局配置。首轮格式错误核实为 Git CRLF 检出转换，恢复与 HEAD 完全相同的 LF 字节后原格式门通过，无全项目格式内容改动。
-- 原生验收：待固定提交的 Windows 安装包；不会以单测、静态渲染或离线进程冒充真实 Claude、审批或物理输入验收。当前两个旧应用实例保持运行。
+- 固定代码版本：`3c7824baebe71e0026f1680fc700ff5fafb0e5ab`，草稿 [PR #35](https://github.com/SophiaData/AgentTerm/pull/35)，[质量检查 44897184829](https://github.com/SophiaData/AgentTerm/actions/runs/44897184829)；运行结果以该链接回读为准。本段后续仅更新证据，不更改包内代码。
+- [Windows-only 打包 44897226917](https://github.com/SophiaData/AgentTerm/actions/runs/44897226917) 已成功，绑定上述代码提交。附件 `windows-x64-nsis`，ID `14704842120`，2470415 bytes，GitHub 附件摘要 `sha256:1dbaa9ca8d7db155facda414cba6b995fb9b54ded35e828fe433450212afd959`；这是附件摘要，不冒充解包后 EXE 摘要。未创建正式 Release。
+- 原生验收 BLOCKED / 0 项通过：下载构建附件并启动临时 MSI 解包工具的整组命令被自动审批拒绝，返回 `blocked by policy`，没有更具体原因；拒绝发生于执行前，目标下载目录与 MSI 文件均不存在。没有换工具或拆命令重试。另对 `127.0.0.1:15721` 做 TCP 探针，当前无监听且连接失败，真实模型回复无法验证。
+- 未安装或启动新包；旧应用 PID 19268、39860 的路径和创建时间保持不变。空账本仍为 24 bytes，SHA-256 `70871f764d93687bb184524eea2cd1651610d49eb544a35e22cff2d8f8509be0`，与测试前备份相同。没有创建业务任务、修改全局模型配置或使用全局键盘鼠标注入。真实执行/停止/重启/接续、审批、物理输入均不能以本地或 CI 测试代替。
 - 尚未交付：#13 证据失效与完成释放、外部作业撤销、CLI 原生对话 resume、macOS 真机验收。#12 与 M4 暂不关闭。
 
 ## 验收现状与下一项（2026-11-20）
