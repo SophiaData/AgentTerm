@@ -9,6 +9,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::task_document::ProcessIdentity;
+
 pub(crate) const OUTPUT_LIMIT: usize = 256 * 1024;
 const STOP_LIMIT: Duration = Duration::from_secs(2);
 
@@ -17,6 +19,26 @@ pub(crate) struct ProcessSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub input: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcessControl(Arc<AtomicBool>);
+
+impl ProcessControl {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Returns true only for the first request. Later clicks are harmless and
+    /// do not create another stop operation.
+    #[allow(dead_code)]
+    pub(crate) fn request_stop(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,9 +51,64 @@ pub enum ProcessError {
     NonZero,
     Descendants,
     StopUnconfirmed,
+    StopRequested,
+    StopRequestUnconfirmed,
+    StopRequestUnrecorded,
+    StartIdentityUnrecorded,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessObservation {
+    /// The recorded PID is definitely absent on the current OS.
+    Exited,
+    /// The recorded PID and OS start identity still match.
+    Alive,
+    /// The PID exists, but its start identity no longer matches the record.
+    Reused,
+    /// The OS could not prove either absence or identity.
+    Unknown,
+}
+
+/// Read-only recovery probe. It never signals, opens a writable handle, or
+/// changes the task ledger. PID absence is safe to classify as `Exited`; every
+/// identity or permission ambiguity stays `Unknown`.
+#[allow(dead_code)]
+pub(crate) fn observe_process(identity: &ProcessIdentity) -> ProcessObservation {
+    #[cfg(unix)]
+    {
+        return observe_unix(identity);
+    }
+    #[cfg(windows)]
+    {
+        return observe_windows(identity);
+    }
+    #[allow(unreachable_code)]
+    ProcessObservation::Unknown
 }
 
 pub(crate) fn run(spec: ProcessSpec, timeout: Duration) -> Result<Vec<u8>, ProcessError> {
+    run_with_start(spec, timeout, |_| true)
+}
+
+/// Calls `on_started` after the child has been attached to its containment
+/// scope. A false return stops the child and refuses to continue without a
+/// durable launch identity.
+pub(crate) fn run_with_start(
+    spec: ProcessSpec,
+    timeout: Duration,
+    on_started: impl FnOnce(ProcessIdentity) -> bool,
+) -> Result<Vec<u8>, ProcessError> {
+    run_with_start_control(spec, timeout, ProcessControl::new(), on_started, || true)
+}
+
+pub(crate) fn run_with_start_control(
+    spec: ProcessSpec,
+    timeout: Duration,
+    control: ProcessControl,
+    on_started: impl FnOnce(ProcessIdentity) -> bool,
+    on_stop_requested: impl FnOnce() -> bool,
+) -> Result<Vec<u8>, ProcessError> {
     if timeout.is_zero() || timeout > Duration::from_secs(300) || spec.input.len() > 32 * 1024 {
         return Err(ProcessError::Start);
     }
@@ -73,6 +150,33 @@ pub(crate) fn run(spec: ProcessSpec, timeout: Duration) -> Result<Vec<u8>, Proce
             ProcessError::StopUnconfirmed
         });
     }
+    let identity = ProcessIdentity {
+        pid: child.id(),
+        executable: spec.binary.to_string_lossy().into_owned(),
+        start_token: process_start_token(child.id()),
+    };
+    let mut on_stop_requested = Some(on_stop_requested);
+    if !on_started(identity) {
+        return Err(if scope.stop(&mut child) {
+            ProcessError::StartIdentityUnrecorded
+        } else {
+            ProcessError::StopUnconfirmed
+        });
+    }
+    if control.stop_requested() {
+        let recorded = on_stop_requested
+            .take()
+            .is_some_and(|callback| callback());
+        return if scope.stop(&mut child) {
+            Err(if recorded {
+                ProcessError::StopRequested
+            } else {
+                ProcessError::StopRequestUnrecorded
+            })
+        } else {
+            Err(ProcessError::StopRequestUnconfirmed)
+        };
+    }
     let mut stdin = child.stdin.take().ok_or(ProcessError::Input)?;
     let mut stdout = child.stdout.take().ok_or(ProcessError::OutputRead)?;
     let (input_tx, input_rx) = mpsc::sync_channel(1);
@@ -104,7 +208,18 @@ pub(crate) fn run(spec: ProcessSpec, timeout: Duration) -> Result<Vec<u8>, Proce
         };
         let _ = output_tx.send(result);
     });
+    let mut stop_requested = false;
+    let mut stop_request_recorded = None;
     let status = loop {
+        if control.stop_requested() {
+            stop_requested = true;
+            stop_request_recorded = Some(
+                on_stop_requested
+                    .take()
+                    .is_some_and(|callback| callback()),
+            );
+            break Err(ProcessError::StopRequested);
+        }
         if oversized.load(Ordering::Acquire) {
             break Err(ProcessError::OutputLimit);
         }
@@ -127,6 +242,14 @@ pub(crate) fn run(spec: ProcessSpec, timeout: Duration) -> Result<Vec<u8>, Proce
     let had_descendants = status.is_ok() && scope.has_processes();
     // Also kills descendants after the direct child exits. A leftover descendant
     // blocks handoff, even if cleanup succeeds.
+    stop_requested |= control.stop_requested();
+    if stop_requested && stop_request_recorded.is_none() {
+        stop_request_recorded = Some(
+            on_stop_requested
+                .take()
+                .is_some_and(|callback| callback()),
+        );
+    }
     let stopped = scope.stop(&mut child);
     let input = input_rx.recv_timeout(STOP_LIMIT);
     let output = output_rx.recv_timeout(STOP_LIMIT);
@@ -139,7 +262,18 @@ pub(crate) fn run(spec: ProcessSpec, timeout: Duration) -> Result<Vec<u8>, Proce
     if !stopped || input.is_err() || output.is_err() {
         // Keep the ledger occupied. An escaped Unix descendant may retain a pipe;
         // do not hang the coordinator by joining an unconfirmed reader.
-        return Err(ProcessError::StopUnconfirmed);
+        return Err(if stop_requested {
+            ProcessError::StopRequestUnconfirmed
+        } else {
+            ProcessError::StopUnconfirmed
+        });
+    }
+    if stop_requested {
+        return Err(if stop_request_recorded == Some(true) {
+            ProcessError::StopRequested
+        } else {
+            ProcessError::StopRequestUnrecorded
+        });
     }
     let status = status?;
     if oversized.load(Ordering::Acquire) {
@@ -155,6 +289,184 @@ pub(crate) fn run(spec: ProcessSpec, timeout: Duration) -> Result<Vec<u8>, Proce
         return Err(ProcessError::Input);
     }
     output.map_err(|_| ProcessError::OutputRead)?
+}
+
+#[cfg(unix)]
+pub(crate) fn process_start_token(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_start_token(&text)
+}
+
+#[cfg(unix)]
+fn parse_start_token(text: &str) -> Option<String> {
+    text.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(unix)]
+fn observe_unix(identity: &ProcessIdentity) -> ProcessObservation {
+    if identity.pid == 0 {
+        return ProcessObservation::Unknown;
+    }
+    let stat_path = format!("/proc/{}/stat", identity.pid);
+    let text = match std::fs::read_to_string(stat_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProcessObservation::Exited;
+        }
+        Err(_) => return ProcessObservation::Unknown,
+    };
+    let Some(expected_token) = identity.start_token.as_deref() else {
+        return ProcessObservation::Unknown;
+    };
+    let Some(actual_token) = parse_start_token(&text) else {
+        return ProcessObservation::Unknown;
+    };
+    if actual_token != expected_token {
+        return ProcessObservation::Reused;
+    }
+    let expected_executable = match std::path::Path::new(&identity.executable).canonicalize() {
+        Ok(path) => path,
+        Err(_) => return ProcessObservation::Unknown,
+    };
+    let actual_executable = match std::fs::read_link(format!("/proc/{}/exe", identity.pid))
+        .and_then(|path| path.canonicalize())
+    {
+        Ok(path) => path,
+        Err(_) => return ProcessObservation::Unknown,
+    };
+    if actual_executable != expected_executable {
+        return ProcessObservation::Reused;
+    }
+    ProcessObservation::Alive
+}
+
+#[cfg(windows)]
+pub(crate) fn process_start_token(pid: u32) -> Option<String> {
+    windows_process::start_token(pid)
+}
+
+#[cfg(windows)]
+fn observe_windows(identity: &ProcessIdentity) -> ProcessObservation {
+    windows_process::observe(identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn process_start_token(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+mod windows_process {
+    use super::{ProcessIdentity, ProcessObservation};
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetExitCodeProcess(handle: Handle, code: *mut u32) -> i32;
+        fn GetProcessTimes(
+            handle: Handle,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+
+    struct HandleGuard(Handle);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn open(pid: u32) -> Result<HandleGuard, ProcessObservation> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return Err(if std::io::Error::last_os_error().raw_os_error()
+                == Some(ERROR_INVALID_PARAMETER)
+            {
+                ProcessObservation::Exited
+            } else {
+                ProcessObservation::Unknown
+            });
+        }
+        Ok(HandleGuard(handle))
+    }
+
+    fn token(handle: Handle) -> Result<String, ProcessObservation> {
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        let ok = unsafe {
+            GetProcessTimes(
+                handle,
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if ok == 0 {
+            return Err(ProcessObservation::Unknown);
+        }
+        Ok(((u64::from(creation.high) << 32) | u64::from(creation.low)).to_string())
+    }
+
+    pub(super) fn start_token(pid: u32) -> Option<String> {
+        let handle = open(pid).ok()?;
+        token(handle.0).ok()
+    }
+
+    pub(super) fn observe(identity: &ProcessIdentity) -> ProcessObservation {
+        let handle = match open(identity.pid) {
+            Ok(handle) => handle,
+            Err(observation) => return observation,
+        };
+        let mut exit_code = 0;
+        if unsafe { GetExitCodeProcess(handle.0, &mut exit_code) } == 0 {
+            return ProcessObservation::Unknown;
+        }
+        if exit_code != STILL_ACTIVE {
+            return ProcessObservation::Exited;
+        }
+        let Some(expected_token) = identity.start_token.as_deref() else {
+            return ProcessObservation::Unknown;
+        };
+        match token(handle.0) {
+            Ok(actual) if actual == expected_token => ProcessObservation::Alive,
+            Ok(_) => ProcessObservation::Reused,
+            Err(observation) => observation,
+        }
+    }
 }
 
 fn reap(child: &mut Child) -> bool {
@@ -461,6 +773,85 @@ mod tests {
             String::from_utf8(output)
                 .unwrap()
                 .contains("INPUT=hello 中文")
+        );
+    }
+
+    #[test]
+    fn start_observer_receives_process_identity() {
+        let mut identity = None;
+        let output = run_with_start(spec("hello"), Duration::from_secs(5), |value| {
+            identity = Some(value);
+            true
+        })
+        .unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("INPUT=hello"));
+        let identity = identity.expect("observer must run after process attachment");
+        assert!(identity.pid > 0);
+        assert!(!identity.executable.is_empty());
+    }
+
+    #[test]
+    fn process_probe_requires_matching_start_identity() {
+        let pid = std::process::id();
+        let identity = ProcessIdentity {
+            pid,
+            executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            start_token: process_start_token(pid),
+        };
+        assert_eq!(observe_process(&identity), ProcessObservation::Alive);
+
+        let mut reused = identity.clone();
+        reused.start_token = Some("different-start-token".into());
+        assert_eq!(observe_process(&reused), ProcessObservation::Reused);
+
+        let mut legacy = identity;
+        legacy.start_token = None;
+        assert_eq!(observe_process(&legacy), ProcessObservation::Unknown);
+    }
+
+    #[test]
+    fn process_probe_classifies_an_absent_pid_as_exited() {
+        let identity = ProcessIdentity {
+            pid: u32::MAX,
+            executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            start_token: Some("never-started".into()),
+        };
+        assert_eq!(observe_process(&identity), ProcessObservation::Exited);
+    }
+
+    #[test]
+    fn rejected_start_observer_stops_without_running_the_task() {
+        assert_eq!(
+            run_with_start(spec("hello"), Duration::from_secs(5), |_| false),
+            Err(ProcessError::StartIdentityUnrecorded)
+        );
+    }
+
+    #[test]
+    fn stop_request_is_idempotent_and_bounded() {
+        let control = ProcessControl::new();
+        let worker_control = control.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            run_with_start_control(
+                spec("hang"),
+                Duration::from_secs(5),
+                worker_control,
+                |_| {
+                    started_tx.send(()).unwrap();
+                    true
+                },
+                || true,
+            )
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("child start must be observed");
+        assert!(control.request_stop());
+        assert!(!control.request_stop());
+        assert_eq!(
+            handle.join().unwrap(),
+            Err(ProcessError::StopRequested)
         );
     }
     #[test]

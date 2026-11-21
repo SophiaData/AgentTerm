@@ -561,7 +561,8 @@ export default function App() {
             </button>
           </div>
           <p className="workspace-records-note">
-            手动 CLI 与任务记录尚未自动关联。
+            手动 CLI
+            需先明确关联到任务记录；受控执行入口会继续校验会话和任务版本。
           </p>
           <TaskWorkbench
             projects={projects.projects}
@@ -571,6 +572,9 @@ export default function App() {
             onDraftChange={setDraft}
             onAddProject={projects.add}
             onRefreshProjects={projects.refresh}
+            currentSession={
+              currentSession?.running ? currentSession.info : null
+            }
           />
         </aside>
       ) : null}

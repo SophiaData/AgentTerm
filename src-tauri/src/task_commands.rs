@@ -1,14 +1,37 @@
 use crate::projects::ProjectStore;
-use crate::task_document::{ArtifactPreview, Document, DocumentStore, Step, TaskPlan};
+use crate::sessions::{SessionInfo, SessionManager};
+use crate::task_document::{ArtifactPreview, Document, DocumentStore, SessionLink, Step, TaskPlan};
 use crate::task_ledger::{Ledger, Phase, Snapshot};
+use crate::task_relay::{Cli, Plan as RelayPlan, Ticket};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+struct ActiveDispatch {
+    token: u128,
+    task_id: String,
+    generation: u64,
+    control: crate::task_process::ProcessControl,
+}
+
+#[derive(Clone)]
+struct DispatchRuntime {
+    active: Arc<Mutex<Option<ActiveDispatch>>>,
+}
+
+impl Default for DispatchRuntime {
+    fn default() -> Self {
+        Self {
+            active: Arc::new(Mutex::new(None)),
+        }
+    }
+}
 
 pub struct TaskLedgerState {
     path: Mutex<Option<PathBuf>>,
     owner_id: String,
+    runtime: DispatchRuntime,
 }
 
 impl Default for TaskLedgerState {
@@ -24,6 +47,7 @@ impl Default for TaskLedgerState {
                     .unwrap_or_default()
                     .as_nanos()
             ),
+            runtime: DispatchRuntime::default(),
         }
     }
 }
@@ -50,6 +74,23 @@ pub struct TaskLedgerView {
 pub struct WorkbenchView {
     pub ledger: TaskLedgerView,
     pub document: Option<Document>,
+    pub recovery: Option<RecoveryView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryView {
+    pub attempts: Vec<RecoveryAttemptView>,
+    pub all_exited: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryAttemptView {
+    pub attempt_id: String,
+    pub step_id: String,
+    pub observation: String,
+    pub safe_to_resume: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,10 +201,63 @@ impl TaskLedgerState {
         if ledger.snapshot().map_err(|error| error.to_string())? != snapshot {
             return Err("任务状态已变化，请刷新".into());
         }
+        let recovery = match (&snapshot.active, &document) {
+            (Some(active), Some(document)) if active.phase == Phase::RecoveryRequired => {
+                let attempts = crate::task_relay::assess_recovery(document)
+                    .into_iter()
+                    .map(|attempt| RecoveryAttemptView {
+                        attempt_id: attempt.attempt_id,
+                        step_id: attempt.step_id,
+                        observation: recovery_observation_name(attempt.observation).into(),
+                        safe_to_resume: attempt.observation
+                            == crate::task_relay::RecoveryObservation::Exited,
+                    })
+                    .collect::<Vec<_>>();
+                let all_exited = !attempts.is_empty() && attempts.iter().all(|attempt| attempt.safe_to_resume);
+                Some(RecoveryView { attempts, all_exited })
+            }
+            _ => None,
+        };
         Ok(WorkbenchView {
             ledger: self.view(snapshot),
             document,
+            recovery,
         })
+    }
+
+    fn resume_after_recovery(
+        &self,
+        task_id: &str,
+        generation: u64,
+        revision: u64,
+    ) -> Result<WorkbenchView, String> {
+        let (snapshot, store) = self.current_store(task_id, generation, revision, false)?;
+        let active = snapshot
+            .active
+            .as_ref()
+            .ok_or_else(|| "没有当前主任务".to_string())?;
+        if active.phase != Phase::RecoveryRequired {
+            return Err("当前任务不在待核实状态，请先刷新".into());
+        }
+        let document = store.snapshot()?;
+        if document.plan.task_id != task_id
+            || document.plan.generation != generation
+            || document.plan.project_id != active.project_id
+        {
+            return Err("任务计划与当前账本不匹配，不能接回".into());
+        }
+        let assessment = crate::task_relay::assess_recovery(&document);
+        if assessment.is_empty()
+            || assessment.iter().any(|attempt| {
+                attempt.observation != crate::task_relay::RecoveryObservation::Exited
+            })
+        {
+            return Err("旧执行尝试尚未全部确认退出，任务继续待核实".into());
+        }
+        self.ledger()?
+            .resume_after_recovery(&self.owner_id, task_id, generation, revision)
+            .map_err(|error| error.to_string())?;
+        self.workbench()
     }
 
     fn plan_input(
@@ -329,6 +423,239 @@ impl TaskLedgerState {
             .map_err(|e| e.to_string())?;
         self.workbench()
     }
+
+    fn prepare_controlled_dispatch(
+        &self,
+        sessions: &SessionManager,
+        task_id: &str,
+        generation: u64,
+        revision: u64,
+        session_id: &str,
+    ) -> Result<(Ticket, RelayPlan, DocumentStore), String> {
+        if self
+            .runtime
+            .active
+            .lock()
+            .map_err(|_| "受控派发状态不可用".to_string())?
+            .is_some()
+        {
+            return Err("已有受控派发正在运行，请先核对当前状态".into());
+        }
+        let (snapshot, store) = self.current_store(task_id, generation, revision, true)?;
+        let document = store.snapshot()?;
+        let info = sessions
+            .session_info(session_id)
+            .map_err(|_| "关联的 CLI 会话不存在或已经结束，不能受控派发".to_string())?;
+        let cli = validate_controlled_dispatch(
+            &snapshot,
+            &document,
+            &info,
+            session_id,
+            task_id,
+            generation,
+            revision,
+        )?;
+        let project_dir = PathBuf::from(&info.project_path)
+            .canonicalize()
+            .map_err(|_| "项目目录不可用，不能受控派发".to_string())?;
+        let ticket = Ticket {
+            task_id: task_id.into(),
+            owner_id: self.owner_id.clone(),
+            generation,
+            revision,
+        };
+        let plan = RelayPlan {
+            project_dir,
+            goal: document.plan.goal,
+            worker: cli,
+            reviewer: cli,
+            timeout: Duration::from_secs(300),
+        };
+        Ok((ticket, plan, store))
+    }
+
+    fn start_controlled_dispatch(
+        &self,
+        ticket: Ticket,
+        plan: RelayPlan,
+        store: DocumentStore,
+    ) -> Result<(), String> {
+        let control = crate::task_process::ProcessControl::new();
+        let token = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        {
+            let mut active = self
+                .runtime
+                .active
+                .lock()
+                .map_err(|_| "受控派发状态不可用".to_string())?;
+            if active.is_some() {
+                return Err("已有受控派发正在运行，请先核对当前状态".into());
+            }
+            *active = Some(ActiveDispatch {
+                token,
+                task_id: ticket.task_id.clone(),
+                generation: ticket.generation,
+                control: control.clone(),
+            });
+        }
+        let ledger = self.ledger()?;
+        let runtime = self.runtime.clone();
+        let task_id = ticket.task_id.clone();
+        let generation = ticket.generation;
+        std::thread::Builder::new()
+            .name("agentterm-controlled-relay".into())
+            .spawn(move || {
+                let _ = crate::task_relay::run_recorded_with_control(
+                    &ledger, &ticket, &plan, &store, control,
+                );
+                if let Ok(mut active) = runtime.active.lock() {
+                    if active.as_ref().is_some_and(|item| {
+                        item.token == token
+                            && item.task_id == task_id
+                            && item.generation == generation
+                    }) {
+                        *active = None;
+                    }
+                }
+            })
+            .map_err(|_| "无法启动受控派发线程，任务继续占用".to_string())?;
+        Ok(())
+    }
+
+    fn request_controlled_stop(
+        &self,
+        task_id: &str,
+        generation: u64,
+        revision: u64,
+    ) -> Result<WorkbenchView, String> {
+        let control = {
+            let active = self
+                .runtime
+                .active
+                .lock()
+                .map_err(|_| "受控派发状态不可用".to_string())?;
+            let dispatch = active
+                .as_ref()
+                .ok_or_else(|| "当前没有可停止的受控派发".to_string())?;
+            if dispatch.task_id != task_id || dispatch.generation != generation {
+                return Err("当前受控派发已变化，请刷新后重试".into());
+            }
+            dispatch.control.clone()
+        };
+        let (_, store) = self.current_store(task_id, generation, revision, true)?;
+        let active = self
+            .ledger()?
+            .snapshot()
+            .map_err(|error| error.to_string())?
+            .active
+            .ok_or_else(|| "没有当前主任务".to_string())?;
+        if !matches!(active.phase, Phase::Running | Phase::Verifying | Phase::Pausing) {
+            return Err("当前任务不在可停止的受控执行阶段".into());
+        }
+        let document = store.snapshot()?;
+        let running = document
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.state == crate::task_document::AttemptState::Running)
+            .ok_or_else(|| "尚未找到可停止的执行尝试，请刷新核对".to_string())?;
+        store.record_stop_request(&running.id, "用户请求停止受控派发")?;
+        control.request_stop();
+        if active.phase != Phase::Pausing {
+            let latest = self
+                .ledger()?
+                .snapshot()
+                .map_err(|error| error.to_string())?;
+            let latest_active = latest
+                .active
+                .as_ref()
+                .ok_or_else(|| "任务在停止请求期间已变化，请重新核对".to_string())?;
+            if latest.generation != generation
+                || latest_active.task_id != task_id
+                || latest_active.owner_id != self.owner_id
+                || !matches!(latest_active.phase, Phase::Running | Phase::Verifying | Phase::Pausing)
+            {
+                return self.workbench();
+            }
+            if latest_active.phase != Phase::Pausing {
+                self.ledger()?
+                    .set_phase(
+                        &self.owner_id,
+                        task_id,
+                        generation,
+                        latest.revision,
+                        Phase::Pausing,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        self.workbench()
+    }
+}
+
+fn controlled_cli(tool_id: &str) -> Result<Cli, String> {
+    match tool_id {
+        "claude" => Ok(Cli::Claude),
+        "cursor" | "cursor-agent" => Ok(Cli::Cursor),
+        _ => Err("当前 CLI 暂不支持受控派发；请先使用 Claude Code 会话".into()),
+    }
+}
+
+fn validate_controlled_dispatch(
+    snapshot: &Snapshot,
+    document: &Document,
+    info: &SessionInfo,
+    session_id: &str,
+    task_id: &str,
+    generation: u64,
+    revision: u64,
+) -> Result<Cli, String> {
+    let active = snapshot
+        .active
+        .as_ref()
+        .ok_or_else(|| "没有当前主任务，不能受控派发".to_string())?;
+    if snapshot.revision != revision
+        || snapshot.generation != generation
+        || active.task_id != task_id
+        || !active.phase.is_reserved()
+    {
+        return Err("任务代次或版本已变化，不能重复派发，请刷新".into());
+    }
+    if document.plan.task_id != task_id
+        || document.plan.generation != generation
+        || document.plan.project_id != active.project_id
+    {
+        return Err("任务计划与当前账本不匹配，不能受控派发".into());
+    }
+    if active.project_id != info.project_path {
+        return Err("只能在任务所属项目的 CLI 会话中受控派发".into());
+    }
+    let link = document
+        .session_link
+        .as_ref()
+        .ok_or_else(|| "请先把当前运行中的 CLI 会话关联到任务记录".to_string())?;
+    if link.id != session_id
+        || link.id != info.id
+        || link.tool_id != info.tool_id
+        || link.tool_name != info.tool_name
+        || link.project_path != info.project_path
+    {
+        return Err("当前 CLI 会话不是任务记录已关联的会话".into());
+    }
+    controlled_cli(&info.tool_id)
+}
+
+fn recovery_observation_name(observation: crate::task_relay::RecoveryObservation) -> &'static str {
+    match observation {
+        crate::task_relay::RecoveryObservation::LaunchUncertain => "launchUncertain",
+        crate::task_relay::RecoveryObservation::Exited => "exited",
+        crate::task_relay::RecoveryObservation::Alive => "alive",
+        crate::task_relay::RecoveryObservation::Reused => "reused",
+        crate::task_relay::RecoveryObservation::Unknown => "unknown",
+    }
 }
 
 #[tauri::command]
@@ -341,6 +668,16 @@ pub fn recover_main_task_reservation(
     release: bool,
 ) -> Result<WorkbenchView, String> {
     state.recover(&projects, &task_id, generation, expected_revision, release)
+}
+
+#[tauri::command]
+pub fn resume_main_task_after_recovery(
+    state: tauri::State<'_, TaskLedgerState>,
+    task_id: String,
+    generation: u64,
+    expected_revision: u64,
+) -> Result<WorkbenchView, String> {
+    state.resume_after_recovery(&task_id, generation, expected_revision)
 }
 
 #[tauri::command]
@@ -393,6 +730,73 @@ pub fn reference_task_artifact(
     let (_, store) = state.current_store(&task_id, generation, expected_revision, true)?;
     store.reference(&relative_path, &label)?;
     state.workbench()
+}
+
+#[tauri::command]
+pub fn associate_task_session(
+    state: tauri::State<'_, TaskLedgerState>,
+    sessions: tauri::State<'_, SessionManager>,
+    task_id: String,
+    generation: u64,
+    expected_revision: u64,
+    session_id: String,
+) -> Result<WorkbenchView, String> {
+    let info = sessions
+        .session_info(&session_id)
+        .map_err(|_| "CLI 会话不存在或已经结束，不能关联".to_string())?;
+    let session = SessionLink {
+        id: info.id,
+        tool_id: info.tool_id,
+        tool_name: info.tool_name,
+        project_path: info.project_path,
+    };
+    let (snapshot, store) = state.current_store(&task_id, generation, expected_revision, true)?;
+    let active = snapshot
+        .active
+        .as_ref()
+        .ok_or_else(|| "没有当前主任务".to_string())?;
+    if active.project_id != session.project_path {
+        return Err("只能关联同一项目下的 CLI 会话".into());
+    }
+    let document = store.snapshot()?;
+    if document.plan.project_id != active.project_id
+        || document.plan.task_id != task_id
+        || document.plan.generation != generation
+    {
+        return Err("任务计划与当前账本不匹配，不能关联会话".into());
+    }
+    store.associate_session(session)?;
+    state.workbench()
+}
+
+#[tauri::command]
+pub fn dispatch_controlled_task(
+    state: tauri::State<'_, TaskLedgerState>,
+    sessions: tauri::State<'_, SessionManager>,
+    task_id: String,
+    generation: u64,
+    expected_revision: u64,
+    session_id: String,
+) -> Result<WorkbenchView, String> {
+    let (ticket, plan, store) = state.prepare_controlled_dispatch(
+        &sessions,
+        &task_id,
+        generation,
+        expected_revision,
+        &session_id,
+    )?;
+    state.start_controlled_dispatch(ticket, plan, store)?;
+    state.workbench()
+}
+
+#[tauri::command]
+pub fn request_stop_controlled_task(
+    state: tauri::State<'_, TaskLedgerState>,
+    task_id: String,
+    generation: u64,
+    expected_revision: u64,
+) -> Result<WorkbenchView, String> {
+    state.request_controlled_stop(&task_id, generation, expected_revision)
 }
 
 #[tauri::command]
@@ -685,6 +1089,8 @@ mod tests {
                 step_id: "worker".into(),
                 state: crate::task_document::AttemptState::Running,
                 summary: "intent".into(),
+                process_identity: None,
+                stop: None,
             })
             .unwrap();
         let new = TaskLedgerState::default();
@@ -696,5 +1102,221 @@ mod tests {
                 .contains("执行记录")
         );
         assert_eq!(old.ledger().unwrap().snapshot().unwrap().revision, 1);
+    }
+
+    #[test]
+    fn dispatched_recovery_exposes_process_evidence_without_releasing_occupancy() {
+        let (state, projects, project) = configured();
+        let view = state.create_task(&projects, input(project)).unwrap();
+        let task = view.ledger.active.as_ref().unwrap().task_id.clone();
+        state
+            .ledger()
+            .unwrap()
+            .set_phase(&state.owner_id, &task, 1, 1, Phase::RecoveryRequired)
+            .unwrap();
+        state
+            .document_store(&task, 1)
+            .unwrap()
+            .record(crate::task_document::AttemptEvent {
+                id: "1:2:0:start".into(),
+                sequence: 4,
+                attempt_id: "1:2:0".into(),
+                step_id: "worker".into(),
+                state: crate::task_document::AttemptState::Running,
+                summary: "intent".into(),
+                process_identity: None,
+                stop: None,
+            })
+            .unwrap();
+
+        let current = state.workbench().unwrap();
+        let recovery = current.recovery.unwrap();
+        assert_eq!(recovery.attempts[0].observation, "launchUncertain");
+        assert!(!recovery.all_exited);
+        assert_eq!(current.ledger.active.unwrap().phase, "recoveryRequired");
+        assert!(state.resume_after_recovery(&task, 1, 2).is_err());
+    }
+
+    #[test]
+    fn dispatched_recovery_can_be_reclaimed_once_all_old_attempts_exited() {
+        let (old, projects, project) = configured();
+        let view = old.create_task(&projects, input(project)).unwrap();
+        let task = view.ledger.active.as_ref().unwrap().task_id.clone();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        old.ledger()
+            .unwrap()
+            .set_phase(&old.owner_id, &task, 1, 1, Phase::RecoveryRequired)
+            .unwrap();
+        old.document_store(&task, 1)
+            .unwrap()
+            .record(crate::task_document::AttemptEvent {
+                id: "1:2:0:start".into(),
+                sequence: 4,
+                attempt_id: "1:2:0".into(),
+                step_id: "worker".into(),
+                state: crate::task_document::AttemptState::Running,
+                summary: "intent".into(),
+                process_identity: Some(crate::task_document::ProcessIdentity {
+                    pid,
+                    executable: std::env::current_exe().unwrap().to_string_lossy().into(),
+                    start_token: None,
+                }),
+                stop: None,
+            })
+            .unwrap();
+        let recovered = TaskLedgerState::default();
+        recovered
+            .configure(old.path.lock().unwrap().clone().unwrap())
+            .unwrap();
+        let current = recovered.workbench().unwrap();
+        assert!(current.recovery.unwrap().all_exited);
+        let resumed = recovered.resume_after_recovery(&task, 1, 2).unwrap();
+        assert_eq!(resumed.ledger.revision, 3);
+        assert_eq!(resumed.ledger.active.unwrap().phase, "recoveredReserved");
+        assert!(recovered.resume_after_recovery(&task, 1, 2).is_err());
+    }
+
+    fn controlled_dispatch_fixture(
+        link: Option<SessionLink>,
+    ) -> (Snapshot, Document, SessionInfo) {
+        let project = std::env::temp_dir().canonicalize().unwrap();
+        let project_path = project.to_string_lossy().into_owned();
+        (
+            Snapshot {
+                revision: 2,
+                generation: 1,
+                active: Some(ActiveTask {
+                    task_id: "task-controlled".into(),
+                    project_id: project_path.clone(),
+                    owner_id: "owner".into(),
+                    phase: Phase::Reserved,
+                }),
+            },
+            Document {
+                revision: 1,
+                plan: TaskPlan {
+                    task_id: "task-controlled".into(),
+                    generation: 1,
+                    project_id: project_path.clone(),
+                    goal: "核对本地材料".into(),
+                    owner: "owner".into(),
+                    scope: "只读".into(),
+                    output_dir: project_path.clone(),
+                    steps: vec![],
+                },
+                events: vec![],
+                artifacts: vec![],
+                session_link: link,
+            },
+            SessionInfo {
+                id: "session-controlled".into(),
+                tool_id: "claude".into(),
+                tool_name: "Claude Code".into(),
+                project_path: project_path,
+            },
+        )
+    }
+
+    #[test]
+    fn controlled_dispatch_requires_a_matching_live_session_link() {
+        let (snapshot, document, info) = controlled_dispatch_fixture(None);
+        let error = validate_controlled_dispatch(
+            &snapshot,
+            &document,
+            &info,
+            &info.id,
+            "task-controlled",
+            1,
+            2,
+        )
+        .unwrap_err();
+        assert!(error.contains("关联"));
+
+        let link = SessionLink {
+            id: info.id.clone(),
+            tool_id: info.tool_id.clone(),
+            tool_name: info.tool_name.clone(),
+            project_path: info.project_path.clone(),
+        };
+        let (snapshot, document, info) = controlled_dispatch_fixture(Some(link));
+        assert_eq!(
+            validate_controlled_dispatch(
+                &snapshot,
+                &document,
+                &info,
+                &info.id,
+                "task-controlled",
+                1,
+                2,
+            )
+            .unwrap(),
+            Cli::Claude
+        );
+    }
+
+    #[test]
+    fn controlled_dispatch_rejects_stale_revision_cross_project_and_unsupported_tool() {
+        let link = SessionLink {
+            id: "session-controlled".into(),
+            tool_id: "claude".into(),
+            tool_name: "Claude Code".into(),
+            project_path: std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+        };
+        let (mut snapshot, document, info) = controlled_dispatch_fixture(Some(link));
+        assert!(validate_controlled_dispatch(
+            &snapshot,
+            &document,
+            &info,
+            &info.id,
+            "task-controlled",
+            1,
+            1,
+        )
+        .unwrap_err()
+        .contains("版本"));
+
+        snapshot.revision = 2;
+        let mut other = info.clone();
+        other.project_path = "C:\\other-project".into();
+        assert!(validate_controlled_dispatch(
+            &snapshot,
+            &document,
+            &other,
+            &other.id,
+            "task-controlled",
+            1,
+            2,
+        )
+        .unwrap_err()
+        .contains("所属项目"));
+
+        let mut unsupported = info;
+        unsupported.tool_id = "codex".into();
+        unsupported.tool_name = "Codex".into();
+        let mut unsupported_document = document;
+        unsupported_document.session_link.as_mut().unwrap().tool_id = "codex".into();
+        unsupported_document.session_link.as_mut().unwrap().tool_name = "Codex".into();
+        assert!(validate_controlled_dispatch(
+            &snapshot,
+            &unsupported_document,
+            &unsupported,
+            &unsupported.id,
+            "task-controlled",
+            1,
+            2,
+        )
+        .unwrap_err()
+        .contains("暂不支持"));
     }
 }

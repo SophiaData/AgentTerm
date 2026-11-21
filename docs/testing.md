@@ -4,16 +4,62 @@
 
 当前双终端分屏代码6a0615d4d44ac0e165109324112a176bd7edd44a通过串行CI44747204310：两端前端75、Linux Rust123、Windows Rust114、TUI17，13项质量门通过。新增14项前端回归；最初b14322f8候选CI44746013910因补正跨项目焦点同步而主动取消，不计作失败或通过。分屏覆盖：显示与输入焦点分离、拖动/键盘调比例、窄空间上下布局、双侧独立尺寸同步、单屏/新建页保持挂载。新增回归检查替换当前格、关闭另一格、失败保留、自然退出和只剩一个会话；原生验收使用离线PTY测试程序，UI Automation只定向调用控件；不使用系统键盘/鼠标注入。Windows-only打包44749553746成功，artifact14635751234；已安装并用真实Claude Code 2.1.326补验启动与会话管理，详见下节。测试结果绑定本轮提交，不沿用下方多会话结果冒充。
 
-### 会话历史与再次打开切片（2026-11-21，本地自动测试通过，CI/原生待验）
+### 会话历史与再次打开切片（2026-11-21，本地自动测试、CI与原生验收通过）
 
 - 本地验证覆盖 Rust 128 passed / 2 ignored（含 `session_history` 9 项：配置校验、起止跨实例重载、重复/缺失拒绝、50 条窗口裁剪、尾行损坏/无换行截断/摘要篡改失败关闭、锁冲突、非法时间戳拒收，以及 `sessions` 4 项：未配置拒查、单次配置、显式停止记 `已停止`、退出清理记 `应用退出`），前端 Vitest 82 passed（新增 10 项覆盖 `sessionHistory` 辅助函数与首页 `最近会话` 渲染/错误重读/缺失工具禁用），`eslint`、`tsc --noEmit`、`prettier --check`、`vite build`、TUI 15 passed、模板治理 13 项全部通过。
-- 本机工具链限制：Windows 未安装 `rustfmt`/`clippy` 组件，这两项静态门禁须待推送后由 Ubuntu CI 执行；本切片尚未打 Windows 安装包做桌面重启后真实“再次打开”原生验证。
+- 本机工具链限制：Windows 未安装 `rustfmt`/`clippy` 组件，这两项静态门禁由 Ubuntu CI 执行并通过；Windows 安装包已完成桌面重启后真实“再次打开”验收，详见下方 Codex 原生桌面验收段。
 - 前序真实 Claude Code 2.1.326 补验补充（绑定已安装 6a0615d4 包 / PR #30 `2779327b` CI44757159573 成功）：定向 `WM_CHAR` 输入中文、数字 `1234567890` 与标点均完整回显，切标签未提交内容保留，退格与 `/help` 自动补全有效；合成 Enter/CR 未触发提交且会话 JSONL 无新记录，提交、方向键定位、物理键盘/IME、审批与分隔线拖动仍为 NOT RUN。
 
-### Windows Codex 解析与乱码修复（2026-11-21，本地单测通过，CI/真机待验）
+### Windows Codex 解析与乱码修复（2026-11-21，本地单测、CI与真机通过）
 
 - 本地验证：`cargo test -- --test-threads=1` 132 passed / 2 ignored（新增 `tools::tests::windows_skips_extensionless_and_ps1_shims_and_prefers_exe_over_cmd`、`sessions::tests::trim_buffer_front_avoids_splitting_ansi_escape_sequences`、`sessions::tests::spawn_pty_strips_verbatim_paths_and_sets_utf8_env`、`sessions::tests::build_pty_command_wraps_windows_cmd_and_strips_verbatim_cwd`）；前端 Vitest 83 passed（新增 `offsetStitch` UTF-8 continuation bytes 对齐测试），`eslint`、`tsc --noEmit`、`vite build`、TUI 15 passed、模板治理 13 项通过。
-- 过程教训与限制：在无控制台句柄（`GetConsoleWindow()==0`）测试进程中直接从单元测试启动真实 ConPTY `cmd.exe /D /C` 会挂起或异常退出（`0xFFFFFFFF`/`0xC000013A`），因此将命令构建与路径/UTF-8 规则抽为纯函数单元覆盖；真机桌面窗口下的 Codex 启动对话与中文无乱码渲染待打新包后实测。
+- 过程教训与限制：在无控制台句柄（`GetConsoleWindow()==0`）测试进程中直接从单元测试启动真实 ConPTY `cmd.exe /D /C` 会挂起或异常退出（`0xFFFFFFFF`/`0xC000013A`），因此将命令构建与路径/UTF-8 规则抽为纯函数单元覆盖；真机桌面窗口下的 Codex 启动、中文无乱码渲染与重启后再次打开已由下方独立验收补足。
+
+### Windows Codex 原生桌面验收（2026-11-21，已通过）
+
+- 新包 `E:\AgentTerm\app-a7c59bf\agentterm.exe` 与旧版 `E:\AgentTerm\app\agentterm.exe` 并行运行；旧版 `PID 19268` 及其中 3 个 Claude 会话未关闭或接管，新版使用独立 `PID 23264`/重启后 `PID 39860`。
+- 新版真实识别并启动 Codex `v0.169.0`；定向窗口消息输入 `请只回复：中文测试通过` 后，终端完整显示中文输入与 Codex 回复 `中文测试通过`，截图证据为 `.trash/2026-11-19/agentterm-split-codex-chinese.png` 与 `.trash/2026-11-19/agentterm-split-codex-response.png`。
+- 结束新版 Codex 会话并重启新版应用后，首页重新读取持久化历史，显示原项目/工具的最近会话；点击“再次打开”成功新建 Codex 终端并显示运行态。该功能是新开进程，不是 CLI 原生 `resume` 或旧实例接管。
+- 分屏补验：两个真实 Codex 会话可进入双终端布局；分隔线竖向状态支持定向 UIA 焦点与 `Right` 微调，`Home`/`End` 设置边界、`Enter` 复位均生效；窗口缩窄至 900px 后自动切换为横向上下布局，分隔控件尺寸由约 `8×625` 变为 `668×8`。本轮未验证真实物理键盘/IME、`Shift+Tab` 审批快捷键与物理鼠标拖动；定向 UIA/WM_CHAR 验证未使用全局键盘鼠标注入。
+
+### #12 启动身份、停止请求与停止证据基础切片（2026-11-21）
+
+- Rust 单线程测试：146 passed、2 ignored、0 failed；新增账本显式接续、活进程阻断、接续后新 dispatch 隔离旧回报测试，覆盖停止请求幂等、启动事件先落盘、进程身份回写、停止请求先写启动事件、终止事件为 `Unknown`、确认停止证据、`RecoveryRequired` 占用保留，以及启动边界未知/身份匹配/身份不匹配/进程已退出分类。`cargo check --manifest-path src-tauri/Cargo.toml` 通过。
+- 实现边界：启动事件先写入，子进程加入隔离范围后记录 PID、可执行文件和平台可用的启动 token；停止请求先持久化，再停止进程；停止确认失败不释放占用。重启核实只读，`Exited` 仍需人工确认后才能显式接续；`Alive`/`Reused`/`Unknown` 继续阻断。接续迁移到新 owner 和新 revision，旧回报不能通过新 dispatch 校验。正常退出保存已确认停止证据；超时、异常、残留、结果未知或停止不确定保持占用并待核实。
+- 当前仍未实现前端停止/接续命令、前端受管派发、外部作业撤销、真实CLI权限验收和用户验收；因此 #12 与 M4 均未完成。下一项是把接续入口接到受控人工核实界面，并继续覆盖多旧尝试、迟到回报持久记录和跨重启竞态。
+
+### #12 功能侧恢复核实界面（2026-11-21）
+
+- 后端 `workbench_snapshot` 在 `RecoveryRequired` 任务下返回每个未结束尝试的只读进程观察结果；新增 `resume_main_task_after_recovery`，在命令内重新检查 task ID、generation、revision、计划归属及所有旧尝试是否均已 `Exited`，通过后才执行账本 CAS 到 `RecoveredReserved`。命令不启动 CLI，也不释放任务占用。
+- 前端任务抽屉展示尝试编号、步骤和观察结果；活跃、PID复用、启动身份缺失或未知状态只显示“重新核对”，全部退出后才显示“核实并接回任务”。前端回归 15 passed；Rust command 定向测试 13 passed；前端 `tsc --noEmit`、Rust `cargo check` 和 `git diff --check` 通过。
+- 该阶段当时的全量结果为 Rust 148 passed / 2 ignored、前端 Vitest 84 passed；随后已继续完成会话关联切片，当前结果见下方。Windows 未安装 `rustfmt`，项目固定的 `pnpm check` 仍被 `python3` 命令缺失阻塞；本阶段没有把功能标为完成。
+
+### #12 真实 CLI 会话与任务记录显式关联（2026-11-21）
+
+- 新增任务文档 `sessionLink` 和 `associate_task_session` command。关联前后端核对 session ID 对应的 PTY 仍在运行、任务与会话项目路径一致、task ID/generation/revision 未变化；绑定只允许从无到有，同值重复操作不追加记录，其他会话换绑被拒绝。
+- 前端任务抽屉在当前任务存在且当前会话仍运行、项目一致时显示“关联当前会话”；跨项目、已退出或已有其他绑定时不显示。绑定后回读显示工具和 session ID，任务记录与会话关系可追溯。
+- 本地验证：前端全量 Vitest 85 passed，Rust 单线程 150 passed / 2 ignored，`pnpm build`、`tsc --noEmit`、本轮文件 Prettier、`cargo check` 和 `git diff --check` 通过。未做真实桌面点击验收、未启动真实 Agent 任务、未接受控派发；本轮仍不把 #12 标为完成。
+- 质量检查：`pnpm lint`、`pnpm typecheck`、`pnpm test`（83 passed）和 `pnpm build` 通过；`pnpm check` 及 `python scripts/run_quality.py` 被项目固定的 `python3` 命令阻塞。`pnpm format:check` 仍报告仓库既有 48 个文件格式不符；Windows 未安装 `rustfmt`/`clippy` 组件，本轮未将其失败改写为通过。
+
+### #12 受控派发最小入口（2026-11-21）
+
+- 后端新增 `dispatch_controlled_task`：只接受已有计划、当前账本的 `taskId/generation/revision`、已关联且仍运行的同项目会话；绑定信息、工具类型和计划归属由 Rust 从后端状态重新读取，前端不能自填路径、工具或授权。
+- 当前仅允许 Claude Code 适配器。relay 固定使用 `--tools ""`、空 MCP 配置、禁止 MCP 工具和无外部操作提示；执行 Agent 与验收 Agent 顺序运行，当前手动终端保持独立，结果写回任务事件。
+- 前端任务抽屉在条件满足时显示“开始受控执行”，Codex/Agy、跨项目、未绑定、会话结束、待核实、非预留阶段和过期 revision 均不显示或被后端拒绝。重复点击由前端单请求锁和后端阶段/revision 校验共同阻止。
+- 本轮定向验证：任务页 17 passed；Rust `task_commands` 15 passed；`pnpm typecheck` 和 `cargo check --manifest-path src-tauri/Cargo.toml` 通过。全量测试、构建、格式检查和单线程 Rust 全套尚待收尾执行。
+- 未验收：真实桌面点击、真实 Claude 账号/权限边界、真实受控接力输出、停止按钮、完成释放、持续状态推送和外部会话接管；因此不关闭 #12 或 M4。
+
+### #12 受控派发状态联动（2026-11-21）
+
+- 前端只在 `dispatch_controlled_task` 请求持续期间短轮询 `workbench_snapshot`，回读后端已持久化的 `running`、`verifying`、`waitingInput`、`waitingApproval`、`pausing` 和 `recoveryRequired` 阶段；任务卡同时展示当前尝试事件，普通手动 CLI 不受影响。
+- 新增回归覆盖 `verifying` 阶段的任务卡、阶段说明和已提交尝试；快照沿用账本 revision/generation 与任务文档 revision 的旧数据保护。前端全量 Vitest 87 passed，`pnpm typecheck`、`pnpm build`、目标文件 Prettier 和 `git diff --check` 通过。
+- 这只是状态可观察性切片，不代表真实桌面持续推送、停止/完成释放、验收证据闸门或真实 Claude 账号权限已通过；`pnpm check` 仍受本机缺少 `python3` 影响，Windows `rustfmt`/`clippy` 仍由 CI 补验。
+
+### #12 停止请求入口（2026-11-21）
+
+- `dispatch_controlled_task` 现在后台启动既有顺序 relay，前端命令立即返回并继续读取持久状态；任务卡在 `running/verifying` 显示停止入口。
+- 停止顺序由后端固定为“写入停止原因 → 请求进程控制 → 推进 `pausing`”；relay 在停止竞态中重新读取账本 revision，再写入 `RecoveryRequired`，避免旧票据覆盖停止后的新状态。
+- 本地验证：Rust 单线程 152 passed / 2 ignored，停止证据定向测试通过，`cargo check`、前端测试 19 passed、lint、typecheck、build、Prettier 通过；尚未做真实桌面点击、真实 Claude 权限、停止后的用户验收和完成释放。`pnpm check` 仍因本机没有 `python3` 退出 1。
 
 前序多会话切片（9eea1dc5）：从单个会话改为多个独立CLI会话；以下保留该切片的历史自动测试结果，原生现状以上方最新分屏段为准。新回归覆盖两个会话独立身份/选择、重复启动保护、后台退出归属、关闭互不影响、停止失败保留、退出竞争、自然退出释放缓存、关闭过程中切换与启动失败重试；App检查切换/新建页仍保留所有终端面板，后端检查运行会话禁止forget、已结束输出按ID释放。代码9eea1dc54dd9a2ba3693baf6d03b7086465447e0通过串行CI44726264171：前端61（两端）、Linux Rust123、Windows Rust114、TUI17；13项质量门通过。两端各2个ignored仍为既有子进程测试入口。新增10项前端和3项后端回归；当时原生未安装/验收，主Agent自检不能冒充独立审查。
 

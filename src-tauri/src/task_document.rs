@@ -43,6 +43,25 @@ pub enum AttemptState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub executable: String,
+    /// OS start token where the platform exposes one (for example Linux
+    /// `/proc/<pid>/stat` starttime). PID alone is never a stop proof.
+    #[serde(default)]
+    pub start_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopEvidence {
+    pub requested: bool,
+    pub confirmed: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AttemptEvent {
     pub id: String,
     pub sequence: u64,
@@ -50,6 +69,14 @@ pub struct AttemptEvent {
     pub step_id: String,
     pub state: AttemptState,
     pub summary: String,
+    /// Added after the process is actually created. Missing on old documents
+    /// means the launch boundary was never durably observed.
+    #[serde(default)]
+    pub process_identity: Option<ProcessIdentity>,
+    /// Stop evidence is attached to the running start event when a stop was
+    /// requested, and to the terminal event when the outcome is known.
+    #[serde(default)]
+    pub stop: Option<StopEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,11 +92,22 @@ pub struct Artifact {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionLink {
+    pub id: String,
+    pub tool_id: String,
+    pub tool_name: String,
+    pub project_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Document {
     pub revision: u64,
     pub plan: TaskPlan,
     pub events: Vec<AttemptEvent>,
     pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub session_link: Option<SessionLink>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -182,6 +220,7 @@ impl DocumentStore {
             plan,
             events: vec![],
             artifacts: vec![],
+            session_link: None,
         };
         let mut file = OpenOptions::new()
             .write(true)
@@ -199,6 +238,20 @@ impl DocumentStore {
     pub fn snapshot(&self) -> Result<Document, String> {
         let _guard = self.lock(false)?;
         read(&mut self.open()?)
+    }
+
+    /// Associates one real AgentTerm session with the task record. The link is
+    /// write-once so a task cannot silently jump between unrelated sessions.
+    pub fn associate_session(&self, link: SessionLink) -> Result<Document, String> {
+        validate_session_link(&link)?;
+        self.update(|document| match &document.session_link {
+            Some(existing) if existing == &link => Ok(false),
+            Some(_) => Err("任务已经关联其他会话，不能静默换绑".into()),
+            None => {
+                document.session_link = Some(link);
+                Ok(true)
+            }
+        })
     }
     fn update(
         &self,
@@ -235,6 +288,73 @@ impl DocumentStore {
             document.events.push(event);
             document.events.sort_by_key(|item| item.sequence);
             Ok(true)
+        })
+    }
+    /// Fills the previously recorded start event after the OS accepted the
+    /// child into its containment scope. A conflicting identity is rejected.
+    pub fn record_process_identity(
+        &self,
+        event_id: &str,
+        identity: ProcessIdentity,
+    ) -> Result<Document, String> {
+        validate_process_identity(&identity)?;
+        self.update(|document| {
+            let event = document
+                .events
+                .iter_mut()
+                .find(|item| item.id == event_id)
+                .ok_or_else(|| "启动事件不存在，不能写入进程身份".to_string())?;
+            if event.state != AttemptState::Running {
+                return Err("只有运行中的启动事件可以写入进程身份".into());
+            }
+            match &event.process_identity {
+                Some(existing) if existing == &identity => Ok(false),
+                Some(_) => Err("启动事件已有不同进程身份，拒绝覆盖".into()),
+                None => {
+                    event.process_identity = Some(identity);
+                    Ok(true)
+                }
+            }
+        })
+    }
+    /// Records an explicit stop request before the native process is asked to
+    /// stop. Repeating the same request is idempotent; changing its reason is
+    /// rejected so the journal cannot rewrite the request history.
+    pub fn record_stop_request(
+        &self,
+        event_id: &str,
+        reason: &str,
+    ) -> Result<Document, String> {
+        if !text(reason, 240) {
+            return Err("停止原因不能为空且不得超过240字节".into());
+        }
+        self.update(|document| {
+            let event = document
+                .events
+                .iter_mut()
+                .find(|item| item.id == event_id)
+                .ok_or_else(|| "启动事件不存在，不能记录停止请求".to_string())?;
+            if event.state != AttemptState::Running {
+                return Err("只有运行中的启动事件可以记录停止请求".into());
+            }
+            match &event.stop {
+                Some(existing)
+                    if existing.requested
+                        && !existing.confirmed
+                        && existing.reason == reason =>
+                {
+                    Ok(false)
+                }
+                Some(_) => Err("启动事件已有不同停止请求，拒绝覆盖".into()),
+                None => {
+                    event.stop = Some(StopEvidence {
+                        requested: true,
+                        confirmed: false,
+                        reason: reason.into(),
+                    });
+                    Ok(true)
+                }
+            }
         })
     }
     pub fn reference(&self, relative_path: &str, label: &str) -> Result<Document, String> {
@@ -362,12 +482,60 @@ fn validate_event(event: &AttemptEvent, plan: &TaskPlan) -> Result<(), String> {
     if revision == 0 || parts[2] != role || event.sequence != sequence || event.id != id {
         return Err(invalid());
     }
+    if let Some(identity) = &event.process_identity {
+        if event.state != AttemptState::Running {
+            return Err(invalid());
+        }
+        validate_process_identity(identity)?;
+    }
+    if let Some(stop) = &event.stop {
+        if !text(&stop.reason, 240)
+            || (event.state == AttemptState::Running
+                && (!stop.requested || stop.confirmed))
+            || (stop.confirmed && !end)
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn validate_process_identity(identity: &ProcessIdentity) -> Result<(), String> {
+    if identity.pid == 0
+        || !text(&identity.executable, 4096)
+        || identity
+            .start_token
+            .as_deref()
+            .is_some_and(|value| !text(value, 256))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+fn validate_session_link(link: &SessionLink) -> Result<(), String> {
+    if !text(&link.id, 256)
+        || !text(&link.tool_id, 120)
+        || !text(&link.tool_name, 240)
+        || !text(&link.project_path, 4096)
+    {
+        return Err(invalid());
+    }
+    let path = Path::new(&link.project_path);
+    if !path.is_absolute()
+        || !path.is_dir()
+        || path.canonicalize().map_err(io_error)? != path
+    {
+        return Err("会话项目路径必须是已存在的真实目录".into());
+    }
     Ok(())
 }
 fn validate_document(document: &Document) -> Result<(), String> {
     validate_plan(&document.plan)?;
     if document.revision == 0 || document.events.len() > 128 || document.artifacts.len() > 32 {
         return Err(invalid());
+    }
+    if let Some(link) = &document.session_link {
+        validate_session_link(link)?;
     }
     let mut previous = 0;
     for event in &document.events {
@@ -427,10 +595,14 @@ fn read(file: &mut File) -> Result<Document, String> {
         if let Some(before) = &last {
             if record.document.revision != before.revision + 1
                 || record.document.plan != before.plan
-                || !before
-                    .events
-                    .iter()
-                    .all(|old| record.document.events.contains(old))
+                || !session_link_history_preserved(before.session_link.as_ref(), record.document.session_link.as_ref())
+                || !before.events.iter().all(|old| {
+                    record
+                        .document
+                        .events
+                        .iter()
+                        .any(|current| event_history_preserved(old, current))
+                })
                 || !record.document.artifacts.starts_with(&before.artifacts)
             {
                 return Err(invalid());
@@ -438,12 +610,47 @@ fn read(file: &mut File) -> Result<Document, String> {
         } else if record.document.revision != 1
             || !record.document.events.is_empty()
             || !record.document.artifacts.is_empty()
+            || record.document.session_link.is_some()
         {
             return Err(invalid());
         }
         last = Some(record.document);
     }
     last.ok_or_else(invalid)
+}
+fn session_link_history_preserved(
+    old: Option<&SessionLink>,
+    current: Option<&SessionLink>,
+) -> bool {
+    match (old, current) {
+        (None, _) => true,
+        (Some(before), Some(after)) => before == after,
+        (Some(_), None) => false,
+    }
+}
+fn event_history_preserved(old: &AttemptEvent, current: &AttemptEvent) -> bool {
+    if old == current {
+        return true;
+    }
+    if old.id != current.id
+        || old.sequence != current.sequence
+        || old.attempt_id != current.attempt_id
+        || old.step_id != current.step_id
+        || old.state != current.state
+        || old.summary != current.summary
+        || old.state != AttemptState::Running
+    {
+        return false;
+    }
+    let identity_added = old.process_identity.is_none() && current.process_identity.is_some();
+    let identity_preserved = old.process_identity == current.process_identity || identity_added;
+    let stop_added = old.stop.is_none()
+        && current
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.requested && !stop.confirmed);
+    let stop_preserved = old.stop == current.stop || stop_added;
+    identity_preserved && stop_preserved && (identity_added || stop_added)
 }
 fn append(file: &mut File, document: &Document) -> Result<(), String> {
     let encoded = serde_json::to_vec(document).map_err(io_error)?;
@@ -553,6 +760,8 @@ mod tests {
                 AttemptState::Running
             },
             summary: "证据说明".into(),
+            process_identity: None,
+            stop: None,
         }
     }
     #[test]
@@ -569,6 +778,27 @@ mod tests {
         assert!(store.create(changed).is_err());
         assert_eq!(store.snapshot().unwrap(), created);
     }
+
+    #[test]
+    fn session_link_is_write_once_and_survives_reopen() {
+        let (store, plan) = fixture();
+        store.create(plan.clone()).unwrap();
+        let link = SessionLink {
+            id: "session-1".into(),
+            tool_id: "claude".into(),
+            tool_name: "Claude Code".into(),
+            project_path: plan.project_id.clone(),
+        };
+        let linked = store.associate_session(link.clone()).unwrap();
+        assert_eq!(linked.session_link, Some(link.clone()));
+        assert_eq!(store.associate_session(link).unwrap(), linked);
+        let different = SessionLink {
+            id: "session-2".into(),
+            ..linked.session_link.clone().unwrap()
+        };
+        assert!(store.associate_session(different).is_err());
+        assert_eq!(store.snapshot().unwrap().session_link, linked.session_link);
+    }
     #[test]
     fn duplicate_and_out_of_order_events_are_idempotent() {
         let (store, plan) = fixture();
@@ -583,6 +813,62 @@ mod tests {
         let mut wrong = event(true);
         wrong.attempt_id = "2:2:0".into();
         assert!(store.record(wrong).is_err());
+    }
+
+    #[test]
+    fn process_identity_is_bound_to_running_event_and_cannot_be_replaced() {
+        let (store, plan) = fixture();
+        store.create(plan).unwrap();
+        store.record(event(false)).unwrap();
+        let identity = ProcessIdentity {
+            pid: 42,
+            executable: "C:/agent.exe".into(),
+            start_token: Some("start-1".into()),
+        };
+        validate_process_identity(&identity).unwrap();
+        let saved = store
+            .record_process_identity("1:2:0:start", identity.clone())
+            .unwrap();
+        validate_document(&saved).unwrap();
+        assert_eq!(saved.events[0].process_identity, Some(identity.clone()));
+        assert_eq!(
+            store
+                .record_process_identity("1:2:0:start", identity.clone())
+                .unwrap(),
+            saved
+        );
+        let mut replacement = identity;
+        replacement.pid = 43;
+        assert!(store
+            .record_process_identity("1:2:0:start", replacement)
+            .is_err());
+    }
+
+    #[test]
+    fn stop_request_is_persisted_before_stop_and_is_idempotent() {
+        let (store, plan) = fixture();
+        store.create(plan).unwrap();
+        store.record(event(false)).unwrap();
+        let saved = store
+            .record_stop_request("1:2:0:start", "用户请求停止")
+            .unwrap();
+        assert_eq!(
+            saved.events[0].stop,
+            Some(StopEvidence {
+                requested: true,
+                confirmed: false,
+                reason: "用户请求停止".into(),
+            })
+        );
+        assert_eq!(
+            store
+                .record_stop_request("1:2:0:start", "用户请求停止")
+                .unwrap(),
+            saved
+        );
+        assert!(store
+            .record_stop_request("1:2:0:start", "另一原因")
+            .is_err());
     }
     #[test]
     fn artifact_hash_is_verified_and_new_version_preserves_old_reference() {

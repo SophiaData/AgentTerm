@@ -92,6 +92,7 @@ const MAX_BUFFER_CHARS: usize = 512 * 1024;
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct PtySession {
+    info: SessionInfo,
     master: Box<dyn portable_pty::MasterPty + Send>,
     /// Foreground process group of the PTY, captured while the child is alive.
     /// Used to terminate descendants that keep the PTY open after the child
@@ -732,6 +733,7 @@ impl SessionManager {
         #[cfg(unix)]
         let pgid = master.process_group_leader();
         let session = PtySession {
+            info: info.clone(),
             master,
             #[cfg(unix)]
             pgid,
@@ -916,6 +918,16 @@ impl SessionManager {
             }),
             None => Err("会话不存在或已结束".to_string()),
         }
+    }
+
+    /// Returns metadata owned by the backend for a live session. Renderer
+    /// supplied labels and paths are never authoritative for task binding.
+    pub fn session_info(&self, session_id: &str) -> Result<SessionInfo, String> {
+        let sessions = self.lock()?;
+        sessions
+            .get(session_id)
+            .map(|session| session.info.clone())
+            .ok_or_else(|| "会话不存在或已结束".to_string())
     }
 
     pub fn write(&self, session_id: &str, data: &str) -> Result<(), String> {
@@ -1222,6 +1234,15 @@ mod tests {
         map.insert(
             id.to_string(),
             super::PtySession {
+                info: super::SessionInfo {
+                    id: id.to_string(),
+                    tool_id: "claude".into(),
+                    tool_name: "Claude Code".into(),
+                    project_path: std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into(),
+                },
                 master: Box::new(FakeMaster),
                 #[cfg(unix)]
                 pgid: None,
@@ -1587,6 +1608,16 @@ mod tests {
     fn snapshot_of_unknown_session_errors() {
         let manager = super::SessionManager::default();
         assert!(manager.snapshot("never-existed").is_err());
+    }
+
+    #[test]
+    fn session_info_reads_backend_owned_metadata_for_live_session() {
+        let manager = super::SessionManager::default();
+        insert_fake_session(&manager, "owned", false);
+        let info = manager.session_info("owned").unwrap();
+        assert_eq!(info.id, "owned");
+        assert_eq!(info.tool_id, "claude");
+        assert!(manager.session_info("missing").is_err());
     }
 
     #[test]

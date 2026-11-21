@@ -6,6 +6,7 @@ import {
   type FormEvent,
 } from "react";
 import type { Project } from "./projects/types";
+import type { SessionInfo } from "./terminal/types";
 import {
   acceptSnapshot,
   actionsBlocked,
@@ -14,8 +15,10 @@ import {
   latestAttempts,
   isReservation,
   phaseLabels,
+  phaseMessages,
   planProblem,
   requestOrder,
+  recoveryObservationLabels,
   selectedProject,
   type PlanInput,
   type Preview,
@@ -42,6 +45,12 @@ export function TaskCard({
   onPreview,
   onCancel,
   onRecover,
+  onResumeAfterRecovery,
+  onRefresh,
+  currentSession,
+  onAssociateSession,
+  onDispatch,
+  onStop,
 }: {
   view: WorkbenchView;
   busy: boolean;
@@ -51,6 +60,12 @@ export function TaskCard({
   onPreview: (id: string) => void;
   onCancel: () => void;
   onRecover: (release: boolean) => void;
+  onResumeAfterRecovery: () => void;
+  onRefresh: () => void;
+  currentSession: SessionInfo | null;
+  onAssociateSession: () => void;
+  onDispatch: () => void;
+  onStop: () => void;
 }) {
   const [confirmation, setConfirmation] = useState<"cancel" | "release" | null>(
     null,
@@ -68,6 +83,29 @@ export function TaskCard({
     active.recoveryRequired &&
     reserved &&
     (!document || document.events.length === 0);
+  const recovery = view.recovery;
+  const sessionLink = document?.sessionLink ?? null;
+  const canAssociateSession =
+    !!document &&
+    !!currentSession &&
+    currentSession.projectPath === active.projectId &&
+    !sessionLink &&
+    !active.recoveryRequired;
+  const canDispatch =
+    !!document &&
+    isReservation(active.phase) &&
+    !active.recoveryRequired &&
+    !!sessionLink &&
+    !!currentSession &&
+    currentSession.id === sessionLink.id &&
+    currentSession.projectPath === active.projectId &&
+    currentSession.toolId === sessionLink.toolId &&
+    currentSession.toolId === "claude";
+  const canStop =
+    !active.recoveryRequired &&
+    (active.phase === "running" ||
+      active.phase === "verifying" ||
+      active.phase === "pausing");
   const attempts = latestAttempts(document?.events ?? []);
   return (
     <article className="task-card">
@@ -88,6 +126,33 @@ export function TaskCard({
         <span>{projectName ?? active.projectId}</span>
         {document && <span>负责人 · {document.plan.owner}</span>}
       </div>
+      {document ? (
+        <section className="session-link-card" aria-label="关联 CLI 会话">
+          <div>
+            <strong>
+              {sessionLink ? "已关联 CLI 会话" : "尚未关联 CLI 会话"}
+            </strong>
+            <p>
+              {sessionLink
+                ? `${sessionLink.toolName} · ${sessionLink.id}`
+                : currentSession &&
+                    currentSession.projectPath === active.projectId
+                  ? `当前会话：${currentSession.toolName}`
+                  : "打开同一项目下的 CLI 会话后，可在这里明确关联。"}
+            </p>
+          </div>
+          {canAssociateSession ? (
+            <button
+              type="button"
+              className="ghost-button"
+              disabled={busy}
+              onClick={onAssociateSession}
+            >
+              关联当前会话
+            </button>
+          ) : null}
+        </section>
+      ) : null}
       {active.recoveryRequired ? (
         <section
           className="task-notice notice-attention"
@@ -120,22 +185,92 @@ export function TaskCard({
               </div>
             </>
           ) : (
-            <p>
-              已有执行记录或执行状态不明，暂时只可查看。运行中任务的停止与恢复尚未开放。
-            </p>
+            <>
+              <p>
+                这是一次受管执行的待核实状态。系统会读取已记录的进程身份；只在全部旧尝试确认退出后，才允许接回任务。
+              </p>
+              {recovery?.attempts.length ? (
+                <ul className="recovery-attempts">
+                  {recovery.attempts.map((attempt) => (
+                    <li key={attempt.attemptId}>
+                      <span>{attempt.stepId}</span>
+                      <strong>
+                        {recoveryObservationLabels[attempt.observation]}
+                      </strong>
+                      <small>{attempt.attemptId}</small>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="recovery-empty">
+                  尚未读取到可核实的执行尝试，继续保持占用。
+                </p>
+              )}
+              <div className="action-row">
+                <button
+                  className="ghost-button"
+                  disabled={busy}
+                  onClick={onRefresh}
+                >
+                  重新核对
+                </button>
+                {recovery?.allExited ? (
+                  <button
+                    className="primary-button"
+                    disabled={busy}
+                    onClick={onResumeAfterRecovery}
+                  >
+                    核实并接回任务
+                  </button>
+                ) : null}
+              </div>
+            </>
           )}
         </section>
+      ) : !reserved ? (
+        <section
+          className="task-notice notice-attention"
+          aria-label="受控执行状态"
+          aria-live="polite"
+        >
+          <h3>{phaseLabels[active.phase] ?? "任务状态待核实"}</h3>
+          <p>
+            {phaseMessages[active.phase] ??
+              "当前状态无法识别，系统保留任务占用，请重新读取后再决定下一步。"}
+          </p>
+        </section>
       ) : (
-        reserved && (
-          <section className="task-notice" aria-label="下一步">
-            <h3>
-              {document ? "计划已保存，可以整理交付文件" : "补全计划后继续"}
-            </h3>
-            <p>
-              自动执行尚未开放。你可以在这里查看计划、添加已有文件并核对版本。
+        <section className="task-notice" aria-label="下一步">
+          <h3>
+            {document
+              ? canDispatch
+                ? "计划已保存，可以开始受控执行"
+                : "计划已保存，可以整理交付文件"
+              : "补全计划后继续"}
+          </h3>
+          <p>
+            {document
+              ? "受控执行会按执行 Agent → 验收 Agent 顺序运行，只使用受限的本地只读 relay；当前终端不会被接管。"
+              : "你可以在这里查看计划、添加已有文件并核对版本。"}
+          </p>
+          {canDispatch ? (
+            <div className="action-row">
+              <button
+                type="button"
+                className="primary-button"
+                disabled={busy}
+                onClick={onDispatch}
+              >
+                {busy ? "正在执行受控接力…" : "开始受控执行"}
+              </button>
+              <span>执行结果会回写任务记录，仍需人工核对验收意见。</span>
+            </div>
+          ) : document && sessionLink && isReservation(active.phase) ? (
+            <p className="tool-detail">
+              选择已关联且仍运行中的 Claude Code 会话后，才会显示受控执行入口。
             </p>
-          </section>
-        )
+          ) : null}
+        </section>
       )}
       {document ? (
         <>
@@ -323,6 +458,14 @@ export function TaskCard({
             取消这项任务
           </button>
           <span>仅适用于尚未执行的任务</span>
+        </div>
+      )}
+      {canStop && active.phase !== "pausing" && (
+        <div className="task-end">
+          <button className="danger-button" disabled={busy} onClick={onStop}>
+            请求停止受控执行
+          </button>
+          <span>停止请求会先写入任务记录；确认前任务仍保持占用。</span>
         </div>
       )}
       {confirmation &&
@@ -553,6 +696,7 @@ export default function TaskWorkbench({
   onDraftChange,
   onAddProject,
   onRefreshProjects,
+  currentSession,
 }: {
   projects: Project[];
   projectBusy: boolean;
@@ -561,6 +705,7 @@ export default function TaskWorkbench({
   onDraftChange: (input: PlanInput) => void;
   onAddProject: () => void;
   onRefreshProjects: () => void;
+  currentSession: SessionInfo | null;
 }) {
   const [view, setView] = useState<WorkbenchView | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
@@ -574,6 +719,8 @@ export default function TaskWorkbench({
   const mutation = useRef(false);
   const reading = useRef(false);
   const mounted = useRef(true);
+  const statusPoll = useRef<ReturnType<typeof setInterval> | null>(null);
+  const statusPollInFlight = useRef(false);
   const load = useCallback(async (): Promise<boolean> => {
     const request = order.current.next();
     reading.current = true;
@@ -603,6 +750,34 @@ export default function TaskWorkbench({
       }
     }
   }, []);
+  const pollStatus = useCallback(async () => {
+    if (!mounted.current || statusPollInFlight.current) return;
+    statusPollInFlight.current = true;
+    try {
+      const next = await invoke<WorkbenchView>("workbench_snapshot");
+      if (mounted.current) {
+        setView((previous) => acceptSnapshot(previous, next));
+        if (
+          next.ledger.active &&
+          !["running", "verifying", "pausing"].includes(
+            next.ledger.active.phase,
+          )
+        ) {
+          stopStatusPolling();
+        }
+      }
+    } catch {
+      // A transient status read cannot replace the last known task state.
+    } finally {
+      statusPollInFlight.current = false;
+    }
+  }, []);
+  const stopStatusPolling = useCallback(() => {
+    if (statusPoll.current !== null) {
+      clearInterval(statusPoll.current);
+      statusPoll.current = null;
+    }
+  }, []);
   useEffect(() => {
     mounted.current = true;
     void load();
@@ -613,10 +788,11 @@ export default function TaskWorkbench({
     window.addEventListener("focus", refreshOnFocus);
     return () => {
       mounted.current = false;
+      stopStatusPolling();
       requests.next();
       window.removeEventListener("focus", refreshOnFocus);
     };
-  }, [load]);
+  }, [load, stopStatusPolling]);
   async function act(
     command: string,
     args?: Record<string, unknown>,
@@ -629,6 +805,10 @@ export default function TaskWorkbench({
     setNotice(null);
     setPreview(null);
     order.current.next();
+    if (command === "dispatch_controlled_task") {
+      void pollStatus();
+      statusPoll.current = setInterval(() => void pollStatus(), 350);
+    }
     try {
       await invoke(command, args);
       if (!mounted.current) return;
@@ -638,6 +818,7 @@ export default function TaskWorkbench({
       }
     } catch (cause) {
       if (!mounted.current) return;
+      if (command === "dispatch_controlled_task") stopStatusPolling();
       await load();
       if (mounted.current) setActionError(message(cause));
     } finally {
@@ -815,6 +996,7 @@ export default function TaskWorkbench({
           projectName={
             projects.find((project) => project.id === active?.projectId)?.name
           }
+          currentSession={currentSession}
           onReference={(relativePath, label) =>
             void act(
               "reference_task_artifact",
@@ -837,6 +1019,39 @@ export default function TaskWorkbench({
               release
                 ? "已结束本次安排，可以登记下一项任务。"
                 : "任务已接回，可以继续整理计划和文件。",
+            )
+          }
+          onResumeAfterRecovery={() =>
+            void act(
+              "resume_main_task_after_recovery",
+              ticket(),
+              "旧执行尝试已确认退出，任务已接回，可以继续派发。",
+            )
+          }
+          onRefresh={() => {
+            setActionError(null);
+            setNotice(null);
+            void load();
+          }}
+          onAssociateSession={() =>
+            void act(
+              "associate_task_session",
+              { ...ticket(), sessionId: currentSession?.id },
+              "当前 CLI 会话已关联到任务记录。",
+            )
+          }
+          onDispatch={() =>
+            void act(
+              "dispatch_controlled_task",
+              { ...ticket(), sessionId: currentSession?.id },
+              "受控接力已结束，结果已写入任务记录，请核对执行与验收意见。",
+            )
+          }
+          onStop={() =>
+            void act(
+              "request_stop_controlled_task",
+              ticket(),
+              "停止请求已记录，系统正在核实受控进程是否已结束。",
             )
           }
         />

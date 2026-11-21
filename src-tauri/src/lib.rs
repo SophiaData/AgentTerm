@@ -36,10 +36,14 @@ pub fn run() {
             task_commands::claim_main_task,
             task_commands::cancel_main_task_reservation,
             task_commands::recover_main_task_reservation,
+            task_commands::resume_main_task_after_recovery,
             task_commands::workbench_snapshot,
             task_commands::create_workbench_task,
             task_commands::attach_task_plan,
             task_commands::reference_task_artifact,
+            task_commands::associate_task_session,
+            task_commands::dispatch_controlled_task,
+            task_commands::request_stop_controlled_task,
             task_commands::preview_task_artifact
         ])
         .setup(|app| {

@@ -35,10 +35,28 @@ export type TaskDocument = {
   };
   events: AttemptEvent[];
   artifacts: Artifact[];
+  sessionLink?: SessionLink | null;
+};
+export type SessionLink = {
+  id: string;
+  toolId: string;
+  toolName: string;
+  projectPath: string;
 };
 export type WorkbenchView = {
   ledger: { revision: number; generation: number; active: MainTask | null };
   document: TaskDocument | null;
+  recovery?: RecoveryView | null;
+};
+export type RecoveryAttempt = {
+  attemptId: string;
+  stepId: string;
+  observation: "launchUncertain" | "exited" | "alive" | "reused" | "unknown";
+  safeToResume: boolean;
+};
+export type RecoveryView = {
+  attempts: RecoveryAttempt[];
+  allExited: boolean;
 };
 export type PlanInput = {
   projectId: string;
@@ -102,6 +120,15 @@ export const phaseLabels: Record<string, string> = {
   recoveryRequired: "待核实",
 };
 
+export const phaseMessages: Record<string, string> = {
+  running: "执行 Agent 正在工作，任务仍占用执行位置。",
+  verifying: "执行 Agent 已交回，验收 Agent 正在独立核对。",
+  waitingInput: "本轮接力已结束，结果已写入记录，等待你核对结果或补充信息。",
+  waitingApproval: "任务正在等待授权，当前占用不会自动释放。",
+  pausing: "正在确认停止和外部残留，确认前不能切换任务。",
+  recoveryRequired: "执行状态无法直接确认，系统保留占用，需先核实旧尝试。",
+};
+
 export function isReservation(phase: string): boolean {
   return phase === "reserved" || phase === "recoveredReserved";
 }
@@ -111,6 +138,17 @@ export const attemptLabels: Record<AttemptEvent["state"], string> = {
   blocked: "等待补充",
   failed: "此步骤未通过",
   unknown: "结果待核实",
+};
+
+export const recoveryObservationLabels: Record<
+  RecoveryAttempt["observation"],
+  string
+> = {
+  launchUncertain: "启动边界未确认",
+  exited: "已确认退出",
+  alive: "仍在运行",
+  reused: "PID 已复用",
+  unknown: "无法确认",
 };
 
 /** Derived display only; never advances the main task or grants approval. */

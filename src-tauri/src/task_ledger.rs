@@ -251,6 +251,35 @@ impl Ledger {
         })
     }
 
+    /// Explicitly reopens a task after a human has confirmed that its prior
+    /// dispatched process is gone. This only returns the task to a reserved
+    /// state; the caller must create a new attempt with the new revision.
+    pub fn resume_after_recovery(
+        &self,
+        new_owner: &str,
+        task_id: &str,
+        generation: u64,
+        expected_revision: u64,
+    ) -> Result<Snapshot, LedgerError> {
+        validate_field(new_owner)?;
+        self.with_locked(|file| {
+            let mut state = read_snapshot(file)?;
+            let task = state.active.as_mut().ok_or(LedgerError::Stale)?;
+            if state.generation != generation
+                || state.revision != expected_revision
+                || task.task_id != task_id
+                || task.phase != Phase::RecoveryRequired
+            {
+                return Err(LedgerError::Stale);
+            }
+            task.owner_id = new_owner.into();
+            task.phase = Phase::RecoveredReserved;
+            state.revision = next(state.revision)?;
+            append(file, &state)?;
+            Ok(state)
+        })
+    }
+
     /// Only the current process may cancel an untouched reservation. Once
     /// dispatch intent has been recorded, this API cannot free the slot.
     /// Verified stopping/completion is deliberately deferred to runtime work.
@@ -596,6 +625,8 @@ fn validate_transition(before: &Snapshot, after: &Snapshot) -> Result<(), Ledger
                 && ((old.phase.is_reserved()
                     && new.phase == Phase::RecoveredReserved
                     && old.owner_id != new.owner_id)
+                    || (old.phase == Phase::RecoveryRequired
+                        && new.phase == Phase::RecoveredReserved)
                     || (old.owner_id == new.owner_id
                         && old.phase != Phase::RecoveryRequired
                         && !new.phase.is_reserved()))
@@ -819,6 +850,32 @@ mod tests {
                 Err(LedgerError::CannotRelease)
             ));
         }
+    }
+
+    #[test]
+    fn explicit_recovery_resume_fences_old_owner_and_returns_reserved_slot() {
+        let ledger = fresh();
+        ledger.claim("task", "project", "old-owner").unwrap();
+        let recovery = ledger
+            .set_phase("old-owner", "task", 1, 1, Phase::RecoveryRequired)
+            .unwrap();
+        let resumed = ledger
+            .resume_after_recovery("new-owner", "task", 1, recovery.revision)
+            .unwrap();
+        assert_eq!(resumed.revision, recovery.revision + 1);
+        assert_eq!(resumed.active.as_ref().unwrap().owner_id, "new-owner");
+        assert_eq!(
+            resumed.active.as_ref().unwrap().phase,
+            Phase::RecoveredReserved
+        );
+        assert!(matches!(
+            ledger.set_phase("old-owner", "task", 1, recovery.revision, Phase::Running),
+            Err(LedgerError::Stale | LedgerError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            ledger.resume_after_recovery("other-owner", "task", 1, recovery.revision),
+            Err(LedgerError::Stale)
+        ));
     }
 
     #[test]

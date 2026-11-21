@@ -1,9 +1,9 @@
 //! Native-only sequential relay. No frontend dispatch command is enabled yet:
 //! real CLI permission profiles and desktop interaction still need acceptance.
 //! Reports are untrusted proposals, never production approval or task completion.
-use crate::task_document::{AttemptEvent, AttemptState, DocumentStore};
+use crate::task_document::{AttemptEvent, AttemptState, Document, DocumentStore, StopEvidence};
 use crate::task_ledger::{Ledger, Phase, Snapshot};
-use crate::task_process::{self, ProcessError, ProcessSpec};
+use crate::task_process::{self, ProcessControl, ProcessError, ProcessObservation, ProcessSpec};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -159,6 +159,7 @@ pub enum RelayError {
     CliUnavailable,
     NativeBinaryRequired,
     Stale,
+    RecoveryNotSafe(String),
     Ledger(String),
     Process(ProcessError),
     UnverifiedReport,
@@ -173,6 +174,134 @@ pub struct Outcome {
     /// None means both reports arrived, NOT that the task passed acceptance.
     pub issue: Option<RelayError>,
     pub snapshot: Snapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum RecoveryObservation {
+    /// The start event exists, but the process identity was never durably seen.
+    LaunchUncertain,
+    Exited,
+    Alive,
+    Reused,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AttemptRecovery {
+    pub attempt_id: String,
+    pub step_id: String,
+    pub observation: RecoveryObservation,
+}
+
+/// Read-only assessment for a restarted coordinator. It does not mutate the
+/// document or ledger and never treats a probe result as permission to retry.
+#[allow(dead_code)]
+pub(crate) fn assess_recovery(document: &Document) -> Vec<AttemptRecovery> {
+    document
+        .events
+        .iter()
+        .filter(|event| event.state == AttemptState::Running)
+        .map(|event| AttemptRecovery {
+            attempt_id: event.attempt_id.clone(),
+            step_id: event.step_id.clone(),
+            observation: match event.process_identity.as_ref() {
+                None => RecoveryObservation::LaunchUncertain,
+                Some(identity) => match task_process::observe_process(identity) {
+                    ProcessObservation::Exited => RecoveryObservation::Exited,
+                    ProcessObservation::Alive => RecoveryObservation::Alive,
+                    ProcessObservation::Reused => RecoveryObservation::Reused,
+                    ProcessObservation::Unknown => RecoveryObservation::Unknown,
+                },
+            },
+        })
+        .collect()
+}
+
+/// Explicit continuation entry point. The caller represents the human
+/// confirmation step; the backend re-probes immediately before the ledger CAS
+/// and only continues when every unfinished prior attempt is definitely gone.
+#[allow(dead_code)]
+pub(crate) fn resume_recorded_after_recovery(
+    ledger: &Ledger,
+    task_id: &str,
+    generation: u64,
+    expected_revision: u64,
+    new_owner: &str,
+    plan: &Plan,
+    store: &DocumentStore,
+    control: ProcessControl,
+) -> Result<Outcome, RelayError> {
+    validate_plan(plan)?;
+    let binaries = [plan.worker.resolve()?, plan.reviewer.resolve()?];
+    resume_recorded_after_recovery_with_binaries(
+        ledger,
+        task_id,
+        generation,
+        expected_revision,
+        new_owner,
+        plan,
+        store,
+        &binaries,
+        control,
+    )
+}
+
+#[allow(dead_code)]
+fn resume_recorded_after_recovery_with_binaries(
+    ledger: &Ledger,
+    task_id: &str,
+    generation: u64,
+    expected_revision: u64,
+    new_owner: &str,
+    plan: &Plan,
+    store: &DocumentStore,
+    binaries: &[PathBuf; 2],
+    control: ProcessControl,
+) -> Result<Outcome, RelayError> {
+    let snapshot = ledger.snapshot().map_err(ledger_error)?;
+    let active = snapshot.active.as_ref().ok_or(RelayError::Stale)?;
+    if snapshot.generation != generation
+        || snapshot.revision != expected_revision
+        || active.task_id != task_id
+        || active.phase != Phase::RecoveryRequired
+        || active.project_id != plan.project_dir.canonicalize().map_err(|_| RelayError::InvalidPlan)?.to_string_lossy()
+    {
+        return Err(RelayError::Stale);
+    }
+    let document = store.snapshot().map_err(RelayError::Document)?;
+    let cwd = plan
+        .project_dir
+        .canonicalize()
+        .map_err(|_| RelayError::InvalidPlan)?;
+    if document.plan.task_id != task_id
+        || document.plan.generation != generation
+        || document.plan.project_id != cwd.to_string_lossy()
+        || document.plan.goal != plan.goal
+    {
+        return Err(RelayError::InvalidPlan);
+    }
+    let assessment = assess_recovery(&document);
+    if assessment.is_empty()
+        || assessment
+            .iter()
+            .any(|item| item.observation != RecoveryObservation::Exited)
+    {
+        return Err(RelayError::RecoveryNotSafe(format!(
+            "旧尝试仍需核实：{assessment:?}"
+        )));
+    }
+    let resumed = ledger
+        .resume_after_recovery(new_owner, task_id, generation, expected_revision)
+        .map_err(ledger_error)?;
+    let ticket = Ticket {
+        task_id: task_id.into(),
+        owner_id: new_owner.into(),
+        generation,
+        revision: resumed.revision,
+    };
+    run_recorded_with_control_with_binaries(ledger, &ticket, plan, store, binaries, control)
 }
 
 /// Executes at most two fresh processes, sequentially. Nothing is retried or
@@ -192,7 +321,33 @@ pub fn run_recorded(
     plan: &Plan,
     store: &DocumentStore,
 ) -> Result<Outcome, RelayError> {
+    run_recorded_with_control(ledger, ticket, plan, store, ProcessControl::new())
+}
+
+/// Native coordinator entry point for a bounded stop request. The caller must
+/// persist `DocumentStore::record_stop_request` before calling
+/// `ProcessControl::request_stop`; this function only observes the control
+/// token and records the resulting stop evidence.
+pub(crate) fn run_recorded_with_control(
+    ledger: &Ledger,
+    ticket: &Ticket,
+    plan: &Plan,
+    store: &DocumentStore,
+    control: ProcessControl,
+) -> Result<Outcome, RelayError> {
     validate_plan(plan)?;
+    let binaries = [plan.worker.resolve()?, plan.reviewer.resolve()?];
+    run_recorded_with_control_with_binaries(ledger, ticket, plan, store, &binaries, control)
+}
+
+fn run_recorded_with_control_with_binaries(
+    ledger: &Ledger,
+    ticket: &Ticket,
+    plan: &Plan,
+    store: &DocumentStore,
+    binaries: &[PathBuf; 2],
+    control: ProcessControl,
+) -> Result<Outcome, RelayError> {
     let document = store.snapshot().map_err(RelayError::Document)?;
     let cwd = plan
         .project_dir
@@ -205,13 +360,34 @@ pub fn run_recorded(
     {
         return Err(RelayError::InvalidPlan);
     }
-    let binaries = [plan.worker.resolve()?, plan.reviewer.resolve()?];
-    run_observed(
+    run_observed_with_start(
         ledger,
         ticket,
         plan,
-        &binaries,
-        task_process::run,
+        binaries,
+        |spec, timeout, event_id| {
+            let mut identity_error = None;
+            let result = task_process::run_with_start_control(
+                spec,
+                timeout,
+                control.clone(),
+                |identity| {
+                    match store.record_process_identity(event_id, identity) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            identity_error = Some(RelayError::Document(error));
+                            false
+                        }
+                    }
+                },
+                || store.record_stop_request(event_id, "受管停止请求").is_ok(),
+            );
+            if let Some(error) = identity_error {
+                Err(error)
+            } else {
+                result.map_err(RelayError::Process)
+            }
+        },
         |event| {
             store
                 .record(event)
@@ -264,6 +440,22 @@ fn phase(
     }
 }
 
+fn phase_from_current(
+    ledger: &Ledger,
+    ticket: &Ticket,
+    next: Phase,
+) -> Result<Snapshot, RelayError> {
+    let current = ledger.snapshot().map_err(ledger_error)?;
+    let active = current.active.as_ref().ok_or(RelayError::Stale)?;
+    if current.generation != ticket.generation
+        || active.task_id != ticket.task_id
+        || active.owner_id != ticket.owner_id
+    {
+        return Err(RelayError::Stale);
+    }
+    phase(ledger, ticket, &current, next)
+}
+
 fn run_with(
     ledger: &Ledger,
     ticket: &Ticket,
@@ -280,6 +472,24 @@ fn run_observed(
     plan: &Plan,
     binaries: &[PathBuf; 2],
     mut execute: impl FnMut(ProcessSpec, Duration) -> Result<Vec<u8>, ProcessError>,
+    record: impl FnMut(AttemptEvent) -> Result<(), RelayError>,
+) -> Result<Outcome, RelayError> {
+    run_observed_with_start(
+        ledger,
+        ticket,
+        plan,
+        binaries,
+        |spec, timeout, _| execute(spec, timeout).map_err(RelayError::Process),
+        record,
+    )
+}
+
+fn run_observed_with_start(
+    ledger: &Ledger,
+    ticket: &Ticket,
+    plan: &Plan,
+    binaries: &[PathBuf; 2],
+    mut execute: impl FnMut(ProcessSpec, Duration, &str) -> Result<Vec<u8>, RelayError>,
     mut record: impl FnMut(AttemptEvent) -> Result<(), RelayError>,
 ) -> Result<Outcome, RelayError> {
     validate_plan(plan)?;
@@ -332,6 +542,8 @@ fn run_observed(
             step_id: step.into(),
             state: AttemptState::Running,
             summary: "已记录执行意图，等待进程结果".into(),
+            process_identity: None,
+            stop: None,
         };
         if let Err(error) = record(start) {
             phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
@@ -343,14 +555,16 @@ fn run_observed(
         } else {
             plan.reviewer
         };
-        let result = execute(cli.spec(&binaries[index], &cwd, prompt), plan.timeout)
-            .map_err(RelayError::Process)
+        let result = execute(
+            cli.spec(&binaries[index], &cwd, prompt),
+            plan.timeout,
+            &format!("{dispatch}:start"),
+        )
             .and_then(|bytes| parse(&bytes, ticket, role, &dispatch));
         let (report, session) = match result {
             Ok(result) => result,
             Err(error) => {
-                outcome.snapshot =
-                    phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
+                outcome.snapshot = phase_from_current(ledger, ticket, Phase::RecoveryRequired)?;
                 record(AttemptEvent {
                     id: format!("{dispatch}:result"),
                     sequence: event_sequence + 1,
@@ -358,13 +572,15 @@ fn run_observed(
                     step_id: step.into(),
                     state: AttemptState::Unknown,
                     summary: format!("结果待核实：{error:?}"),
+                    process_identity: None,
+                    stop: Some(stop_evidence(&error)),
                 })?;
                 outcome.issue = Some(error);
                 return Ok(outcome);
             }
         };
         if worker_session.as_ref() == Some(&session) {
-            outcome.snapshot = phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
+            outcome.snapshot = phase_from_current(ledger, ticket, Phase::RecoveryRequired)?;
             record(AttemptEvent {
                 id: format!("{dispatch}:result"),
                 sequence: event_sequence + 1,
@@ -372,6 +588,12 @@ fn run_observed(
                 step_id: step.into(),
                 state: AttemptState::Unknown,
                 summary: "审查复用了执行会话，不能作为独立验收".into(),
+                process_identity: None,
+                stop: Some(StopEvidence {
+                    requested: false,
+                    confirmed: false,
+                    reason: "执行会话身份与审查会话相同，停止状态需核实".into(),
+                }),
             })?;
             outcome.issue = Some(RelayError::ReusedSession);
             return Ok(outcome);
@@ -388,9 +610,15 @@ fn run_observed(
                 _ => AttemptState::Reported,
             },
             summary: report.summary.clone(),
+            process_identity: None,
+            stop: Some(StopEvidence {
+                requested: false,
+                confirmed: true,
+                reason: "进程正常退出，隔离范围已清空".into(),
+            }),
         };
         if let Err(error) = record(event) {
-            phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
+            phase_from_current(ledger, ticket, Phase::RecoveryRequired)?;
             return Err(error);
         }
         match role {
@@ -406,6 +634,31 @@ fn run_observed(
     }
     outcome.snapshot = phase(ledger, ticket, &outcome.snapshot, Phase::WaitingInput)?;
     Ok(outcome)
+}
+
+fn stop_evidence(error: &RelayError) -> StopEvidence {
+    let confirmed = !matches!(
+        error,
+        RelayError::Document(_)
+            | RelayError::Process(ProcessError::Start)
+            | RelayError::Process(ProcessError::StopUnconfirmed)
+            | RelayError::Process(ProcessError::StopRequestUnconfirmed)
+            | RelayError::Process(ProcessError::StopRequestUnrecorded)
+    );
+    StopEvidence {
+        requested: matches!(
+            error,
+            RelayError::Process(ProcessError::StopRequested)
+                | RelayError::Process(ProcessError::StopRequestUnconfirmed)
+                | RelayError::Process(ProcessError::StopRequestUnrecorded)
+        ),
+        confirmed,
+        reason: if confirmed {
+            format!("进程已退出，隔离范围已清空；结果仍需核实：{error:?}")
+        } else {
+            format!("进程停止状态待核实：{error:?}")
+        },
+    }
 }
 
 fn prompt(
@@ -906,6 +1159,388 @@ fn main() {
             ledger.snapshot().unwrap().active.unwrap().phase,
             Phase::RecoveryRequired
         );
+    }
+
+    #[test]
+    fn recorded_native_launch_persists_identity_before_terminal_result() {
+        let (ledger, ticket, plan, _) = fixture();
+        let root = plan.project_dir.canonicalize().unwrap();
+        let store = DocumentStore::at(&root, &ticket.task_id, ticket.generation).unwrap();
+        store
+            .create(crate::task_document::TaskPlan {
+                task_id: ticket.task_id.clone(),
+                generation: ticket.generation,
+                project_id: root.to_string_lossy().into_owned(),
+                goal: plan.goal.clone(),
+                owner: "owner".into(),
+                scope: "local".into(),
+                output_dir: root.to_string_lossy().into_owned(),
+                steps: vec![
+                    crate::task_document::Step {
+                        id: "worker".into(),
+                        title: "worker".into(),
+                        assignee: "worker".into(),
+                    },
+                    crate::task_document::Step {
+                        id: "reviewer".into(),
+                        title: "reviewer".into(),
+                        assignee: "reviewer".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        let binary = native_fixture();
+        let outcome = run_observed_with_start(
+            &ledger,
+            &ticket,
+            &plan,
+            &[binary.clone(), binary],
+            |spec, timeout, event_id| {
+                let mut identity_error = None;
+                let result = task_process::run_with_start(spec, timeout, |identity| {
+                    match store.record_process_identity(event_id, identity) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            identity_error = Some(RelayError::Document(error));
+                            false
+                        }
+                    }
+                });
+                if let Some(error) = identity_error {
+                    Err(error)
+                } else {
+                    result.map_err(RelayError::Process)
+                }
+            },
+            |event| {
+                store
+                    .record(event)
+                    .map(|_| ())
+                    .map_err(RelayError::Document)
+            },
+        )
+        .unwrap();
+        assert!(outcome.issue.is_none());
+        let saved = store.snapshot().unwrap();
+        assert_eq!(saved.events.len(), 4);
+        assert!(saved.events[0].process_identity.is_some());
+        assert!(saved.events[2].process_identity.is_some());
+        assert!(saved.events[1].stop.as_ref().unwrap().confirmed);
+        assert!(saved.events[3].stop.as_ref().unwrap().confirmed);
+    }
+
+    #[test]
+    fn recorded_stop_request_precedes_terminal_unknown_event_and_keeps_occupancy() {
+        let (ledger, ticket, plan, _) = fixture();
+        let root = plan.project_dir.canonicalize().unwrap();
+        let store = DocumentStore::at(&root, &ticket.task_id, ticket.generation).unwrap();
+        store
+            .create(crate::task_document::TaskPlan {
+                task_id: ticket.task_id.clone(),
+                generation: ticket.generation,
+                project_id: root.to_string_lossy().into_owned(),
+                goal: plan.goal.clone(),
+                owner: "owner".into(),
+                scope: "local".into(),
+                output_dir: root.to_string_lossy().into_owned(),
+                steps: vec![
+                    crate::task_document::Step {
+                        id: "worker".into(),
+                        title: "worker".into(),
+                        assignee: "worker".into(),
+                    },
+                    crate::task_document::Step {
+                        id: "reviewer".into(),
+                        title: "reviewer".into(),
+                        assignee: "reviewer".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        let binary = native_fixture();
+        let control = ProcessControl::new();
+        assert!(control.request_stop());
+        assert!(!control.request_stop());
+
+        let outcome = run_recorded_with_control_with_binaries(
+            &ledger,
+            &ticket,
+            &plan,
+            &store,
+            &[binary.clone(), binary],
+            control,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.issue, Some(RelayError::Process(ProcessError::StopRequested)));
+        assert_eq!(outcome.snapshot.active.unwrap().phase, Phase::RecoveryRequired);
+        assert!(ledger.claim("other", "other", "other").is_err());
+
+        let saved = store.snapshot().unwrap();
+        assert_eq!(saved.events.len(), 2);
+        assert_eq!(saved.events[0].step_id, "worker");
+        assert_eq!(saved.events[0].state, AttemptState::Running);
+        assert!(saved.events[0].process_identity.is_some());
+        let start_stop = saved.events[0].stop.as_ref().unwrap();
+        assert!(start_stop.requested);
+        assert!(!start_stop.confirmed);
+        assert_eq!(start_stop.reason, "受管停止请求");
+        assert_eq!(saved.events[1].step_id, "worker");
+        assert_eq!(saved.events[1].state, AttemptState::Unknown);
+        let terminal_stop = saved.events[1].stop.as_ref().unwrap();
+        assert!(terminal_stop.requested);
+        assert!(terminal_stop.confirmed);
+        assert!(terminal_stop.reason.contains("StopRequested"));
+        assert_eq!(saved.events[0].sequence + 1, saved.events[1].sequence);
+    }
+
+    #[test]
+    fn recovery_assessment_keeps_launch_and_identity_uncertainty_distinct() {
+        let (ledger, ticket, plan, _) = fixture();
+        let root = plan.project_dir.canonicalize().unwrap();
+        let store = DocumentStore::at(&root, &ticket.task_id, ticket.generation).unwrap();
+        store
+            .create(crate::task_document::TaskPlan {
+                task_id: ticket.task_id.clone(),
+                generation: ticket.generation,
+                project_id: root.to_string_lossy().into_owned(),
+                goal: plan.goal.clone(),
+                owner: "owner".into(),
+                scope: "local".into(),
+                output_dir: root.to_string_lossy().into_owned(),
+                steps: vec![
+                    crate::task_document::Step {
+                        id: "worker".into(),
+                        title: "worker".into(),
+                        assignee: "worker".into(),
+                    },
+                    crate::task_document::Step {
+                        id: "reviewer".into(),
+                        title: "reviewer".into(),
+                        assignee: "reviewer".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        let pid = std::process::id();
+        store
+            .record(AttemptEvent {
+                id: "1:2:0:start".into(),
+                sequence: 4,
+                attempt_id: "1:2:0".into(),
+                step_id: "worker".into(),
+                state: AttemptState::Running,
+                summary: "未记录进程身份".into(),
+                process_identity: None,
+                stop: None,
+            })
+            .unwrap();
+        store
+            .record(AttemptEvent {
+                id: "1:4:1:start".into(),
+                sequence: 8,
+                attempt_id: "1:4:1".into(),
+                step_id: "reviewer".into(),
+                state: AttemptState::Running,
+                summary: "身份已记录".into(),
+                process_identity: Some(crate::task_document::ProcessIdentity {
+                    pid,
+                    executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                    start_token: super::task_process::process_start_token(pid),
+                }),
+                stop: None,
+            })
+            .unwrap();
+
+        let assessment = assess_recovery(&store.snapshot().unwrap());
+        assert_eq!(assessment.len(), 2);
+        assert_eq!(assessment[0].observation, RecoveryObservation::LaunchUncertain);
+        assert_eq!(assessment[1].observation, RecoveryObservation::Alive);
+        assert_eq!(ledger.snapshot().unwrap().active.unwrap().phase, Phase::Reserved);
+    }
+
+    #[test]
+    fn explicit_recovery_resume_requires_exit_and_fences_late_report() {
+        let (ledger, ticket, plan, _) = fixture();
+        let root = plan.project_dir.canonicalize().unwrap();
+        let store = DocumentStore::at(&root, &ticket.task_id, ticket.generation).unwrap();
+        store
+            .create(crate::task_document::TaskPlan {
+                task_id: ticket.task_id.clone(),
+                generation: ticket.generation,
+                project_id: root.to_string_lossy().into_owned(),
+                goal: plan.goal.clone(),
+                owner: "owner".into(),
+                scope: "local".into(),
+                output_dir: root.to_string_lossy().into_owned(),
+                steps: vec![
+                    crate::task_document::Step {
+                        id: "worker".into(),
+                        title: "worker".into(),
+                        assignee: "worker".into(),
+                    },
+                    crate::task_document::Step {
+                        id: "reviewer".into(),
+                        title: "reviewer".into(),
+                        assignee: "reviewer".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        store
+            .record(AttemptEvent {
+                id: "1:2:0:start".into(),
+                sequence: 4,
+                attempt_id: "1:2:0".into(),
+                step_id: "worker".into(),
+                state: AttemptState::Running,
+                summary: "旧尝试已停止，等待人工核实".into(),
+                process_identity: Some(crate::task_document::ProcessIdentity {
+                    pid: u32::MAX,
+                    executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                    start_token: None,
+                }),
+                stop: None,
+            })
+            .unwrap();
+        let recovery = ledger
+            .set_phase(
+                &ticket.owner_id,
+                &ticket.task_id,
+                ticket.generation,
+                ticket.revision,
+                Phase::RecoveryRequired,
+            )
+            .unwrap();
+        let binary = native_fixture();
+        let outcome = resume_recorded_after_recovery_with_binaries(
+            &ledger,
+            &ticket.task_id,
+            ticket.generation,
+            recovery.revision,
+            "new-owner",
+            &plan,
+            &store,
+            &[binary.clone(), binary],
+            ProcessControl::new(),
+        )
+        .unwrap();
+        assert!(outcome.issue.is_none());
+        assert_eq!(outcome.snapshot.active.unwrap().phase, Phase::WaitingInput);
+
+        let saved = store.snapshot().unwrap();
+        assert!(saved.events.iter().any(|event| event.attempt_id == "1:2:0"));
+        assert!(saved.events.iter().any(|event| event.attempt_id == "1:4:0"));
+        let late_report = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "late-old-session",
+            "result": serde_json::to_string(&Report {
+                version: 1,
+                task_id: ticket.task_id.clone(),
+                generation: ticket.generation,
+                dispatch_id: "1:2:0".into(),
+                role: Role::Worker,
+                status: ReportStatus::Ready,
+                summary: "旧回报".into(),
+            })
+            .unwrap(),
+        });
+        assert!(matches!(
+            parse(
+                &serde_json::to_vec(&late_report).unwrap(),
+                &ticket,
+                Role::Worker,
+                "1:4:0",
+            ),
+            Err(RelayError::UnverifiedReport)
+        ));
+    }
+
+    #[test]
+    fn explicit_recovery_resume_keeps_live_process_occupied() {
+        let (ledger, ticket, plan, _) = fixture();
+        let root = plan.project_dir.canonicalize().unwrap();
+        let store = DocumentStore::at(&root, &ticket.task_id, ticket.generation).unwrap();
+        store
+            .create(crate::task_document::TaskPlan {
+                task_id: ticket.task_id.clone(),
+                generation: ticket.generation,
+                project_id: root.to_string_lossy().into_owned(),
+                goal: plan.goal.clone(),
+                owner: "owner".into(),
+                scope: "local".into(),
+                output_dir: root.to_string_lossy().into_owned(),
+                steps: vec![
+                    crate::task_document::Step {
+                        id: "worker".into(),
+                        title: "worker".into(),
+                        assignee: "worker".into(),
+                    },
+                    crate::task_document::Step {
+                        id: "reviewer".into(),
+                        title: "reviewer".into(),
+                        assignee: "reviewer".into(),
+                    },
+                ],
+            })
+            .unwrap();
+        let pid = std::process::id();
+        store
+            .record(AttemptEvent {
+                id: "1:2:0:start".into(),
+                sequence: 4,
+                attempt_id: "1:2:0".into(),
+                step_id: "worker".into(),
+                state: AttemptState::Running,
+                summary: "仍有活跃进程".into(),
+                process_identity: Some(crate::task_document::ProcessIdentity {
+                    pid,
+                    executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                    start_token: task_process::process_start_token(pid),
+                }),
+                stop: None,
+            })
+            .unwrap();
+        let recovery = ledger
+            .set_phase(
+                &ticket.owner_id,
+                &ticket.task_id,
+                ticket.generation,
+                ticket.revision,
+                Phase::RecoveryRequired,
+            )
+            .unwrap();
+        let binary = native_fixture();
+        let result = resume_recorded_after_recovery_with_binaries(
+            &ledger,
+            &ticket.task_id,
+            ticket.generation,
+            recovery.revision,
+            "new-owner",
+            &plan,
+            &store,
+            &[binary.clone(), binary],
+            ProcessControl::new(),
+        );
+        assert!(matches!(result, Err(RelayError::RecoveryNotSafe(_))));
+        assert_eq!(
+            ledger.snapshot().unwrap().active.unwrap().phase,
+            Phase::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn stop_request_evidence_distinguishes_confirmation() {
+        let confirmed = stop_evidence(&RelayError::Process(ProcessError::StopRequested));
+        assert!(confirmed.requested);
+        assert!(confirmed.confirmed);
+        let uncertain = stop_evidence(&RelayError::Process(
+            ProcessError::StopRequestUnconfirmed,
+        ));
+        assert!(uncertain.requested);
+        assert!(!uncertain.confirmed);
     }
     #[test]
     fn progress_write_failure_before_spawn_launches_nothing() {

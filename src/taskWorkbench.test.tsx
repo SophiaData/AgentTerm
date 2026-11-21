@@ -6,6 +6,7 @@ import {
   actionsBlocked,
   emptyPlan,
   latestAttempts,
+  phaseMessages,
   requestOrder,
   planProblem,
   selectedProject,
@@ -74,6 +75,12 @@ const callbacks = {
   onPreview: () => {},
   onCancel: () => {},
   onRecover: () => {},
+  onResumeAfterRecovery: () => {},
+  onRefresh: () => {},
+  currentSession: null,
+  onAssociateSession: () => {},
+  onDispatch: () => {},
+  onStop: () => {},
 };
 
 describe("task workbench", () => {
@@ -133,6 +140,125 @@ describe("task workbench", () => {
     expect(html).not.toContain("取消这项任务");
     expect(html).toContain("不代表主任务完成");
   });
+  it("shows the durable relay phase while a controlled attempt is running", () => {
+    const current = view();
+    current.ledger.active!.phase = "verifying";
+    current.document!.events = [end];
+    const html = renderToStaticMarkup(
+      <TaskCard view={current} busy={true} preview={null} {...callbacks} />,
+    );
+    expect(html).toContain("独立验收中");
+    expect(html).toContain(phaseMessages.verifying);
+    expect(html).toContain("结果已提交");
+    expect(html).not.toContain("开始受控执行");
+  });
+  it("offers a stop request only while controlled execution is active", () => {
+    const current = view();
+    current.ledger.active!.phase = "running";
+    const running = renderToStaticMarkup(
+      <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
+    );
+    expect(running).toContain("请求停止受控执行");
+    expect(running).toContain("停止请求会先写入任务记录");
+
+    current.ledger.active!.phase = "pausing";
+    const pausing = renderToStaticMarkup(
+      <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
+    );
+    expect(pausing).not.toContain("请求停止受控执行");
+    expect(pausing).toContain("正在暂停");
+  });
+  it("offers association only for the current session in the task project", () => {
+    const current = view();
+    const sameProject = {
+      id: "session-1",
+      toolId: "claude",
+      toolName: "Claude Code",
+      projectPath: "/project",
+    };
+    const sameProjectHtml = renderToStaticMarkup(
+      <TaskCard
+        view={current}
+        busy={false}
+        preview={null}
+        {...callbacks}
+        currentSession={sameProject}
+      />,
+    );
+    expect(sameProjectHtml).toContain("尚未关联 CLI 会话");
+    expect(sameProjectHtml).toContain("关联当前会话");
+
+    current.document!.sessionLink = {
+      id: "session-1",
+      toolId: "claude",
+      toolName: "Claude Code",
+      projectPath: "/project",
+    };
+    const linkedHtml = renderToStaticMarkup(
+      <TaskCard
+        view={current}
+        busy={false}
+        preview={null}
+        {...callbacks}
+        currentSession={sameProject}
+      />,
+    );
+    expect(linkedHtml).toContain("已关联 CLI 会话");
+    expect(linkedHtml).not.toContain("关联当前会话");
+
+    const otherProjectHtml = renderToStaticMarkup(
+      <TaskCard
+        view={view()}
+        busy={false}
+        preview={null}
+        {...callbacks}
+        currentSession={{
+          ...sameProject,
+          id: "session-2",
+          projectPath: "/other",
+        }}
+      />,
+    );
+    expect(otherProjectHtml).not.toContain("关联当前会话");
+  });
+  it("offers controlled dispatch only after the linked Claude session and reservation match", () => {
+    const current = view();
+    current.ledger.active!.phase = "reserved";
+    current.document!.sessionLink = {
+      id: "session-1",
+      toolId: "claude",
+      toolName: "Claude Code",
+      projectPath: "/project",
+    };
+    const linked = {
+      id: "session-1",
+      toolId: "claude",
+      toolName: "Claude Code",
+      projectPath: "/project",
+    };
+    const html = renderToStaticMarkup(
+      <TaskCard
+        view={current}
+        busy={false}
+        preview={null}
+        {...callbacks}
+        currentSession={linked}
+      />,
+    );
+    expect(html).toContain("开始受控执行");
+    expect(html).toContain("当前终端不会被接管");
+
+    const codexHtml = renderToStaticMarkup(
+      <TaskCard
+        view={current}
+        busy={false}
+        preview={null}
+        {...callbacks}
+        currentSession={{ ...linked, toolId: "codex", toolName: "Codex" }}
+      />,
+    );
+    expect(codexHtml).not.toContain("开始受控执行");
+  });
   it("recovery keeps read access but hides reference and cancellation actions", () => {
     const current = view();
     current.ledger.active!.recoveryRequired = true;
@@ -173,6 +299,45 @@ describe("task workbench", () => {
     );
     expect(html).not.toContain("核实并接回任务");
   });
+  it("shows process evidence before offering a dispatched-task recovery", () => {
+    const current = view();
+    current.ledger.active!.recoveryRequired = true;
+    current.ledger.active!.phase = "recoveryRequired";
+    current.document!.events = [start];
+    current.recovery = {
+      attempts: [
+        {
+          attemptId: start.attemptId,
+          stepId: start.stepId,
+          observation: "alive",
+          safeToResume: false,
+        },
+      ],
+      allExited: false,
+    };
+    const blocked = renderToStaticMarkup(
+      <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
+    );
+    expect(blocked).toContain("仍在运行");
+    expect(blocked).toContain("重新核对");
+    expect(blocked).not.toContain("核实并接回任务");
+
+    current.recovery = {
+      attempts: [
+        {
+          ...current.recovery.attempts[0],
+          observation: "exited",
+          safeToResume: true,
+        },
+      ],
+      allExited: true,
+    };
+    const ready = renderToStaticMarkup(
+      <TaskCard view={current} busy={false} preview={null} {...callbacks} />,
+    );
+    expect(ready).toContain("已确认退出");
+    expect(ready).toContain("核实并接回任务");
+  });
   it("recovered reservations remain undispatched and can be cancelled by their owner", () => {
     const current = view();
     current.ledger.active!.phase = "recoveredReserved";
@@ -183,7 +348,7 @@ describe("task workbench", () => {
     expect(html).toContain("取消这项任务");
     expect(html).not.toContain("核实并接回任务");
     expect(html).not.toContain("确认取消任务");
-    expect(html).toContain("自动执行尚未开放");
+    expect(html).toContain("受控执行会按执行 Agent");
   });
   it("shows missing metadata and permits cancelling only an untouched reservation", () => {
     const current = view();
