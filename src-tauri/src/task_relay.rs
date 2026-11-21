@@ -383,7 +383,7 @@ fn run_recorded_with_control_with_binaries(
                         false
                     }
                 },
-                || store.record_stop_request(event_id, "受管停止请求").is_ok(),
+                || ensure_stop_request(store, event_id),
             );
             if let Some(error) = identity_error {
                 Err(error)
@@ -398,6 +398,25 @@ fn run_recorded_with_control_with_binaries(
                 .map_err(RelayError::Document)
         },
     )
+}
+
+fn ensure_stop_request(store: &DocumentStore, event_id: &str) -> bool {
+    // The UI already persisted the user's reason before setting ProcessControl.
+    // Preserve it instead of trying to replace it with the relay's fallback.
+    match store.snapshot() {
+        Ok(document) => {
+            if let Some(stop) = document
+                .events
+                .iter()
+                .find(|event| event.id == event_id && event.state == AttemptState::Running)
+                .and_then(|event| event.stop.as_ref())
+            {
+                return stop.requested && !stop.confirmed;
+            }
+            store.record_stop_request(event_id, "受管停止请求").is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
 fn validate_plan(plan: &Plan) -> Result<(), RelayError> {
@@ -1301,6 +1320,18 @@ fn main() {
         assert!(terminal_stop.confirmed);
         assert!(terminal_stop.reason.contains("StopRequested"));
         assert_eq!(saved.events[0].sequence + 1, saved.events[1].sequence);
+        // A command-originated stop must retain its already recorded reason.
+        let mut command_stop = saved.events[0].clone();
+        command_stop.id = "1:4:0:start".into();
+        command_stop.attempt_id = "1:4:0".into();
+        command_stop.sequence = 8;
+        command_stop.stop = None;
+        store.record(command_stop.clone()).unwrap();
+        let before = store
+            .record_stop_request(&command_stop.id, "用户请求停止受控派发")
+            .unwrap();
+        assert!(ensure_stop_request(&store, &command_stop.id));
+        assert_eq!(store.snapshot().unwrap(), before);
     }
 
     #[test]
@@ -1439,7 +1470,7 @@ fn main() {
             &ticket.task_id,
             ticket.generation,
             recovery.revision,
-            "new-owner",
+            &ticket.owner_id,
             &plan,
             &store,
             &[binary.clone(), binary],

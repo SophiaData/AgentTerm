@@ -42,6 +42,7 @@ pub fn run() {
             task_commands::attach_task_plan,
             task_commands::reference_task_artifact,
             task_commands::associate_task_session,
+            task_commands::reassociate_task_session_after_recovery,
             task_commands::dispatch_controlled_task,
             task_commands::request_stop_controlled_task,
             task_commands::preview_task_artifact
