@@ -959,6 +959,10 @@ impl SessionManager {
     }
 
     pub fn stop(&self, session_id: &str) -> Result<(), String> {
+        self.stop_with_reason(session_id, "已停止")
+    }
+
+    fn stop_with_reason(&self, session_id: &str, reason: &str) -> Result<(), String> {
         // Kill first, only then drop the record. Removing before a successful
         // kill lost the session on failure, leaving the process alive with no
         // handle to retry from (#17).
@@ -983,7 +987,7 @@ impl SessionManager {
             done.remove(session_id);
         }
         drop(session);
-        self.record_end(session_id, Some("已停止".to_string()), None);
+        self.record_end(session_id, Some(reason.to_string()), None);
         Ok(())
     }
 
@@ -1014,7 +1018,7 @@ impl SessionManager {
             .collect::<Vec<_>>();
         let mut failures = Vec::new();
         for id in ids {
-            match self.stop(&id) {
+            match self.stop_with_reason(&id, "应用退出") {
                 Ok(()) => {}
                 Err(error) if error == "会话不存在或已结束" => {}
                 Err(error) => failures.push(format!("{id}: {error}")),
