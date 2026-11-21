@@ -320,11 +320,7 @@ impl DocumentStore {
     /// Records an explicit stop request before the native process is asked to
     /// stop. Repeating the same request is idempotent; changing its reason is
     /// rejected so the journal cannot rewrite the request history.
-    pub fn record_stop_request(
-        &self,
-        event_id: &str,
-        reason: &str,
-    ) -> Result<Document, String> {
+    pub fn record_stop_request(&self, event_id: &str, reason: &str) -> Result<Document, String> {
         if !text(reason, 240) {
             return Err("停止原因不能为空且不得超过240字节".into());
         }
@@ -339,9 +335,7 @@ impl DocumentStore {
             }
             match &event.stop {
                 Some(existing)
-                    if existing.requested
-                        && !existing.confirmed
-                        && existing.reason == reason =>
+                    if existing.requested && !existing.confirmed && existing.reason == reason =>
                 {
                     Ok(false)
                 }
@@ -488,14 +482,12 @@ fn validate_event(event: &AttemptEvent, plan: &TaskPlan) -> Result<(), String> {
         }
         validate_process_identity(identity)?;
     }
-    if let Some(stop) = &event.stop {
-        if !text(&stop.reason, 240)
-            || (event.state == AttemptState::Running
-                && (!stop.requested || stop.confirmed))
-            || (stop.confirmed && !end)
-        {
-            return Err(invalid());
-        }
+    if let Some(stop) = &event.stop
+        && (!text(&stop.reason, 240)
+            || (event.state == AttemptState::Running && (!stop.requested || stop.confirmed))
+            || (stop.confirmed && !end))
+    {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -521,10 +513,7 @@ fn validate_session_link(link: &SessionLink) -> Result<(), String> {
         return Err(invalid());
     }
     let path = Path::new(&link.project_path);
-    if !path.is_absolute()
-        || !path.is_dir()
-        || path.canonicalize().map_err(io_error)? != path
-    {
+    if !path.is_absolute() || !path.is_dir() || path.canonicalize().map_err(io_error)? != path {
         return Err("会话项目路径必须是已存在的真实目录".into());
     }
     Ok(())
@@ -595,7 +584,10 @@ fn read(file: &mut File) -> Result<Document, String> {
         if let Some(before) = &last {
             if record.document.revision != before.revision + 1
                 || record.document.plan != before.plan
-                || !session_link_history_preserved(before.session_link.as_ref(), record.document.session_link.as_ref())
+                || !session_link_history_preserved(
+                    before.session_link.as_ref(),
+                    record.document.session_link.as_ref(),
+                )
                 || !before.events.iter().all(|old| {
                     record
                         .document
@@ -839,9 +831,11 @@ mod tests {
         );
         let mut replacement = identity;
         replacement.pid = 43;
-        assert!(store
-            .record_process_identity("1:2:0:start", replacement)
-            .is_err());
+        assert!(
+            store
+                .record_process_identity("1:2:0:start", replacement)
+                .is_err()
+        );
     }
 
     #[test]
@@ -866,9 +860,11 @@ mod tests {
                 .unwrap(),
             saved
         );
-        assert!(store
-            .record_stop_request("1:2:0:start", "另一原因")
-            .is_err());
+        assert!(
+            store
+                .record_stop_request("1:2:0:start", "另一原因")
+                .is_err()
+        );
     }
     #[test]
     fn artifact_hash_is_verified_and_new_version_preserves_old_reference() {

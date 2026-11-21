@@ -222,7 +222,7 @@ pub(crate) fn assess_recovery(document: &Document) -> Vec<AttemptRecovery> {
 /// Explicit continuation entry point. The caller represents the human
 /// confirmation step; the backend re-probes immediately before the ledger CAS
 /// and only continues when every unfinished prior attempt is definitely gone.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn resume_recorded_after_recovery(
     ledger: &Ledger,
     task_id: &str,
@@ -248,7 +248,7 @@ pub(crate) fn resume_recorded_after_recovery(
     )
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn resume_recorded_after_recovery_with_binaries(
     ledger: &Ledger,
     task_id: &str,
@@ -266,7 +266,12 @@ fn resume_recorded_after_recovery_with_binaries(
         || snapshot.revision != expected_revision
         || active.task_id != task_id
         || active.phase != Phase::RecoveryRequired
-        || active.project_id != plan.project_dir.canonicalize().map_err(|_| RelayError::InvalidPlan)?.to_string_lossy()
+        || active.project_id
+            != plan
+                .project_dir
+                .canonicalize()
+                .map_err(|_| RelayError::InvalidPlan)?
+                .to_string_lossy()
     {
         return Err(RelayError::Stale);
     }
@@ -371,13 +376,11 @@ fn run_recorded_with_control_with_binaries(
                 spec,
                 timeout,
                 control.clone(),
-                |identity| {
-                    match store.record_process_identity(event_id, identity) {
-                        Ok(_) => true,
-                        Err(error) => {
-                            identity_error = Some(RelayError::Document(error));
-                            false
-                        }
+                |identity| match store.record_process_identity(event_id, identity) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        identity_error = Some(RelayError::Document(error));
+                        false
                     }
                 },
                 || store.record_stop_request(event_id, "受管停止请求").is_ok(),
@@ -560,7 +563,7 @@ fn run_observed_with_start(
             plan.timeout,
             &format!("{dispatch}:start"),
         )
-            .and_then(|bytes| parse(&bytes, ticket, role, &dispatch));
+        .and_then(|bytes| parse(&bytes, ticket, role, &dispatch));
         let (report, session) = match result {
             Ok(result) => result,
             Err(error) => {
@@ -1272,8 +1275,14 @@ fn main() {
         )
         .unwrap();
 
-        assert_eq!(outcome.issue, Some(RelayError::Process(ProcessError::StopRequested)));
-        assert_eq!(outcome.snapshot.active.unwrap().phase, Phase::RecoveryRequired);
+        assert_eq!(
+            outcome.issue,
+            Some(RelayError::Process(ProcessError::StopRequested))
+        );
+        assert_eq!(
+            outcome.snapshot.active.unwrap().phase,
+            Phase::RecoveryRequired
+        );
         assert!(ledger.claim("other", "other", "other").is_err());
 
         let saved = store.snapshot().unwrap();
@@ -1345,7 +1354,10 @@ fn main() {
                 summary: "身份已记录".into(),
                 process_identity: Some(crate::task_document::ProcessIdentity {
                     pid,
-                    executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                    executable: std::env::current_exe()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
                     start_token: super::task_process::process_start_token(pid),
                 }),
                 stop: None,
@@ -1354,9 +1366,15 @@ fn main() {
 
         let assessment = assess_recovery(&store.snapshot().unwrap());
         assert_eq!(assessment.len(), 2);
-        assert_eq!(assessment[0].observation, RecoveryObservation::LaunchUncertain);
+        assert_eq!(
+            assessment[0].observation,
+            RecoveryObservation::LaunchUncertain
+        );
         assert_eq!(assessment[1].observation, RecoveryObservation::Alive);
-        assert_eq!(ledger.snapshot().unwrap().active.unwrap().phase, Phase::Reserved);
+        assert_eq!(
+            ledger.snapshot().unwrap().active.unwrap().phase,
+            Phase::Reserved
+        );
     }
 
     #[test]
@@ -1397,7 +1415,10 @@ fn main() {
                 summary: "旧尝试已停止，等待人工核实".into(),
                 process_identity: Some(crate::task_document::ProcessIdentity {
                     pid: u32::MAX,
-                    executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                    executable: std::env::current_exe()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
                     start_token: None,
                 }),
                 stop: None,
@@ -1497,7 +1518,10 @@ fn main() {
                 summary: "仍有活跃进程".into(),
                 process_identity: Some(crate::task_document::ProcessIdentity {
                     pid,
-                    executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                    executable: std::env::current_exe()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
                     start_token: task_process::process_start_token(pid),
                 }),
                 stop: None,
@@ -1536,9 +1560,7 @@ fn main() {
         let confirmed = stop_evidence(&RelayError::Process(ProcessError::StopRequested));
         assert!(confirmed.requested);
         assert!(confirmed.confirmed);
-        let uncertain = stop_evidence(&RelayError::Process(
-            ProcessError::StopRequestUnconfirmed,
-        ));
+        let uncertain = stop_evidence(&RelayError::Process(ProcessError::StopRequestUnconfirmed));
         assert!(uncertain.requested);
         assert!(!uncertain.confirmed);
     }

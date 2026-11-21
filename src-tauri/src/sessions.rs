@@ -1238,10 +1238,7 @@ mod tests {
                     id: id.to_string(),
                     tool_id: "claude".into(),
                     tool_name: "Claude Code".into(),
-                    project_path: std::env::current_dir()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into(),
+                    project_path: std::env::current_dir().unwrap().to_string_lossy().into(),
                 },
                 master: Box::new(FakeMaster),
                 #[cfg(unix)]

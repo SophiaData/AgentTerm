@@ -213,8 +213,12 @@ impl TaskLedgerState {
                             == crate::task_relay::RecoveryObservation::Exited,
                     })
                     .collect::<Vec<_>>();
-                let all_exited = !attempts.is_empty() && attempts.iter().all(|attempt| attempt.safe_to_resume);
-                Some(RecoveryView { attempts, all_exited })
+                let all_exited =
+                    !attempts.is_empty() && attempts.iter().all(|attempt| attempt.safe_to_resume);
+                Some(RecoveryView {
+                    attempts,
+                    all_exited,
+                })
             }
             _ => None,
         };
@@ -447,13 +451,7 @@ impl TaskLedgerState {
             .session_info(session_id)
             .map_err(|_| "关联的 CLI 会话不存在或已经结束，不能受控派发".to_string())?;
         let cli = validate_controlled_dispatch(
-            &snapshot,
-            &document,
-            &info,
-            session_id,
-            task_id,
-            generation,
-            revision,
+            &snapshot, &document, &info, session_id, task_id, generation, revision,
         )?;
         let project_dir = PathBuf::from(&info.project_path)
             .canonicalize()
@@ -511,14 +509,14 @@ impl TaskLedgerState {
                 let _ = crate::task_relay::run_recorded_with_control(
                     &ledger, &ticket, &plan, &store, control,
                 );
-                if let Ok(mut active) = runtime.active.lock() {
-                    if active.as_ref().is_some_and(|item| {
+                if let Ok(mut active) = runtime.active.lock()
+                    && active.as_ref().is_some_and(|item| {
                         item.token == token
                             && item.task_id == task_id
                             && item.generation == generation
-                    }) {
-                        *active = None;
-                    }
+                    })
+                {
+                    *active = None;
                 }
             })
             .map_err(|_| "无法启动受控派发线程，任务继续占用".to_string())?;
@@ -552,7 +550,10 @@ impl TaskLedgerState {
             .map_err(|error| error.to_string())?
             .active
             .ok_or_else(|| "没有当前主任务".to_string())?;
-        if !matches!(active.phase, Phase::Running | Phase::Verifying | Phase::Pausing) {
+        if !matches!(
+            active.phase,
+            Phase::Running | Phase::Verifying | Phase::Pausing
+        ) {
             return Err("当前任务不在可停止的受控执行阶段".into());
         }
         let document = store.snapshot()?;
@@ -576,7 +577,10 @@ impl TaskLedgerState {
             if latest.generation != generation
                 || latest_active.task_id != task_id
                 || latest_active.owner_id != self.owner_id
-                || !matches!(latest_active.phase, Phase::Running | Phase::Verifying | Phase::Pausing)
+                || !matches!(
+                    latest_active.phase,
+                    Phase::Running | Phase::Verifying | Phase::Pausing
+                )
             {
                 return self.workbench();
             }
@@ -1183,9 +1187,7 @@ mod tests {
         assert!(recovered.resume_after_recovery(&task, 1, 2).is_err());
     }
 
-    fn controlled_dispatch_fixture(
-        link: Option<SessionLink>,
-    ) -> (Snapshot, Document, SessionInfo) {
+    fn controlled_dispatch_fixture(link: Option<SessionLink>) -> (Snapshot, Document, SessionInfo) {
         let project = std::env::temp_dir().canonicalize().unwrap();
         let project_path = project.to_string_lossy().into_owned();
         (
@@ -1274,49 +1276,59 @@ mod tests {
                 .into(),
         };
         let (mut snapshot, document, info) = controlled_dispatch_fixture(Some(link));
-        assert!(validate_controlled_dispatch(
-            &snapshot,
-            &document,
-            &info,
-            &info.id,
-            "task-controlled",
-            1,
-            1,
-        )
-        .unwrap_err()
-        .contains("版本"));
+        assert!(
+            validate_controlled_dispatch(
+                &snapshot,
+                &document,
+                &info,
+                &info.id,
+                "task-controlled",
+                1,
+                1,
+            )
+            .unwrap_err()
+            .contains("版本")
+        );
 
         snapshot.revision = 2;
         let mut other = info.clone();
         other.project_path = "C:\\other-project".into();
-        assert!(validate_controlled_dispatch(
-            &snapshot,
-            &document,
-            &other,
-            &other.id,
-            "task-controlled",
-            1,
-            2,
-        )
-        .unwrap_err()
-        .contains("所属项目"));
+        assert!(
+            validate_controlled_dispatch(
+                &snapshot,
+                &document,
+                &other,
+                &other.id,
+                "task-controlled",
+                1,
+                2,
+            )
+            .unwrap_err()
+            .contains("所属项目")
+        );
 
         let mut unsupported = info;
         unsupported.tool_id = "codex".into();
         unsupported.tool_name = "Codex".into();
         let mut unsupported_document = document;
         unsupported_document.session_link.as_mut().unwrap().tool_id = "codex".into();
-        unsupported_document.session_link.as_mut().unwrap().tool_name = "Codex".into();
-        assert!(validate_controlled_dispatch(
-            &snapshot,
-            &unsupported_document,
-            &unsupported,
-            &unsupported.id,
-            "task-controlled",
-            1,
-            2,
-        )
-        .unwrap_err()
-        .contains("暂不支持"));
+        unsupported_document
+            .session_link
+            .as_mut()
+            .unwrap()
+            .tool_name = "Codex".into();
+        assert!(
+            validate_controlled_dispatch(
+                &snapshot,
+                &unsupported_document,
+                &unsupported,
+                &unsupported.id,
+                "task-controlled",
+                1,
+                2,
+            )
+            .unwrap_err()
+            .contains("暂不支持")
+        );
     }
 }

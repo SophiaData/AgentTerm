@@ -164,9 +164,7 @@ pub(crate) fn run_with_start_control(
         });
     }
     if control.stop_requested() {
-        let recorded = on_stop_requested
-            .take()
-            .is_some_and(|callback| callback());
+        let recorded = on_stop_requested.take().is_some_and(|callback| callback());
         return if scope.stop(&mut child) {
             Err(if recorded {
                 ProcessError::StopRequested
@@ -213,11 +211,8 @@ pub(crate) fn run_with_start_control(
     let status = loop {
         if control.stop_requested() {
             stop_requested = true;
-            stop_request_recorded = Some(
-                on_stop_requested
-                    .take()
-                    .is_some_and(|callback| callback()),
-            );
+            stop_request_recorded =
+                Some(on_stop_requested.take().is_some_and(|callback| callback()));
             break Err(ProcessError::StopRequested);
         }
         if oversized.load(Ordering::Acquire) {
@@ -244,11 +239,7 @@ pub(crate) fn run_with_start_control(
     // blocks handoff, even if cleanup succeeds.
     stop_requested |= control.stop_requested();
     if stop_requested && stop_request_recorded.is_none() {
-        stop_request_recorded = Some(
-            on_stop_requested
-                .take()
-                .is_some_and(|callback| callback()),
-        );
+        stop_request_recorded = Some(on_stop_requested.take().is_some_and(|callback| callback()));
     }
     let stopped = scope.stop(&mut child);
     let input = input_rx.recv_timeout(STOP_LIMIT);
@@ -402,21 +393,16 @@ mod windows_process {
     }
 
     fn open(pid: u32) -> Result<HandleGuard, ProcessObservation> {
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-                0,
-                pid,
-            )
-        };
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
         if handle.is_null() {
-            return Err(if std::io::Error::last_os_error().raw_os_error()
-                == Some(ERROR_INVALID_PARAMETER)
-            {
-                ProcessObservation::Exited
-            } else {
-                ProcessObservation::Unknown
-            });
+            return Err(
+                if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                    ProcessObservation::Exited
+                } else {
+                    ProcessObservation::Unknown
+                },
+            );
         }
         Ok(HandleGuard(handle))
     }
@@ -426,15 +412,8 @@ mod windows_process {
         let mut exit = FileTime::default();
         let mut kernel = FileTime::default();
         let mut user = FileTime::default();
-        let ok = unsafe {
-            GetProcessTimes(
-                handle,
-                &mut creation,
-                &mut exit,
-                &mut kernel,
-                &mut user,
-            )
-        };
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
         if ok == 0 {
             return Err(ProcessObservation::Unknown);
         }
@@ -795,7 +774,10 @@ mod tests {
         let pid = std::process::id();
         let identity = ProcessIdentity {
             pid,
-            executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            executable: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             start_token: process_start_token(pid),
         };
         assert_eq!(observe_process(&identity), ProcessObservation::Alive);
@@ -813,7 +795,10 @@ mod tests {
     fn process_probe_classifies_an_absent_pid_as_exited() {
         let identity = ProcessIdentity {
             pid: u32::MAX,
-            executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            executable: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             start_token: Some("never-started".into()),
         };
         assert_eq!(observe_process(&identity), ProcessObservation::Exited);
@@ -849,10 +834,7 @@ mod tests {
             .expect("child start must be observed");
         assert!(control.request_stop());
         assert!(!control.request_stop());
-        assert_eq!(
-            handle.join().unwrap(),
-            Err(ProcessError::StopRequested)
-        );
+        assert_eq!(handle.join().unwrap(), Err(ProcessError::StopRequested));
     }
     #[test]
     fn missing_binary_cannot_start() {
