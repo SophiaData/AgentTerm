@@ -1773,3 +1773,197 @@ h2 {
     width: 100%;
   }
 }
+/* Issue #13: shared workbench status language. */
+:root {
+  --at-surface-app: #0f172a;
+  --at-surface-raised: #1b2336;
+  --at-surface-sunken: #0b1220;
+  --at-surface-hover: #222c42;
+  --at-border-subtle: #223049;
+  --at-border-default: #334155;
+  --at-text-primary: #f8fafc;
+  --at-text-secondary: #a8b6cc;
+  --at-text-tertiary: #7e8ca5;
+  --at-accent: #22c55e;
+  --at-accent-quiet: rgb(34 197 94 / 14%);
+  --at-focus-ring: #38bdf8;
+  --at-status-idle: #94a3b8;
+  --at-status-warning: #fb923c;
+  --at-status-error: #f87171;
+  --at-radius-sm: 6px;
+  --at-radius-md: 8px;
+  --at-motion-fast: 120ms;
+}
+
+:focus-visible {
+  outline-color: var(--at-focus-ring);
+}
+
+.sidebar-tools {
+  margin: 20px 8px 0;
+  padding-top: 16px;
+  border-top: 1px solid var(--at-border-subtle);
+}
+
+.sidebar-tools-heading {
+  padding: 0 0 8px;
+}
+
+.sidebar-tools-heading .sidebar-icon-button {
+  width: 26px;
+  height: 26px;
+  font-size: 16px;
+}
+
+.sidebar-tool-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sidebar-tool-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  color: var(--at-text-secondary);
+  font-size: 11px;
+}
+
+.sidebar-tool-item strong {
+  overflow: hidden;
+  color: var(--at-text-primary);
+  font-size: 11px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-chip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid var(--at-border-default);
+  border-radius: var(--at-radius-sm);
+  color: var(--at-text-secondary);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.status-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.status-installed {
+  border-color: color-mix(in srgb, var(--at-accent) 55%, var(--at-border-default));
+  background: var(--at-accent-quiet);
+  color: var(--at-accent);
+}
+
+.status-missing {
+  color: var(--at-status-idle);
+}
+
+.status-notExecutable {
+  border-color: color-mix(in srgb, var(--at-status-warning) 55%, var(--at-border-default));
+  background: rgb(251 146 60 / 12%);
+  color: var(--at-status-warning);
+}
+
+.sidebar-inline-error,
+.workspace-error-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid rgb(248 113 113 / 45%);
+  border-radius: var(--at-radius-md);
+  background: rgb(248 113 113 / 9%);
+  color: var(--at-status-error);
+}
+
+.sidebar-inline-error {
+  display: block;
+  margin-top: 10px;
+  padding: 8px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.sidebar-inline-error p,
+.sidebar-inline-error small {
+  display: block;
+  margin: 4px 0 0;
+}
+
+.sidebar-inline-error p {
+  overflow-wrap: anywhere;
+}
+
+.sidebar-inline-error small,
+.workspace-error-bar small {
+  color: var(--at-text-secondary);
+}
+
+.workspace-error-bar {
+  margin-bottom: 20px;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workspace-error-bar .status-error-icon {
+  flex: none;
+  color: var(--at-status-error);
+}
+
+.workspace-error-bar p,
+.workspace-error-bar small {
+  display: block;
+  margin: 4px 0 0;
+}
+
+.workspace-error-bar p {
+  overflow-wrap: anywhere;
+}
+
+.workspace-agent-option {
+  transition:
+    border-color var(--at-motion-fast) ease-out,
+    background-color var(--at-motion-fast) ease-out;
+}
+
+.workspace-agent-option[aria-pressed="true"] {
+  border-color: var(--at-accent);
+  background: var(--at-accent-quiet);
+  color: var(--at-text-primary);
+}
+
+.workspace-agent-option:focus-visible,
+.workspace-new-session:focus-visible,
+.workspace-tab:focus-visible,
+.workspace-tab-add:focus-visible,
+.workspace-session-link:focus-visible {
+  outline: 2px solid var(--at-focus-ring);
+  outline-offset: 2px;
+}
+
+@media (max-width: 720px) {
+  .session-workspace,
+  .session-workspace.with-records {
+    grid-template-columns: 176px minmax(0, 1fr);
+  }
+}
