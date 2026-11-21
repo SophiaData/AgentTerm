@@ -14,6 +14,16 @@ import {
 import { useLauncher, type ActiveSession } from "./terminal/useLauncher";
 import { useSessionHistory } from "./terminal/useSessionHistory";
 import { badgeLabel, detailText } from "./tools/types";
+function toolStatusIcon(kind: string): string {
+  switch (kind) {
+    case "installed":
+      return "✓";
+    case "missing":
+      return "–";
+    default:
+      return "!";
+  }
+}
 import { useTools } from "./tools/useTools";
 import { emptyPlan } from "./workbenchState";
 
@@ -162,6 +172,48 @@ export default function App() {
               .map(sessionLink)}
           </div>
         ) : null}
+        <section className="sidebar-tools" aria-labelledby="tool-status-title">
+          <div className="sidebar-heading sidebar-tools-heading">
+            <h2 id="tool-status-title">工具状态</h2>
+            <button
+              type="button"
+              className="sidebar-icon-button"
+              aria-label="重新检测 CLI 工具"
+              title="重新检测 CLI 工具"
+              disabled={tools.loading || launcher.busy}
+              onClick={() => void tools.refresh()}
+            >
+              ↻
+            </button>
+          </div>
+          {tools.loading && tools.tools.length === 0 ? (
+            <p className="sidebar-message">正在检测 Claude Code、Codex 和 Agy…</p>
+          ) : (
+            <ul className="sidebar-tool-list">
+              {tools.tools.map((tool) => (
+                <li key={tool.id} className="sidebar-tool-item">
+                  <span
+                    className={`status-chip status-${tool.state.kind}`}
+                    title={detailText(tool.state)}
+                  >
+                    <span className="status-icon" aria-hidden="true">
+                      {toolStatusIcon(tool.state.kind)}
+                    </span>
+                    <span>{badgeLabel(tool.state)}</span>
+                  </span>
+                  <strong>{tool.name}</strong>
+                </li>
+              ))}
+            </ul>
+          )}
+          {tools.error ? (
+            <div className="sidebar-inline-error" role="alert">
+              <strong>工具检测失败</strong>
+              <p>{tools.error}</p>
+              <small>下一步：点击右上角重新检测。</small>
+            </div>
+          ) : null}
+        </section>
         <div className="sidebar-bottom">
           {selectedProject ? (
             <details className="sidebar-details">
@@ -207,25 +259,6 @@ export default function App() {
               )}
             </details>
           ) : null}
-          <details className="sidebar-details">
-            <summary>CLI 工具状态</summary>
-            {tools.tools.map((tool) => (
-              <div key={tool.id} className="sidebar-tool-status">
-                <strong>
-                  {tool.name} · {badgeLabel(tool.state)}
-                </strong>
-                <p>{detailText(tool.state)}</p>
-              </div>
-            ))}
-            <button
-              type="button"
-              className="ghost-button"
-              disabled={tools.loading || launcher.busy}
-              onClick={() => void tools.refresh()}
-            >
-              {tools.loading ? "检测中…" : "重新检测"}
-            </button>
-          </details>
           <p className="workspace-note">
             {launcher.sessions.length
               ? `${launcher.sessions.length} 个会话 · ${launcher.sessions.filter((s) => s.running).length} 个进程运行中`
@@ -356,6 +389,26 @@ export default function App() {
         {!currentSession ? (
           <div className="workspace-start">
             <div className="workspace-start-content">
+              {launcher.startError ? (
+                <div className="workspace-error-bar" role="alert">
+                  <span className="status-icon status-error-icon" aria-hidden="true">!</span>
+                  <div>
+                    <strong>会话启动失败</strong>
+                    <p>{launcher.startError}</p>
+                    <small>下一步：检查所选工具状态后重试。</small>
+                  </div>
+                </div>
+              ) : null}
+              {tools.error ? (
+                <div className="workspace-error-bar" role="alert">
+                  <span className="status-icon status-error-icon" aria-hidden="true">!</span>
+                  <div>
+                    <strong>工具检测失败</strong>
+                    <p>{tools.error}</p>
+                    <small>下一步：点击左侧工具状态旁的重新检测。</small>
+                  </div>
+                </div>
+              ) : null}
               <span className="workspace-start-mark" aria-hidden="true">
                 &gt;_
               </span>
@@ -438,16 +491,7 @@ export default function App() {
                   添加项目
                 </button>
               )}
-              {launcher.startError ? (
-                <p className="tools-error" role="alert">
-                  {launcher.startError}
-                </p>
-              ) : null}
-              {tools.error ? (
-                <p className="tools-error" role="alert">
-                  {tools.error}
-                </p>
-              ) : null}
+
               {history.error || recentHistory.length ? (
                 <section className="workspace-history" aria-label="最近会话">
                   <div className="workspace-history-heading">
