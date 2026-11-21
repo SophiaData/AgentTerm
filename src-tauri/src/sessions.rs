@@ -121,12 +121,10 @@ pub struct SpawnedPty {
 }
 
 fn has_utf8_locale(value: Option<&std::ffi::OsStr>) -> bool {
-    value
-        .and_then(|item| item.to_str())
-        .is_some_and(|text| {
-            let lower = text.to_ascii_lowercase();
-            lower.contains("utf-8") || lower.contains("utf8")
-        })
+    value.and_then(|item| item.to_str()).is_some_and(|text| {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("utf-8") || lower.contains("utf8")
+    })
 }
 
 #[cfg(windows)]
@@ -341,12 +339,9 @@ fn escape_sequence_complete(slice: &[u8]) -> bool {
         return true;
     }
     match slice[1] {
-        b'[' => slice[2..]
-            .iter()
-            .any(|byte| (0x40..=0x7e).contains(byte)),
+        b'[' => slice[2..].iter().any(|byte| (0x40..=0x7e).contains(byte)),
         b']' => {
-            slice[2..].contains(&0x07)
-                || slice[2..].windows(2).any(|pair| pair == [0x1b, b'\\'])
+            slice[2..].contains(&0x07) || slice[2..].windows(2).any(|pair| pair == [0x1b, b'\\'])
         }
         _ => slice.len() >= 3,
     }
@@ -1089,9 +1084,7 @@ pub fn session_history(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
 
     use super::SessionManager;
 
@@ -1868,7 +1861,10 @@ mod tests {
 
     #[test]
     fn trim_buffer_front_avoids_splitting_ansi_escape_sequences() {
-        let mut data = format!("\x1b[38;2;140;222;194m{}\x1b[0m\n第二行正常输出", "x".repeat(40));
+        let mut data = format!(
+            "\x1b[38;2;140;222;194m{}\x1b[0m\n第二行正常输出",
+            "x".repeat(40)
+        );
         super::trim_buffer_front(&mut data, 32);
         assert!(
             !data.starts_with('[') && !data.starts_with(';'),
@@ -1884,7 +1880,9 @@ mod tests {
         assert_eq!(clean, PathBuf::from(r"E:\AgentTerm"));
         let unc = super::strip_windows_verbatim(Path::new(r"\\?\UNC\server\share\proj"));
         assert_eq!(unc, PathBuf::from(r"\\server\share\proj"));
-        assert!(super::has_utf8_locale(Some(std::ffi::OsStr::new("zh_CN.UTF-8"))));
+        assert!(super::has_utf8_locale(Some(std::ffi::OsStr::new(
+            "zh_CN.UTF-8"
+        ))));
         assert!(!super::has_utf8_locale(Some(std::ffi::OsStr::new("C"))));
     }
 
@@ -1908,10 +1906,7 @@ mod tests {
             args[3],
             r"C:\Users\Administrator\AppData\Roaming\npm\codex.cmd"
         );
-        assert_eq!(
-            cmd.get_cwd().unwrap().to_string_lossy(),
-            r"E:\AgentTerm"
-        );
+        assert_eq!(cmd.get_cwd().unwrap().to_string_lossy(), r"E:\AgentTerm");
         assert_eq!(cmd.get_env("PYTHONUTF8").unwrap(), "1");
         assert_eq!(cmd.get_env("PYTHONIOENCODING").unwrap(), "utf-8");
     }
