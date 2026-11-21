@@ -108,6 +108,10 @@ pub struct Document {
     pub artifacts: Vec<Artifact>,
     #[serde(default)]
     pub session_link: Option<SessionLink>,
+    /// Previous bindings are appended only after explicit recovery. Omit the
+    /// empty field so hashes of documents written by older versions still match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_link_history: Vec<SessionLink>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -221,6 +225,7 @@ impl DocumentStore {
             events: vec![],
             artifacts: vec![],
             session_link: None,
+            session_link_history: Vec::new(),
         };
         let mut file = OpenOptions::new()
             .write(true)
@@ -266,6 +271,37 @@ impl DocumentStore {
             append(&mut file, &document)?;
         }
         Ok(document)
+    }
+    /// Only the recovery command may call this while holding the ledger lock.
+    pub(crate) fn reassociate_session(
+        &self,
+        expected_previous: &str,
+        link: SessionLink,
+    ) -> Result<Document, String> {
+        validate_session_link(&link)?;
+        self.update(|document| {
+            let previous = document
+                .session_link
+                .as_ref()
+                .ok_or_else(|| "原会话关联不存在，请刷新".to_string())?;
+            if previous == &link {
+                return Ok(false);
+            }
+            if previous.id != expected_previous
+                || link.project_path != document.plan.project_id
+                || link.tool_id != previous.tool_id
+                || document.session_link_history.len() >= 32
+                || document
+                    .session_link_history
+                    .iter()
+                    .any(|item| item.id == link.id)
+            {
+                return Err("原关联已变化、工具不一致或关联历史已达上限，请核实".into());
+            }
+            document.session_link_history.push(previous.clone());
+            document.session_link = Some(link);
+            Ok(true)
+        })
     }
     /// Native scheduler only. Renderer commands cannot inject run/report events.
     pub fn record(&self, event: AttemptEvent) -> Result<Document, String> {
@@ -520,11 +556,29 @@ fn validate_session_link(link: &SessionLink) -> Result<(), String> {
 }
 fn validate_document(document: &Document) -> Result<(), String> {
     validate_plan(&document.plan)?;
-    if document.revision == 0 || document.events.len() > 128 || document.artifacts.len() > 32 {
+    if document.revision == 0
+        || document.events.len() > 128
+        || document.artifacts.len() > 32
+        || document.session_link_history.len() > 32
+    {
         return Err(invalid());
     }
     if let Some(link) = &document.session_link {
         validate_session_link(link)?;
+        if link.project_path != document.plan.project_id {
+            return Err(invalid());
+        }
+    }
+    let mut session_ids = std::collections::HashSet::new();
+    for link in document
+        .session_link_history
+        .iter()
+        .chain(document.session_link.iter())
+    {
+        validate_session_link(link)?;
+        if link.project_path != document.plan.project_id || !session_ids.insert(&link.id) {
+            return Err(invalid());
+        }
     }
     let mut previous = 0;
     for event in &document.events {
@@ -584,10 +638,7 @@ fn read(file: &mut File) -> Result<Document, String> {
         if let Some(before) = &last {
             if record.document.revision != before.revision + 1
                 || record.document.plan != before.plan
-                || !session_link_history_preserved(
-                    before.session_link.as_ref(),
-                    record.document.session_link.as_ref(),
-                )
+                || !session_link_history_preserved(before, &record.document)
                 || !before.events.iter().all(|old| {
                     record
                         .document
@@ -603,6 +654,7 @@ fn read(file: &mut File) -> Result<Document, String> {
             || !record.document.events.is_empty()
             || !record.document.artifacts.is_empty()
             || record.document.session_link.is_some()
+            || !record.document.session_link_history.is_empty()
         {
             return Err(invalid());
         }
@@ -610,14 +662,22 @@ fn read(file: &mut File) -> Result<Document, String> {
     }
     last.ok_or_else(invalid)
 }
-fn session_link_history_preserved(
-    old: Option<&SessionLink>,
-    current: Option<&SessionLink>,
-) -> bool {
-    match (old, current) {
-        (None, _) => true,
-        (Some(before), Some(after)) => before == after,
-        (Some(_), None) => false,
+fn session_link_history_preserved(old: &Document, current: &Document) -> bool {
+    if old.session_link == current.session_link {
+        return old.session_link_history == current.session_link_history;
+    }
+    match (&old.session_link, &current.session_link) {
+        (None, Some(_)) => old.session_link_history == current.session_link_history,
+        (Some(before), Some(after)) => {
+            current.session_link_history.len() == old.session_link_history.len() + 1
+                && current
+                    .session_link_history
+                    .starts_with(&old.session_link_history)
+                && current.session_link_history.last() == Some(before)
+                && before.tool_id == after.tool_id
+                && before.id != after.id
+        }
+        _ => false,
     }
 }
 fn event_history_preserved(old: &AttemptEvent, current: &AttemptEvent) -> bool {
@@ -790,6 +850,57 @@ mod tests {
         };
         assert!(store.associate_session(different).is_err());
         assert_eq!(store.snapshot().unwrap().session_link, linked.session_link);
+    }
+
+    #[test]
+    fn explicit_reassociation_keeps_history_and_rejects_conflicts() {
+        let (store, plan) = fixture();
+        store.create(plan.clone()).unwrap();
+        let first = SessionLink {
+            id: "session-first".into(),
+            tool_id: "claude".into(),
+            tool_name: "Claude Code".into(),
+            project_path: plan.project_id.clone(),
+        };
+        store.associate_session(first.clone()).unwrap();
+        let second = SessionLink {
+            id: "session-second".into(),
+            ..first.clone()
+        };
+        assert!(store.associate_session(second.clone()).is_err());
+        assert!(
+            store
+                .reassociate_session("stale-id", second.clone())
+                .is_err()
+        );
+        assert!(
+            store
+                .reassociate_session(
+                    &first.id,
+                    SessionLink {
+                        tool_id: "codex".into(),
+                        ..second.clone()
+                    }
+                )
+                .is_err()
+        );
+        let updated = store
+            .reassociate_session(&first.id, second.clone())
+            .unwrap();
+        assert_eq!(updated.session_link_history, vec![first.clone()]);
+        assert_eq!(updated.session_link, Some(second.clone()));
+        assert_eq!(store.snapshot().unwrap(), updated);
+        assert_eq!(
+            store
+                .reassociate_session(&first.id, second.clone())
+                .unwrap(),
+            updated
+        );
+        assert!(store.reassociate_session(&second.id, first).is_err());
+        // A hash-valid history rewrite must still fail the append contract.
+        let mut rewritten = updated.clone();
+        rewritten.session_link_history.clear();
+        assert!(!session_link_history_preserved(&updated, &rewritten));
     }
     #[test]
     fn duplicate_and_out_of_order_events_are_idempotent() {

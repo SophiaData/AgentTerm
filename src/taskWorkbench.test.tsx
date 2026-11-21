@@ -79,11 +79,40 @@ const callbacks = {
   onRefresh: () => {},
   currentSession: null,
   onAssociateSession: () => {},
+  onReassociateSession: () => {},
   onDispatch: () => {},
   onStop: () => {},
 };
 
 describe("task workbench", () => {
+  it("offers explicit reassociation only for a recovered matching project and tool", () => {
+    const current = view();
+    current.ledger.active!.phase = "recoveredReserved";
+    current.document!.sessionLink = {
+      id: "old",
+      toolId: "claude",
+      toolName: "Claude Code",
+      projectPath: "/project",
+    };
+    const session = { ...current.document!.sessionLink, id: "new" };
+    const render = () =>
+      renderToStaticMarkup(
+        <TaskCard
+          view={current}
+          busy={false}
+          preview={null}
+          {...callbacks}
+          currentSession={session}
+        />,
+      );
+    expect(render()).toContain("将已接回任务关联到当前会话");
+    expect(render()).not.toContain("开始受控执行");
+    current.ledger.active!.phase = "running";
+    expect(render()).not.toContain("将已接回任务关联到当前会话");
+    current.ledger.active!.phase = "recoveredReserved";
+    current.ledger.active!.recoveryRequired = true;
+    expect(render()).not.toContain("将已接回任务关联到当前会话");
+  });
   it("reduces duplicate/out-of-order events without regressing a completed attempt", () => {
     expect(latestAttempts([end, start, end, start])).toEqual([end]);
     const second = {
