@@ -1084,7 +1084,13 @@ pub fn session_history(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::io::Read;
+    #[cfg(windows)]
+    use std::path::Path;
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     use super::SessionManager;
 
