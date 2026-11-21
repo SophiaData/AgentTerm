@@ -188,7 +188,9 @@ export default function App() {
             </button>
           </div>
           {tools.loading && tools.tools.length === 0 ? (
-            <p className="sidebar-message">正在检测 Claude Code、Codex 和 Agy…</p>
+            <p className="sidebar-message">
+              正在检测 Claude Code、Codex 和 Agy…
+            </p>
           ) : (
             <ul className="sidebar-tool-list">
               {tools.tools.map((tool) => (
@@ -392,7 +394,12 @@ export default function App() {
             <div className="workspace-start-content">
               {launcher.startError ? (
                 <div className="workspace-error-bar" role="alert">
-                  <span className="status-icon status-error-icon" aria-hidden="true">!</span>
+                  <span
+                    className="status-icon status-error-icon"
+                    aria-hidden="true"
+                  >
+                    !
+                  </span>
                   <div>
                     <strong>会话启动失败</strong>
                     <p>{launcher.startError}</p>
@@ -402,7 +409,12 @@ export default function App() {
               ) : null}
               {tools.error ? (
                 <div className="workspace-error-bar" role="alert">
-                  <span className="status-icon status-error-icon" aria-hidden="true">!</span>
+                  <span
+                    className="status-icon status-error-icon"
+                    aria-hidden="true"
+                  >
+                    !
+                  </span>
                   <div>
                     <strong>工具检测失败</strong>
                     <p>{tools.error}</p>
