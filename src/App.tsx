@@ -14,6 +14,8 @@ import {
 import { useLauncher, type ActiveSession } from "./terminal/useLauncher";
 import { useSessionHistory } from "./terminal/useSessionHistory";
 import { badgeLabel, detailText } from "./tools/types";
+import { useTools } from "./tools/useTools";
+
 function toolStatusIcon(kind: string): string {
   switch (kind) {
     case "installed":
@@ -24,7 +26,6 @@ function toolStatusIcon(kind: string): string {
       return "!";
   }
 }
-import { useTools } from "./tools/useTools";
 import { emptyPlan } from "./workbenchState";
 
 export default function App() {
