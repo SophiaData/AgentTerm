@@ -1773,6 +1773,183 @@ h2 {
     width: 100%;
   }
 }
+/* Project files sit beside the terminal and collapse into a drawer on narrow windows. */
+.session-workspace.with-files {
+  grid-template-columns: 204px minmax(0, 1fr) 390px;
+}
+.workspace-files {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-left: 1px solid #303c47;
+  background: #111820;
+}
+.file-panel-heading,
+.file-preview-heading,
+.file-preview-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 14px;
+}
+.file-panel-heading {
+  min-height: 55px;
+  border-bottom: 1px solid #252c35;
+  font-size: 13px;
+}
+.file-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.file-project-heading {
+  display: grid;
+  flex: none;
+  gap: 6px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #252c35;
+  font-size: 12px;
+}
+.file-project-heading small {
+  overflow: hidden;
+  color: #8d98a6;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-project-heading .ghost-button {
+  justify-self: start;
+}
+.file-tree {
+  flex: 1 1 40%;
+  min-height: 80px;
+  overflow: auto;
+  padding: 8px;
+}
+.file-tree-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.file-tree-entry {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: #c1cbd5;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.file-tree-entry:hover,
+.file-tree-entry[aria-current="true"] {
+  background: #202d38;
+  border-color: #34414a;
+}
+.file-tree-entry:disabled {
+  color: #768391;
+  cursor: default;
+}
+.file-entry-icon {
+  flex: none;
+  width: 14px;
+  text-align: center;
+}
+.file-entry-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-subdirectory {
+  margin-left: 13px;
+  padding-left: 3px;
+  border-left: 1px solid #2b3540;
+}
+.file-message {
+  margin: 8px 6px;
+  color: #95a3b2;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.file-message p {
+  margin: 4px 0;
+}
+.file-error {
+  color: #f3a6a6;
+}
+.file-preview {
+  display: flex;
+  flex: 1.2 1 45%;
+  flex-direction: column;
+  min-height: 130px;
+  min-width: 0;
+  border-top: 1px solid #303c47;
+  background: #0d131b;
+}
+.file-preview-heading {
+  padding-bottom: 0;
+  font-size: 12px;
+}
+.file-preview-heading strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-preview-actions small {
+  color: #8d98a6;
+  font-size: 11px;
+}
+.file-preview pre {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 12px 14px;
+  overflow: auto;
+  color: #d6e0e9;
+  font-family: Consolas, "Microsoft YaHei", monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  tab-size: 2;
+}
+.file-preview-empty {
+  margin: auto;
+  color: #8d98a6;
+  font-size: 12px;
+}
+.file-preview .file-message {
+  overflow: auto;
+  margin: 8px 14px;
+}
+@media (max-width: 1000px) {
+  .session-workspace.with-files {
+    grid-template-columns: 204px minmax(0, 1fr);
+  }
+  .workspace-files {
+    position: fixed;
+    top: 55px;
+    right: 0;
+    bottom: 0;
+    width: min(420px, calc(100vw - 170px));
+    z-index: 10;
+    box-shadow: -15px 0 35px #0005;
+  }
+}
+@media (max-width: 650px) {
+  .session-workspace.with-files {
+    grid-template-columns: 160px minmax(0, 1fr);
+  }
+}
+
 /* Issue #13: shared workbench status language. */
 :root {
   --at-surface-app: #0f172a;

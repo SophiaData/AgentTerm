@@ -33,6 +33,8 @@ describe("AgentTerm application shell", () => {
       `<p class="workspace-start-path" title="${display}">${display}</p>`,
     );
     expect(html).not.toContain(path);
+    expect(html).toContain('aria-label="项目文件"');
+    expect(html).toContain("在系统资源管理器中打开");
     expect(project.path).toBe(path);
     expect(project.id).toBe(path);
   });

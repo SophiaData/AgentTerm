@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { PRODUCT_NAME } from "./meta";
 import TaskWorkbench from "./TaskWorkbench";
+import ProjectFiles from "./files/ProjectFiles";
 import { displayPath } from "./projects/displayPath";
 import { useProjects } from "./projects/useProjects";
 import SessionWorkspace from "./terminal/SessionWorkspace";
@@ -37,6 +38,7 @@ export default function App() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [toolId, setToolId] = useState<string | null>(null);
   const [recordsOpen, setRecordsOpen] = useState(false);
+  const [filesOpen, setFilesOpen] = useState(true);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
     projects.projects.find((p) => p.id === projectId) ?? projects.projects[0];
@@ -44,6 +46,9 @@ export default function App() {
     tools.tools.find((t) => t.id === toolId && t.state.kind === "installed") ??
     tools.tools.find((t) => t.state.kind === "installed");
   const currentSession = launcher.session;
+  const fileProject = currentSession
+    ? projects.projects.find((p) => p.path === currentSession.info.projectPath)
+    : selectedProject;
   const projectBusy = projects.loading || projects.busy || launcher.busy;
   const activeSessionIds = new Set(launcher.sessions.map((s) => s.info.id));
   const recentHistory = recentClosedHistory(history.records, activeSessionIds);
@@ -90,7 +95,9 @@ export default function App() {
   );
 
   return (
-    <main className={`session-workspace${recordsOpen ? " with-records" : ""}`}>
+    <main
+      className={`session-workspace${recordsOpen ? " with-records" : ""}${filesOpen && fileProject ? " with-files" : ""}`}
+    >
       <aside className="workspace-sidebar" aria-label="项目与会话">
         <div className="workspace-brand">
           <span className="workspace-brand-icon" aria-hidden="true">
@@ -288,6 +295,19 @@ export default function App() {
             <button
               type="button"
               className="ghost-button"
+              disabled={!fileProject}
+              aria-expanded={filesOpen && !!fileProject}
+              aria-controls="project-files"
+              onClick={() => {
+                setFilesOpen((open) => !open);
+                setRecordsOpen(false);
+              }}
+            >
+              文件
+            </button>
+            <button
+              type="button"
+              className="ghost-button"
               aria-pressed={launcher.paneIds.length === 2}
               disabled={!currentSession || launcher.sessions.length < 2}
               title="并排查看两个已有会话；选择其他会话会替换当前面板"
@@ -304,7 +324,10 @@ export default function App() {
               className="ghost-button"
               aria-expanded={recordsOpen}
               aria-controls="session-records"
-              onClick={() => setRecordsOpen((open) => !open)}
+              onClick={() => {
+                setRecordsOpen((open) => !open);
+                setFilesOpen(false);
+              }}
             >
               {recordsOpen ? "收起任务记录" : "任务记录"}
             </button>
@@ -601,6 +624,13 @@ export default function App() {
           </div>
         ) : null}
       </section>
+      {filesOpen && fileProject ? (
+        <ProjectFiles
+          key={fileProject.id}
+          project={fileProject}
+          onClose={() => setFilesOpen(false)}
+        />
+      ) : null}
       {recordsOpen ? (
         <aside
           className="workspace-records"
