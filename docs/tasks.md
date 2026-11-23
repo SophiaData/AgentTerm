@@ -7,6 +7,10 @@
 
 ## 当前方向与下一项工作（2026-11-23）
 
+**最新交付：已合并并打包（11 月 23 日）**：按用户“测试通过就合并打包”的授权，PR 最终提交的 [CI 45165330066](https://github.com/SophiaData/AgentTerm/actions/runs/45165330066) 两端成功后，[PR #35](https://github.com/SophiaData/AgentTerm/pull/35) 已合入 `main`，提交 `52a9a59585a9746327d83127fe29369d70ddcf2b`。该提交的 [main CI 45167546361](https://github.com/SophiaData/AgentTerm/actions/runs/45167546361) 两端通过，再串行生成 [Windows x64 安装包 45169830049](https://github.com/SophiaData/AgentTerm/actions/runs/45169830049)，附件 `windows-x64-nsis` 已可下载。下一项是在允许的验收入口和模型代理可用后，使用此 `main` 包验证 Agy 实际终端交互与停止恢复；#12/M4 和冻结验收标准不变。未安装或运行新包，未创建正式 Release，证据见 [testing](testing.md)。本次交付记录作本地文档提交，PR 正文同步线上结果。
+
+以下是历史进展；旧的“草稿/不合并”状态及旧包不覆盖上述最新交付和唯一下一项。
+
 **Agy 适配补查（11 月 23 日）**：真实 Agy `1.5.15` 位于 `%LOCALAPPDATA%\agy\bin\agy.exe`，当前 PATH 未包含该目录；默认目录漏检已修复，保留 PATH 优先。代码 `a7f4887` 的 [CI 45159685193](https://github.com/SophiaData/AgentTerm/actions/runs/45159685193)、串行只读评审和 [Windows 新包 45163296814](https://github.com/SophiaData/AgentTerm/actions/runs/45163296814) 均通过。下一项是验收入口及模型代理可用后，在该新包验证 Agy 检测/终端交互及既有停止恢复；真实对话和受控派发不因 `--version/--help` 成功而标通过。#12 与 M4 状态不变，详见 [testing](testing.md)。
 
 **11 月 23 日续办**：修复 macOS 退出误判、停止竞争后任务卡死，代码 `c322c4a` 已推送 PR #35；单个 DeepSeek 串行静态复审 PASS，[GitHub CI 45149490139](https://github.com/SophiaData/AgentTerm/actions/runs/45149490139) Linux/Windows 均成功，[Windows 包 45151496125](https://github.com/SophiaData/AgentTerm/actions/runs/45151496125) 构建成功。复现、测试数和附件摘要见 [testing](testing.md)。完整测试和打包后续优先 GitHub 串行，本地仅最小复现。模型代理 15721 仍无监听，此前下载/解包自动审批阻塞仍保留；下一项仅为在允许的验收入口及模型代理恢复后，对本次固定新包完成真实执行→停止→重启核实→换绑接续。#12 仍是唯一进行中项，冻结标准不变，PR 不合并、不发布。

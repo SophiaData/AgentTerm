@@ -1,5 +1,14 @@
 # Testing policy
 
+## PR #35 合并与 main 安装包（2026-11-23）
+
+- 用户明确授权“测试通过就合并打包”。PR 最终提交 `7cd670a8f73da2f988b76801410829dfecb14daa` 的 [CI 45165330066](https://github.com/SophiaData/AgentTerm/actions/runs/45165330066) Linux/Windows 两端成功后，[PR #35](https://github.com/SophiaData/AgentTerm/pull/35) 已合入 `main`，合并提交 `52a9a59585a9746327d83127fe29369d70ddcf2b`；合并后的文件内容与已验证 PR 相同。
+- 合并后的 [CI 45167546361](https://github.com/SophiaData/AgentTerm/actions/runs/45167546361) 两端成功：Linux 13 项质量检查通过，后端 169 passed / 2 ignored、TUI 17 passed；Windows 后端 164 passed / 2 ignored，两项 Agy 默认目录及 PATH 优先级回归均通过。全部在 GitHub 串行完成，本地未重复编译。
+- 等 `main` CI 完成后，才启动 [Windows 构建 45169830049](https://github.com/SophiaData/AgentTerm/actions/runs/45169830049)，同一合并提交的 Windows x64 NSIS 安装包构建成功，用时 11 分 41 秒；本次未构建独立 TUI 包。
+- 附件 [windows-x64-nsis](https://github.com/SophiaData/AgentTerm/actions/runs/45169830049)，2462588 bytes，GitHub 附件 SHA-256 `14c79752a1c291d90a6ca16718fdad1ad1388df1ca20797c0b21208537998bda`，回读时未过期，保留至 2027-02-21。此摘要属于 GitHub 附件，不代表解包后的安装器或应用 EXE。
+- 本轮仅完成合并与构建，没有下载、安装或启动新包，没有创建正式 Release；此前下载/临时 MSI 解包的自动审批阻塞未重试或绕过，模型代理本轮未重新探测。Agy 应用内检测、中文交互及真实停止恢复仍待验收，#12/M4 不因此标记完成。下一项为使用此 `main` 包完成原生验收。
+- 以下是各轮历史证据；旧的“草稿/不合并”和旧包链接不代表本轮交付状态。本次交付记录仅作本地文档提交，线上状态与下载入口同时记录在 PR #35 正文。
+
 ## Agy 默认安装目录检测补修（2026-11-23）
 
 - 用户要求继续适配 Agy；本机 `Get-Command agy` 未找到入口，但定向检查 `%LOCALAPPDATA%\agy\bin\agy.exe` 后，真实 `--version` 返回 `1.5.15`，`--help` 正常退出。该目录不在当前 PATH 中，原 `candidate_search_dirs` 又仅补查 npm/pnpm 等目录，因此漏检；不能据 PATH 缺失断言 Agy 未安装。
