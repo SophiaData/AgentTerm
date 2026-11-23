@@ -1,5 +1,12 @@
 # Testing policy
 
+## Agy 默认安装目录检测补修（2026-11-23）
+
+- 用户要求继续适配 Agy；本机 `Get-Command agy` 未找到入口，但定向检查 `%LOCALAPPDATA%\agy\bin\agy.exe` 后，真实 `--version` 返回 `1.5.15`，`--help` 正常退出。该目录不在当前 PATH 中，原 `candidate_search_dirs` 又仅补查 npm/pnpm 等目录，因此漏检；不能据 PATH 缺失断言 Agy 未安装。
+- 安装目录依据为 [Antigravity 官方排障说明](https://antigravity.google/docs/cli/troubleshooting/) 与本机实际路径。Windows 搜索现在追加该默认目录，仍优先使用用户已有 PATH；检测和手动终端启动共用此搜索入口。未修改全局 PATH、账号、模型或 Agy 设置。
+- 新增 Windows 回归：无 PATH 条目时从默认目录识别版本（含路径空格、目录缺失）；显式 PATH 安装优先于默认安装。测试使用临时 `.cmd` 夹具，不冒充真实 Agy 对话。完整质量检查和打包走 GitHub 串行，本地不重新构建 Tauri。
+- 尚未验证：新包内 Agy 检测与交互终端、中文输入/回复、快捷键、退出及历史重开。真实 CLI `--version/--help` 仅证明入口可执行，不等于完整终端验收。任务抽屉受控派发仍只开放 Claude，未为 Agy/Codex新增自动派发或原生 resume。CI、评审和新包结果在本节补充。
+
 ## #12 串行评审补修（2026-11-23）
 
 - 根据用户最新 D2 要求，单个 DeepSeek 子代理只读评审，主代理等待结束后修复。首轮静态结论 FAIL：非 Linux Unix 错用 `/proc` 缺失判退出；停止与后续阶段写入竞争可能把任务留在同一 owner 的 `pausing`。旧规则中“无子代理”仅适用于 11 月 21 日的历史工作。

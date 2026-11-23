@@ -218,7 +218,7 @@ fn platform_extra_dirs() -> Vec<PathBuf> {
             dirs.push(PathBuf::from(app_data).join("npm"));
         }
         if let Some(local_data) = env::var_os("LOCALAPPDATA") {
-            dirs.push(PathBuf::from(local_data).join("pnpm"));
+            dirs.extend(windows_local_bin_dirs(Path::new(&local_data)));
         }
         if let Some(home) = &home {
             dirs.push(home.join(".bun").join("bin"));
@@ -238,6 +238,10 @@ fn platform_extra_dirs() -> Vec<PathBuf> {
     }
 
     dirs
+}
+
+fn windows_local_bin_dirs(local_data: &Path) -> [PathBuf; 2] {
+    [local_data.join("pnpm"), local_data.join("agy").join("bin")]
 }
 
 fn nvm_bin_dirs(home: &Path) -> Vec<PathBuf> {
@@ -567,6 +571,58 @@ mod tests {
             statuses
                 .iter()
                 .all(|status| status.state == ToolState::Missing)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_finds_agy_in_default_directory_without_a_path_entry() {
+        let dir = TempDir::new("agy-default");
+        let local_data = dir.path().join("Local App Data");
+        let agy_dir = local_data.join("agy").join("bin");
+        let dirs = super::windows_local_bin_dirs(&local_data);
+        let agy = TOOL_DEFINITIONS
+            .iter()
+            .find(|tool| tool.id == "agy")
+            .unwrap();
+        assert_eq!(detect_tool(agy, &dirs).state, ToolState::Missing);
+
+        std::fs::create_dir_all(&agy_dir).unwrap();
+        let binary = agy_dir.join("agy.cmd");
+        std::fs::write(&binary, "@echo off\r\necho 1.5.15\r\n").unwrap();
+        assert_eq!(
+            detect_tool(agy, &dirs).state,
+            ToolState::Installed {
+                path: binary.display().to_string(),
+                version: Some("1.5.15".into()),
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_explicit_path_keeps_priority_over_default_agy_installation() {
+        let dir = TempDir::new("agy-path-priority");
+        let custom = dir.path().join("custom");
+        let local_data = dir.path().join("local");
+        let agy_dir = local_data.join("agy").join("bin");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::create_dir_all(&agy_dir).unwrap();
+        let custom_binary = custom.join("agy.cmd");
+        std::fs::write(&custom_binary, "@echo off\r\necho 2.0.0\r\n").unwrap();
+        std::fs::write(agy_dir.join("agy.cmd"), "@echo off\r\necho 1.5.15\r\n").unwrap();
+        let mut dirs = vec![custom];
+        dirs.extend(super::windows_local_bin_dirs(&local_data));
+        let agy = TOOL_DEFINITIONS
+            .iter()
+            .find(|tool| tool.id == "agy")
+            .unwrap();
+        assert_eq!(
+            detect_tool(agy, &dirs).state,
+            ToolState::Installed {
+                path: custom_binary.display().to_string(),
+                version: Some("2.0.0".into()),
+            }
         );
     }
 
