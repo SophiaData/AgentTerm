@@ -5,7 +5,10 @@
 - 用户要求继续适配 Agy；本机 `Get-Command agy` 未找到入口，但定向检查 `%LOCALAPPDATA%\agy\bin\agy.exe` 后，真实 `--version` 返回 `1.5.15`，`--help` 正常退出。该目录不在当前 PATH 中，原 `candidate_search_dirs` 又仅补查 npm/pnpm 等目录，因此漏检；不能据 PATH 缺失断言 Agy 未安装。
 - 安装目录依据为 [Antigravity 官方排障说明](https://antigravity.google/docs/cli/troubleshooting/) 与本机实际路径。Windows 搜索现在追加该默认目录，仍优先使用用户已有 PATH；检测和手动终端启动共用此搜索入口。未修改全局 PATH、账号、模型或 Agy 设置。
 - 新增 Windows 回归：无 PATH 条目时从默认目录识别版本（含路径空格、目录缺失）；显式 PATH 安装优先于默认安装。测试使用临时 `.cmd` 夹具，不冒充真实 Agy 对话。完整质量检查和打包走 GitHub 串行，本地不重新构建 Tauri。
-- 尚未验证：新包内 Agy 检测与交互终端、中文输入/回复、快捷键、退出及历史重开。真实 CLI `--version/--help` 仅证明入口可执行，不等于完整终端验收。任务抽屉受控派发仍只开放 Claude，未为 Agy/Codex新增自动派发或原生 resume。CI、评审和新包结果在本节补充。
+- 代码 `a7f48874da5103acfb42294412f49516753a0cde` 的 [CI 45159685193](https://github.com/SophiaData/AgentTerm/actions/runs/45159685193) 已全部成功：Linux 13 项质量门通过，后端 169/2 ignored、TUI 17；Windows 后端 164/2 ignored，新增两项 Agy 回归均通过。单个 DeepSeek 串行静态评审 PASS；改动文件格式、字节与 diff 检查通过。
+- 同一代码的 [Windows 包 45163296814](https://github.com/SophiaData/AgentTerm/actions/runs/45163296814) 已构建成功。附件 `windows-x64-nsis`，2461314 bytes，GitHub 附件 SHA-256 `0afce80495e73470c9813a85c36de894c073b70a71044cf6f16076ef50e60a39`；摘要不代表安装器或应用 EXE。先完成 CI，再评审、打包；无本地完整编译，未创建正式 Release。
+- 尚未验证：新包内 Agy 检测与交互终端、中文输入/回复、快捷键、退出及历史重开。真实 CLI `--version/--help` 仅证明入口可执行，不等于完整终端验收。任务抽屉受控派发仍只开放 Claude，未为 Agy/Codex 新增自动派发或原生 resume。收尾回读 `127.0.0.1:15721` 仍无监听；此前下载/临时 MSI 解包命令被自动审批以 `blocked by policy` 拒绝且未给细因，未重试或绕过，新包未安装运行。
+- 非阻塞评审建议：后续加强生产目录拼装入口的回归；当前测试直接调用默认目录辅助函数并手工拼接 PATH 顺序，生产调用关系已静态核对。本轮不为建议项扩大改动。
 
 ## #12 串行评审补修（2026-11-23）
 

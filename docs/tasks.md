@@ -7,7 +7,7 @@
 
 ## 当前方向与下一项工作（2026-11-23）
 
-**Agy 适配补查（11 月 23 日）**：用户要求继续后，已定位真实 Agy `1.5.15` 位于 `%LOCALAPPDATA%\agy\bin\agy.exe`，当前 PATH 未包含该目录；补齐工具检测和手动终端共用的默认目录搜索，保留 PATH 优先。下一项先完成此必要修复的 GitHub 串行检查与打包，再对新包做 Agy 终端及既有恢复验收；真实对话和受控派发不因 `--version/--help` 成功而标通过。#12 与 M4 状态不变，详见 [testing](testing.md)。
+**Agy 适配补查（11 月 23 日）**：真实 Agy `1.5.15` 位于 `%LOCALAPPDATA%\agy\bin\agy.exe`，当前 PATH 未包含该目录；默认目录漏检已修复，保留 PATH 优先。代码 `a7f4887` 的 [CI 45159685193](https://github.com/SophiaData/AgentTerm/actions/runs/45159685193)、串行只读评审和 [Windows 新包 45163296814](https://github.com/SophiaData/AgentTerm/actions/runs/45163296814) 均通过。下一项是验收入口及模型代理可用后，在该新包验证 Agy 检测/终端交互及既有停止恢复；真实对话和受控派发不因 `--version/--help` 成功而标通过。#12 与 M4 状态不变，详见 [testing](testing.md)。
 
 **11 月 23 日续办**：修复 macOS 退出误判、停止竞争后任务卡死，代码 `c322c4a` 已推送 PR #35；单个 DeepSeek 串行静态复审 PASS，[GitHub CI 45149490139](https://github.com/SophiaData/AgentTerm/actions/runs/45149490139) Linux/Windows 均成功，[Windows 包 45151496125](https://github.com/SophiaData/AgentTerm/actions/runs/45151496125) 构建成功。复现、测试数和附件摘要见 [testing](testing.md)。完整测试和打包后续优先 GitHub 串行，本地仅最小复现。模型代理 15721 仍无监听，此前下载/解包自动审批阻塞仍保留；下一项仅为在允许的验收入口及模型代理恢复后，对本次固定新包完成真实执行→停止→重启核实→换绑接续。#12 仍是唯一进行中项，冻结标准不变，PR 不合并、不发布。
 
