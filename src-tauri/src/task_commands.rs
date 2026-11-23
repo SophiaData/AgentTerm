@@ -75,6 +75,7 @@ pub struct WorkbenchView {
     pub ledger: TaskLedgerView,
     pub document: Option<Document>,
     pub recovery: Option<RecoveryView>,
+    pub dispatch_active: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,8 +202,32 @@ impl TaskLedgerState {
         if ledger.snapshot().map_err(|error| error.to_string())? != snapshot {
             return Err("任务状态已变化，请刷新".into());
         }
+        let dispatch_active = self
+            .runtime
+            .active
+            .lock()
+            .map_err(|_| "受控派发状态不可用".to_string())?
+            .as_ref()
+            .is_some_and(|dispatch| {
+                snapshot.active.as_ref().is_some_and(|task| {
+                    dispatch.task_id == task.task_id && dispatch.generation == snapshot.generation
+                })
+            });
+        // A failed relay may be unable to persist its final recovery phase.
+        // Reading this state must expose recovery without rewriting the ledger.
+        let interrupted = !dispatch_active
+            && snapshot.active.as_ref().is_some_and(|active| {
+                matches!(
+                    active.phase,
+                    Phase::Running | Phase::Verifying | Phase::Pausing
+                )
+            });
         let recovery = match (&snapshot.active, &document) {
-            (Some(active), Some(document)) if active.phase == Phase::RecoveryRequired => {
+            (Some(active), Some(document))
+                if active.phase == Phase::RecoveryRequired
+                    || interrupted
+                    || (active.owner_id != self.owner_id && !document.events.is_empty()) =>
+            {
                 let attempts = crate::task_relay::assess_recovery(document)
                     .into_iter()
                     .map(|attempt| RecoveryAttemptView {
@@ -222,10 +247,15 @@ impl TaskLedgerState {
             }
             _ => None,
         };
+        let mut ledger_view = self.view(snapshot);
+        if interrupted && let Some(active) = &mut ledger_view.active {
+            active.recovery_required = true;
+        }
         Ok(WorkbenchView {
-            ledger: self.view(snapshot),
+            ledger: ledger_view,
             document,
             recovery,
+            dispatch_active,
         })
     }
 
@@ -240,7 +270,25 @@ impl TaskLedgerState {
             .active
             .as_ref()
             .ok_or_else(|| "没有当前主任务".to_string())?;
-        if active.phase != Phase::RecoveryRequired {
+        // Hold the runtime guard through recovery so a new dispatch cannot
+        // start between the inactivity check and the ledger CAS.
+        let runtime = self
+            .runtime
+            .active
+            .lock()
+            .map_err(|_| "受控派发状态不可用".to_string())?;
+        if runtime.is_some() {
+            return Err("受控执行仍在收尾，请稍后重新核对".into());
+        }
+        let interrupted = active.owner_id == self.owner_id
+            && matches!(
+                active.phase,
+                Phase::Running | Phase::Verifying | Phase::Pausing
+            );
+        if active.phase != Phase::RecoveryRequired
+            && active.owner_id == self.owner_id
+            && !interrupted
+        {
             return Err("当前任务不在待核实状态，请先刷新".into());
         }
         let document = store.snapshot()?;
@@ -258,9 +306,25 @@ impl TaskLedgerState {
         {
             return Err("旧执行尝试尚未全部确认退出，任务继续待核实".into());
         }
-        self.ledger()?
+        let ledger = self.ledger()?;
+        let revision = if interrupted {
+            ledger
+                .set_phase(
+                    &self.owner_id,
+                    task_id,
+                    generation,
+                    revision,
+                    Phase::RecoveryRequired,
+                )
+                .map_err(|error| error.to_string())?
+                .revision
+        } else {
+            revision
+        };
+        ledger
             .resume_after_recovery(&self.owner_id, task_id, generation, revision)
             .map_err(|error| error.to_string())?;
+        drop(runtime);
         self.workbench()
     }
 
@@ -478,6 +542,7 @@ impl TaskLedgerState {
         plan: RelayPlan,
         store: DocumentStore,
     ) -> Result<(), String> {
+        let ledger = self.ledger()?;
         let control = crate::task_process::ProcessControl::new();
         let token = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -499,7 +564,6 @@ impl TaskLedgerState {
                 control: control.clone(),
             });
         }
-        let ledger = self.ledger()?;
         let runtime = self.runtime.clone();
         let task_id = ticket.task_id.clone();
         let generation = ticket.generation;
@@ -519,7 +583,16 @@ impl TaskLedgerState {
                     *active = None;
                 }
             })
-            .map_err(|_| "无法启动受控派发线程，任务继续占用".to_string())?;
+            .map_err(|_| {
+                if let Ok(mut active) = self.runtime.active.lock()
+                    && active
+                        .as_ref()
+                        .is_some_and(|dispatch| dispatch.token == token)
+                {
+                    *active = None;
+                }
+                "无法启动受控派发线程，任务继续占用".to_string()
+            })?;
         Ok(())
     }
 
@@ -770,6 +843,49 @@ pub fn associate_task_session(
         return Err("任务计划与当前账本不匹配，不能关联会话".into());
     }
     store.associate_session(session)?;
+    state.workbench()
+}
+
+#[tauri::command]
+pub fn reassociate_task_session_after_recovery(
+    state: tauri::State<'_, TaskLedgerState>,
+    sessions: tauri::State<'_, SessionManager>,
+    task_id: String,
+    generation: u64,
+    expected_revision: u64,
+    previous_session_id: String,
+    session_id: String,
+) -> Result<WorkbenchView, String> {
+    let info = sessions
+        .session_info(&session_id)
+        .map_err(|_| "当前 CLI 会话不存在或已结束".to_string())?;
+    let (_, store) = state.current_store(&task_id, generation, expected_revision, true)?;
+    state
+        .ledger()?
+        .while_recovered(
+            &state.owner_id,
+            &task_id,
+            generation,
+            expected_revision,
+            || -> Result<(), String> {
+                if previous_session_id != session_id
+                    && sessions.session_info(&previous_session_id).is_ok()
+                {
+                    return Err("原关联会话仍在运行，请继续使用原会话或先结束它".into());
+                }
+                store.reassociate_session(
+                    &previous_session_id,
+                    SessionLink {
+                        id: info.id,
+                        tool_id: info.tool_id,
+                        tool_name: info.tool_name,
+                        project_path: info.project_path,
+                    },
+                )?;
+                Ok(())
+            },
+        )
+        .map_err(|error| error.to_string())??;
     state.workbench()
 }
 
@@ -1142,8 +1258,133 @@ mod tests {
     }
 
     #[test]
+    fn idle_dispatch_exposes_and_recovers_same_owner_interruption() {
+        for phase in [Phase::Running, Phase::Verifying, Phase::Pausing] {
+            let (state, projects, project) = configured();
+            let view = state.create_task(&projects, input(project)).unwrap();
+            let task = view.ledger.active.unwrap().task_id;
+            let ledger = state.ledger().unwrap();
+            ledger
+                .set_phase(&state.owner_id, &task, 1, 1, phase)
+                .unwrap();
+            let pid = exited_owner().split('-').next().unwrap().parse().unwrap();
+            state
+                .document_store(&task, 1)
+                .unwrap()
+                .record(crate::task_document::AttemptEvent {
+                    id: "1:2:0:start".into(),
+                    sequence: 4,
+                    attempt_id: "1:2:0".into(),
+                    step_id: "worker".into(),
+                    state: crate::task_document::AttemptState::Running,
+                    summary: "intent".into(),
+                    process_identity: Some(crate::task_document::ProcessIdentity {
+                        pid,
+                        executable: "fixture".into(),
+                        start_token: None,
+                    }),
+                    stop: None,
+                })
+                .unwrap();
+
+            // An active relay must not be mistaken for an interrupted one.
+            *state.runtime.active.lock().unwrap() = Some(ActiveDispatch {
+                token: 1,
+                task_id: task.clone(),
+                generation: 1,
+                control: crate::task_process::ProcessControl::new(),
+            });
+            let running = state.workbench().unwrap();
+            assert!(running.dispatch_active);
+            assert!(!running.ledger.active.unwrap().recovery_required);
+            assert!(running.recovery.is_none());
+            assert!(state.resume_after_recovery(&task, 1, 2).is_err());
+            *state.runtime.active.lock().unwrap() = None;
+
+            let before = ledger.snapshot().unwrap();
+            let interrupted = state.workbench().unwrap();
+            assert!(!interrupted.dispatch_active);
+            assert!(interrupted.ledger.active.unwrap().recovery_required);
+            assert!(interrupted.recovery.unwrap().all_exited);
+            assert_eq!(ledger.snapshot().unwrap(), before);
+            let resumed = state.resume_after_recovery(&task, 1, 2).unwrap();
+            assert_eq!(resumed.ledger.active.unwrap().phase, "recoveredReserved");
+            assert_eq!(resumed.ledger.revision, 4);
+            assert!(state.resume_after_recovery(&task, 1, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn idle_dispatch_with_unconfirmed_launch_remains_occupied() {
+        let (state, projects, project) = configured();
+        let view = state.create_task(&projects, input(project)).unwrap();
+        let task = view.ledger.active.unwrap().task_id;
+        let ledger = state.ledger().unwrap();
+        ledger
+            .set_phase(&state.owner_id, &task, 1, 1, Phase::Pausing)
+            .unwrap();
+        state
+            .document_store(&task, 1)
+            .unwrap()
+            .record(crate::task_document::AttemptEvent {
+                id: "1:2:0:start".into(),
+                sequence: 4,
+                attempt_id: "1:2:0".into(),
+                step_id: "worker".into(),
+                state: crate::task_document::AttemptState::Running,
+                summary: "intent".into(),
+                process_identity: None,
+                stop: None,
+            })
+            .unwrap();
+        let before = ledger.snapshot().unwrap();
+        assert!(!state.workbench().unwrap().recovery.unwrap().all_exited);
+        assert!(state.resume_after_recovery(&task, 1, 2).is_err());
+        assert_eq!(ledger.snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn restart_during_running_exposes_recovery_without_rewriting_the_ledger() {
+        let (mut old, projects, project) = configured();
+        old.owner_id = exited_owner();
+        let view = old.create_task(&projects, input(project)).unwrap();
+        let task = view.ledger.active.unwrap().task_id;
+        old.ledger()
+            .unwrap()
+            .set_phase(&old.owner_id, &task, 1, 1, Phase::Running)
+            .unwrap();
+        old.document_store(&task, 1)
+            .unwrap()
+            .record(crate::task_document::AttemptEvent {
+                id: "1:2:0:start".into(),
+                sequence: 4,
+                attempt_id: "1:2:0".into(),
+                step_id: "worker".into(),
+                state: crate::task_document::AttemptState::Running,
+                summary: "intent".into(),
+                process_identity: None,
+                stop: None,
+            })
+            .unwrap();
+        let restarted = TaskLedgerState::default();
+        restarted
+            .configure(old.path.lock().unwrap().clone().unwrap())
+            .unwrap();
+        let current = restarted.workbench().unwrap();
+        assert!(current.ledger.active.unwrap().recovery_required);
+        let recovery = current
+            .recovery
+            .expect("crashed running tasks need a recovery assessment");
+        assert_eq!(recovery.attempts[0].observation, "launchUncertain");
+        assert!(!recovery.all_exited);
+        assert!(restarted.resume_after_recovery(&task, 1, 2).is_err());
+        assert_eq!(old.ledger().unwrap().snapshot().unwrap().revision, 2);
+    }
+
+    #[test]
     fn dispatched_recovery_can_be_reclaimed_once_all_old_attempts_exited() {
-        let (old, projects, project) = configured();
+        let (mut old, projects, project) = configured();
+        old.owner_id = exited_owner();
         let view = old.create_task(&projects, input(project)).unwrap();
         let task = view.ledger.active.as_ref().unwrap().task_id.clone();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1187,6 +1428,60 @@ mod tests {
         assert!(recovered.resume_after_recovery(&task, 1, 2).is_err());
     }
 
+    #[test]
+    fn crashed_coordinator_can_be_reclaimed_from_running_verifying_or_pausing() {
+        for phase in [
+            Phase::Running,
+            Phase::Verifying,
+            Phase::Pausing,
+            Phase::WaitingInput,
+        ] {
+            let (mut old, projects, project) = configured();
+            old.owner_id = exited_owner();
+            let view = old.create_task(&projects, input(project)).unwrap();
+            let task = view.ledger.active.unwrap().task_id;
+            old.ledger()
+                .unwrap()
+                .set_phase(&old.owner_id, &task, 1, 1, phase)
+                .unwrap();
+            let pid = old.owner_id.split('-').next().unwrap().parse().unwrap();
+            let store = old.document_store(&task, 1).unwrap();
+            store
+                .record(crate::task_document::AttemptEvent {
+                    id: "1:2:0:start".into(),
+                    sequence: 4,
+                    attempt_id: "1:2:0".into(),
+                    step_id: "worker".into(),
+                    state: crate::task_document::AttemptState::Running,
+                    summary: "intent".into(),
+                    process_identity: Some(crate::task_document::ProcessIdentity {
+                        pid,
+                        executable: "fixture".into(),
+                        start_token: None,
+                    }),
+                    stop: None,
+                })
+                .unwrap();
+            let before = store.snapshot().unwrap();
+            let restarted = TaskLedgerState::default();
+            restarted
+                .configure(old.path.lock().unwrap().clone().unwrap())
+                .unwrap();
+            assert!(restarted.workbench().unwrap().recovery.unwrap().all_exited);
+            let resumed = restarted.resume_after_recovery(&task, 1, 2).unwrap();
+            assert_eq!(resumed.ledger.active.unwrap().phase, "recoveredReserved");
+            assert_eq!(resumed.ledger.revision, 3);
+            assert_eq!(store.snapshot().unwrap(), before);
+            assert!(
+                old.ledger()
+                    .unwrap()
+                    .set_phase(&old.owner_id, &task, 1, 2, Phase::Running)
+                    .is_err()
+            );
+            assert!(restarted.resume_after_recovery(&task, 1, 2).is_err());
+        }
+    }
+
     fn controlled_dispatch_fixture(link: Option<SessionLink>) -> (Snapshot, Document, SessionInfo) {
         let project = std::env::temp_dir().canonicalize().unwrap();
         let project_path = project.to_string_lossy().into_owned();
@@ -1216,6 +1511,7 @@ mod tests {
                 events: vec![],
                 artifacts: vec![],
                 session_link: link,
+                session_link_history: Vec::new(),
             },
             SessionInfo {
                 id: "session-controlled".into(),

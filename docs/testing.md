@@ -1,5 +1,42 @@
 # Testing policy
 
+## Agy 默认安装目录检测补修（2026-11-23）
+
+- 用户要求继续适配 Agy；本机 `Get-Command agy` 未找到入口，但定向检查 `%LOCALAPPDATA%\agy\bin\agy.exe` 后，真实 `--version` 返回 `1.5.15`，`--help` 正常退出。该目录不在当前 PATH 中，原 `candidate_search_dirs` 又仅补查 npm/pnpm 等目录，因此漏检；不能据 PATH 缺失断言 Agy 未安装。
+- 安装目录依据为 [Antigravity 官方排障说明](https://antigravity.google/docs/cli/troubleshooting/) 与本机实际路径。Windows 搜索现在追加该默认目录，仍优先使用用户已有 PATH；检测和手动终端启动共用此搜索入口。未修改全局 PATH、账号、模型或 Agy 设置。
+- 新增 Windows 回归：无 PATH 条目时从默认目录识别版本（含路径空格、目录缺失）；显式 PATH 安装优先于默认安装。测试使用临时 `.cmd` 夹具，不冒充真实 Agy 对话。完整质量检查和打包走 GitHub 串行，本地不重新构建 Tauri。
+- 代码 `a7f48874da5103acfb42294412f49516753a0cde` 的 [CI 45159685193](https://github.com/SophiaData/AgentTerm/actions/runs/45159685193) 已全部成功：Linux 13 项质量门通过，后端 169/2 ignored、TUI 17；Windows 后端 164/2 ignored，新增两项 Agy 回归均通过。单个 DeepSeek 串行静态评审 PASS；改动文件格式、字节与 diff 检查通过。
+- 同一代码的 [Windows 包 45163296814](https://github.com/SophiaData/AgentTerm/actions/runs/45163296814) 已构建成功。附件 `windows-x64-nsis`，2461314 bytes，GitHub 附件 SHA-256 `0afce80495e73470c9813a85c36de894c073b70a71044cf6f16076ef50e60a39`；摘要不代表安装器或应用 EXE。先完成 CI，再评审、打包；无本地完整编译，未创建正式 Release。
+- 尚未验证：新包内 Agy 检测与交互终端、中文输入/回复、快捷键、退出及历史重开。真实 CLI `--version/--help` 仅证明入口可执行，不等于完整终端验收。任务抽屉受控派发仍只开放 Claude，未为 Agy/Codex 新增自动派发或原生 resume。收尾回读 `127.0.0.1:15721` 仍无监听；此前下载/临时 MSI 解包命令被自动审批以 `blocked by policy` 拒绝且未给细因，未重试或绕过，新包未安装运行。
+- 非阻塞评审建议：后续加强生产目录拼装入口的回归；当前测试直接调用默认目录辅助函数并手工拼接 PATH 顺序，生产调用关系已静态核对。本轮不为建议项扩大改动。
+
+## #12 串行评审补修（2026-11-23）
+
+- 根据用户最新 D2 要求，单个 DeepSeek 子代理只读评审，主代理等待结束后修复。首轮静态结论 FAIL：非 Linux Unix 错用 `/proc` 缺失判退出；停止与后续阶段写入竞争可能把任务留在同一 owner 的 `pausing`。旧规则中“无子代理”仅适用于 11 月 21 日的历史工作。
+- 停止竞态回归先在旧实现实测失败：`stop_racing_with_handoff_or_final_report_keeps_task_recoverable`，实际 `Pausing`、预期 `RecoveryRequired`，0 passed / 1 failed；修复后执行转验收和最后报告两个竞争窗口均通过。
+- 修复：Unix 只在 `kill(pid, 0)` 明确返回 ESRCH 时证明退出；`/proc` 仅用于 Linux 身份核对。macOS 活进程身份暂归 `Unknown`，继续阻断恢复。后台异常后有界读取当前版本并推进待核实，仅允许本次派发的版本；持久化仍失败时，空闲后台加执行阶段显示只读核实入口，人工接回再次验证全部旧进程已退出，并持有运行锁防止同时新派发。
+- Windows 本地 `pnpm check` 13 项全部通过：前端 89、Rust 后端 162 passed / 2 ignored、TUI 15、模板契约 13；单 worker、单 Rust job。新增 5 项回归覆盖停止竞争、迟到失败不覆盖新尝试/owner、后台结束后同 owner 接回、身份未知继续占用、活进程无启动身份不得判退出。另有 Unix 非法 PID 断言，须由 Unix CI 执行。跨平台旧夹具已改用实测退出的子进程 PID，不以 `u32::MAX` 假定退出。
+- 本轮全量检查保留既有 `sessions.rs` 测试未使用 Result 和 TUI `serde` 未使用依赖警告；未据此扩大改动。临时 Python/pnpm 原生入口只作用于检查进程 PATH，构建和测试缓存位于 E 盘。
+- 第二轮单个 DeepSeek 只读复审 PASS（仅静态）；15 个交付文件字节检查通过。代码提交 `c322c4ab1b3f08d386a07f1a9dabb3257f411247` 已推送 PR #35。[GitHub 质量检查 45149490139](https://github.com/SophiaData/AgentTerm/actions/runs/45149490139) 两 job 均成功，Linux 后端 169/2 ignored、TUI 17，Windows 后端 162/2 ignored。最后跨平台夹具调整后的定向测试亦通过；Windows 结果不替代 macOS 真机。
+- [Windows 包 45151496125](https://github.com/SophiaData/AgentTerm/actions/runs/45151496125) 成功，绑定 `c322c4a`。附件 `windows-x64-nsis`，2471787 bytes，GitHub 附件摘要 `sha256:3233abf9f36f40237b11a644aa9f5630b07a205329791c8cc1225f4e97067c67`；不是解包后 EXE 摘要。提前触发的 45149507161 因与延迟出现的 CI 短暂重叠而主动取消，不计通过；最终构建在 CI 全部成功后才触发。11 月 21 日旧包不含本轮增量。
+- 11 月 23 日环境回读：PR #35 仍为未合并草稿。`127.0.0.1:15721` 无监听，24-byte 账本 SHA-256 仍为 `70871f764d93687bb184524eea2cd1651610d49eb544a35e22cff2d8f8509be0`。收尾时旧 PID19268 已不在，39860 的路径/创建时间未变；本轮未操作旧应用，退出原因未查。此前自动审批拒绝未解除，未重试下载/解包，新包未安装或启动；原生验收仍为 0 项通过，#12/M4 保持未完成。
+- 本轮测试程序、生成 schema、E 盘编译与测试目录已移入回收站，备份保留；回收不计物理空间释放。用户纠正后，后续完整测试/打包优先在 GitHub 串行执行，本地只做必要最小复现，避免重复编译及堆积缓存。
+- 首轮建议项留待原生验收：短暂轮询错误成功后仍需手动刷新；会话换绑在持锁前检查状态，存在刚结束会话被绑定的窗口，派发前仍会重新校验。未将建议项扩入本次修复。
+
+## #12 停止与重启接续修复（2026-11-21，本轮）
+
+基线 `30c4204` 的 CI `44893208852` 已通过。本轮在 `codex/recovery-acceptance` 上顺序实施与主 Agent 自检，不调用开发或评审子 Agent。以下记录属于本轮；下方历史切片不代表当前整体验收。
+
+- 复现：新增 `restart_during_running_exposes_recovery_without_rewriting_the_ledger` 在修复前失败，原因是旧 owner 的 `Running` 任务未返回恢复评估（0 passed / 1 failed，exit 101）。修复后通过。
+- 本地 Windows：`pnpm check` 的 13 项全部通过；前端 89 passed，Rust 后端 157 passed / 2 ignored，TUI 15 passed，模板契约 13 passed。两个 ignored 是现有由父测试调用的子进程入口。全部串行、单 worker / 单 Rust job。
+- 新覆盖：执行/验收/暂停/等待阶段崩溃后接回、读评估不改账本、活协调进程阻止接管、旧票据拒绝、会话历史持久化与换绑冲突、UI 恢复换绑入口、已持久化用户停止原因不被后台替换。
+- 本机 `python3` 与 Python 子进程对 `pnpm` 的解析缺失，通过本轮临时原生命令入口调用既有 Python/Node 解决，不更改全局配置。首轮格式错误核实为 Git CRLF 检出转换，恢复与 HEAD 完全相同的 LF 字节后原格式门通过，无全项目格式内容改动。
+- 固定代码版本：`3c7824baebe71e0026f1680fc700ff5fafb0e5ab`，草稿 [PR #35](https://github.com/SophiaData/AgentTerm/pull/35)，[质量检查 44897184829](https://github.com/SophiaData/AgentTerm/actions/runs/44897184829)；运行结果以该链接回读为准。本段后续仅更新证据，不更改包内代码。
+- [Windows-only 打包 44897226917](https://github.com/SophiaData/AgentTerm/actions/runs/44897226917) 已成功，绑定上述代码提交。附件 `windows-x64-nsis`，ID `14704842120`，2470415 bytes，GitHub 附件摘要 `sha256:1dbaa9ca8d7db155facda414cba6b995fb9b54ded35e828fe433450212afd959`；这是附件摘要，不冒充解包后 EXE 摘要。未创建正式 Release。
+- 原生验收 BLOCKED / 0 项通过：下载构建附件并启动临时 MSI 解包工具的整组命令被自动审批拒绝，返回 `blocked by policy`，没有更具体原因；拒绝发生于执行前，目标下载目录与 MSI 文件均不存在。没有换工具或拆命令重试。另对 `127.0.0.1:15721` 做 TCP 探针，当前无监听且连接失败，真实模型回复无法验证。
+- 未安装或启动新包；旧应用 PID 19268、39860 的路径和创建时间保持不变。空账本仍为 24 bytes，SHA-256 `70871f764d93687bb184524eea2cd1651610d49eb544a35e22cff2d8f8509be0`，与测试前备份相同。没有创建业务任务、修改全局模型配置或使用全局键盘鼠标注入。真实执行/停止/重启/接续、审批、物理输入均不能以本地或 CI 测试代替。
+- 尚未交付：#13 证据失效与完成释放、外部作业撤销、CLI 原生对话 resume、macOS 真机验收。#12 与 M4 暂不关闭。
+
 ## 验收现状与下一项（2026-11-20）
 
 当前双终端分屏代码6a0615d4d44ac0e165109324112a176bd7edd44a通过串行CI44747204310：两端前端75、Linux Rust123、Windows Rust114、TUI17，13项质量门通过。新增14项前端回归；最初b14322f8候选CI44746013910因补正跨项目焦点同步而主动取消，不计作失败或通过。分屏覆盖：显示与输入焦点分离、拖动/键盘调比例、窄空间上下布局、双侧独立尺寸同步、单屏/新建页保持挂载。新增回归检查替换当前格、关闭另一格、失败保留、自然退出和只剩一个会话；原生验收使用离线PTY测试程序，UI Automation只定向调用控件；不使用系统键盘/鼠标注入。Windows-only打包44749553746成功，artifact14635751234；已安装并用真实Claude Code 2.1.326补验启动与会话管理，详见下节。测试结果绑定本轮提交，不沿用下方多会话结果冒充。

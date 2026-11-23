@@ -36,6 +36,7 @@ export type TaskDocument = {
   events: AttemptEvent[];
   artifacts: Artifact[];
   sessionLink?: SessionLink | null;
+  sessionLinkHistory?: SessionLink[];
 };
 export type SessionLink = {
   id: string;
@@ -47,6 +48,7 @@ export type WorkbenchView = {
   ledger: { revision: number; generation: number; active: MainTask | null };
   document: TaskDocument | null;
   recovery?: RecoveryView | null;
+  dispatchActive?: boolean;
 };
 export type RecoveryAttempt = {
   attemptId: string;

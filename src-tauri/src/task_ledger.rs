@@ -268,15 +268,47 @@ impl Ledger {
             if state.generation != generation
                 || state.revision != expected_revision
                 || task.task_id != task_id
-                || task.phase != Phase::RecoveryRequired
             {
                 return Err(LedgerError::Stale);
+            }
+            if task.owner_id == new_owner {
+                if task.phase != Phase::RecoveryRequired {
+                    return Err(LedgerError::Stale);
+                }
+            } else if !owner_has_exited(&task.owner_id) || task.phase == Phase::Reserved {
+                // An exited worker does not prove its coordinator cannot hand
+                // off to the next step. Check the old owner under the CAS lock.
+                return Err(LedgerError::RecoveryRequired);
             }
             task.owner_id = new_owner.into();
             task.phase = Phase::RecoveredReserved;
             state.revision = next(state.revision)?;
             append(file, &state)?;
             Ok(state)
+        })
+    }
+
+    /// Holds the ledger lock while a recovered task updates its session link.
+    /// A concurrent dispatcher cannot leave the reservation during the write.
+    pub(crate) fn while_recovered<T>(
+        &self,
+        owner_id: &str,
+        task_id: &str,
+        generation: u64,
+        revision: u64,
+        apply: impl FnOnce() -> T,
+    ) -> Result<T, LedgerError> {
+        self.with_locked(|file| {
+            let state = read_snapshot(file)?;
+            require_owner(&state, owner_id, task_id, generation, revision)?;
+            if state
+                .active
+                .as_ref()
+                .is_none_or(|task| task.phase != Phase::RecoveredReserved)
+            {
+                return Err(LedgerError::RecoveryRequired);
+            }
+            Ok(apply())
         })
     }
 
@@ -622,9 +654,7 @@ fn validate_transition(before: &Snapshot, after: &Snapshot) -> Result<(), Ledger
             before.generation == after.generation
                 && old.task_id == new.task_id
                 && old.project_id == new.project_id
-                && ((old.phase.is_reserved()
-                    && new.phase == Phase::RecoveredReserved
-                    && old.owner_id != new.owner_id)
+                && ((new.phase == Phase::RecoveredReserved && old.owner_id != new.owner_id)
                     || (old.phase == Phase::RecoveryRequired
                         && new.phase == Phase::RecoveredReserved)
                     || (old.owner_id == new.owner_id
@@ -855,9 +885,16 @@ mod tests {
     #[test]
     fn explicit_recovery_resume_fences_old_owner_and_returns_reserved_slot() {
         let ledger = fresh();
-        ledger.claim("task", "project", "old-owner").unwrap();
+        let mut old = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let old_owner = format!("{}-1", old.id());
+        old.wait().unwrap();
+        ledger.claim("task", "project", &old_owner).unwrap();
         let recovery = ledger
-            .set_phase("old-owner", "task", 1, 1, Phase::RecoveryRequired)
+            .set_phase(&old_owner, "task", 1, 1, Phase::RecoveryRequired)
             .unwrap();
         let resumed = ledger
             .resume_after_recovery("new-owner", "task", 1, recovery.revision)
@@ -876,6 +913,37 @@ mod tests {
             ledger.resume_after_recovery("other-owner", "task", 1, recovery.revision),
             Err(LedgerError::Stale)
         ));
+    }
+
+    #[test]
+    fn live_coordinator_blocks_recovery_even_when_marked_recovery_required() {
+        let ledger = fresh();
+        let owner = format!("{}-1", std::process::id());
+        ledger.claim("task", "project", &owner).unwrap();
+        ledger
+            .set_phase(&owner, "task", 1, 1, Phase::RecoveryRequired)
+            .unwrap();
+        assert!(
+            ledger
+                .resume_after_recovery("new-owner", "task", 1, 2)
+                .is_err()
+        );
+        assert_eq!(ledger.snapshot().unwrap().revision, 2);
+        let resumed = ledger.resume_after_recovery(&owner, "task", 1, 2).unwrap();
+        assert_eq!(resumed.revision, 3);
+        assert!(
+            ledger
+                .while_recovered(&owner, "task", 1, 3, || true)
+                .unwrap()
+        );
+        ledger
+            .set_phase(&owner, "task", 1, 3, Phase::Running)
+            .unwrap();
+        assert!(
+            ledger
+                .while_recovered(&owner, "task", 1, 4, || true)
+                .is_err()
+        );
     }
 
     #[test]

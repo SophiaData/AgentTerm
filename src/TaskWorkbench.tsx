@@ -49,6 +49,7 @@ export function TaskCard({
   onRefresh,
   currentSession,
   onAssociateSession,
+  onReassociateSession,
   onDispatch,
   onStop,
 }: {
@@ -64,6 +65,7 @@ export function TaskCard({
   onRefresh: () => void;
   currentSession: SessionInfo | null;
   onAssociateSession: () => void;
+  onReassociateSession: () => void;
   onDispatch: () => void;
   onStop: () => void;
 }) {
@@ -101,6 +103,14 @@ export function TaskCard({
     currentSession.projectPath === active.projectId &&
     currentSession.toolId === sessionLink.toolId &&
     currentSession.toolId === "claude";
+  const canReassociate =
+    !active.recoveryRequired &&
+    active.phase === "recoveredReserved" &&
+    !!sessionLink &&
+    !!currentSession &&
+    currentSession.id !== sessionLink.id &&
+    currentSession.projectPath === active.projectId &&
+    currentSession.toolId === sessionLink.toolId;
   const canStop =
     !active.recoveryRequired &&
     (active.phase === "running" ||
@@ -150,6 +160,33 @@ export function TaskCard({
             >
               关联当前会话
             </button>
+          ) : null}
+          {canReassociate ? (
+            <div>
+              <p>
+                原会话结束后可关联当前会话，原关联记录保留。此操作不会自动执行任务。
+              </p>
+              <button
+                type="button"
+                className="ghost-button"
+                disabled={busy}
+                onClick={onReassociateSession}
+              >
+                将已接回任务关联到当前会话
+              </button>
+            </div>
+          ) : null}
+          {document.sessionLinkHistory?.length ? (
+            <details>
+              <summary>历史会话关联</summary>
+              <ul>
+                {document.sessionLinkHistory.map((link) => (
+                  <li key={link.id}>
+                    {link.toolName} · {link.id}
+                  </li>
+                ))}
+              </ul>
+            </details>
           ) : null}
         </section>
       ) : null}
@@ -750,6 +787,12 @@ export default function TaskWorkbench({
       }
     }
   }, []);
+  const stopStatusPolling = useCallback(() => {
+    if (statusPoll.current !== null) {
+      clearInterval(statusPoll.current);
+      statusPoll.current = null;
+    }
+  }, []);
   const pollStatus = useCallback(async () => {
     if (!mounted.current || statusPollInFlight.current) return;
     statusPollInFlight.current = true;
@@ -757,27 +800,28 @@ export default function TaskWorkbench({
       const next = await invoke<WorkbenchView>("workbench_snapshot");
       if (mounted.current) {
         setView((previous) => acceptSnapshot(previous, next));
-        if (
-          next.ledger.active &&
-          !["running", "verifying", "pausing"].includes(
-            next.ledger.active.phase,
-          )
-        ) {
-          stopStatusPolling();
-        }
       }
-    } catch {
-      // A transient status read cannot replace the last known task state.
+    } catch (cause) {
+      if (mounted.current) setReadError(message(cause));
     } finally {
       statusPollInFlight.current = false;
     }
   }, []);
-  const stopStatusPolling = useCallback(() => {
-    if (statusPoll.current !== null) {
-      clearInterval(statusPoll.current);
-      statusPoll.current = null;
-    }
-  }, []);
+  const pollingTask = view?.dispatchActive
+    ? view.ledger.active?.taskId
+    : undefined;
+  useEffect(() => {
+    if (!pollingTask) return;
+    statusPoll.current = setInterval(() => void pollStatus(), 350);
+    const deadline = setTimeout(() => {
+      stopStatusPolling();
+      setReadError("受控执行状态刷新已超时，请重新核对；任务占用仍保留。");
+    }, 650_000);
+    return () => {
+      clearTimeout(deadline);
+      stopStatusPolling();
+    };
+  }, [pollingTask, pollStatus, stopStatusPolling]);
   useEffect(() => {
     mounted.current = true;
     void load();
@@ -805,10 +849,6 @@ export default function TaskWorkbench({
     setNotice(null);
     setPreview(null);
     order.current.next();
-    if (command === "dispatch_controlled_task") {
-      void pollStatus();
-      statusPoll.current = setInterval(() => void pollStatus(), 350);
-    }
     try {
       await invoke(command, args);
       if (!mounted.current) return;
@@ -818,7 +858,6 @@ export default function TaskWorkbench({
       }
     } catch (cause) {
       if (!mounted.current) return;
-      if (command === "dispatch_controlled_task") stopStatusPolling();
       await load();
       if (mounted.current) setActionError(message(cause));
     } finally {
@@ -1040,11 +1079,22 @@ export default function TaskWorkbench({
               "当前 CLI 会话已关联到任务记录。",
             )
           }
+          onReassociateSession={() =>
+            void act(
+              "reassociate_task_session_after_recovery",
+              {
+                ...ticket(),
+                previousSessionId: view.document?.sessionLink?.id,
+                sessionId: currentSession?.id,
+              },
+              "已关联当前会话，原关联记录保留；可明确启动新的执行尝试。",
+            )
+          }
           onDispatch={() =>
             void act(
               "dispatch_controlled_task",
               { ...ticket(), sessionId: currentSession?.id },
-              "受控接力已结束，结果已写入任务记录，请核对执行与验收意见。",
+              "受控执行已提交，正在跟踪执行与停止状态。",
             )
           }
           onStop={() =>
