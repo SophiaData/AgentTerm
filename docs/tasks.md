@@ -7,9 +7,11 @@
 
 ## 当前方向与下一项工作（2026-11-23）
 
-**最新交付：已合并并打包（11 月 23 日）**：按用户“测试通过就合并打包”的授权，PR 最终提交的 [CI 45165330066](https://github.com/SophiaData/AgentTerm/actions/runs/45165330066) 两端成功后，[PR #35](https://github.com/SophiaData/AgentTerm/pull/35) 已合入 `main`，提交 `52a9a59585a9746327d83127fe29369d70ddcf2b`。该提交的 [main CI 45167546361](https://github.com/SophiaData/AgentTerm/actions/runs/45167546361) 两端通过，再串行生成 [Windows x64 安装包 45169830049](https://github.com/SophiaData/AgentTerm/actions/runs/45169830049)，附件 `windows-x64-nsis` 已可下载。下一项是在允许的验收入口和模型代理可用后，使用此 `main` 包验证 Agy 实际终端交互与停止恢复；#12/M4 和冻结验收标准不变。未安装或运行新包，未创建正式 Release，证据见 [testing](testing.md)。本次交付记录作本地文档提交，PR 正文同步线上结果。
+**首页地址反馈（11 月 23 日）**：用户看到的地址为 `\\?\E:\AgentTerm`，Windows 内部长路径前缀被原样展示。已补显示层格式化：首页地址、项目设置和相关提示展示普通盘符/网络共享地址，实际存储、ID与会话启动路径不变。旧实现2项回归失败，修复后20项定向测试通过；该修复与下方合并/安装记录一并提交非草稿PR，完整CI通过后按已获授权合并并更新测试包。此段为提交前验证记录，最新合并/打包证据见修复PR；#12/M4标准不变，后续唯一功能验收仍为Agy真实交互与停止恢复。
 
-以下是历史进展；旧的“草稿/不合并”状态及旧包不覆盖上述最新交付和唯一下一项。
+**最新交付：已安装并打开（11 月 23 日）**：运行代码已通过 [PR #35](https://github.com/SophiaData/AgentTerm/pull/35) 合入 `main`（`52a9a59`），[main CI 45167546361](https://github.com/SophiaData/AgentTerm/actions/runs/45167546361) 两端通过，[Windows 包 45169830049](https://github.com/SophiaData/AgentTerm/actions/runs/45169830049) 构建成功。按用户安装授权，校验附件后安装至 `E:\AgentTerm\app-52a9a59`，安装器退出 0；桌面和开始菜单入口均指向新版，旧版文件保留。新版 PID 23224 的窗口 `AgentTerm` 已打开并响应。用户明确要求检查无问题后提交合并，本轮合并/打包/安装证据一并提交正式 PR。下一项为在模型可用后验收该固定包的 Agy 真实交互与停止恢复；#12/M4 和冻结验收标准不变，启动成功不等于完整验收。证据见 [testing](testing.md)。
+
+以下是历史进展；旧的“草稿/不合并/未安装”状态及旧包不覆盖上述最新交付和唯一下一项。
 
 **Agy 适配补查（11 月 23 日）**：真实 Agy `1.5.15` 位于 `%LOCALAPPDATA%\agy\bin\agy.exe`，当前 PATH 未包含该目录；默认目录漏检已修复，保留 PATH 优先。代码 `a7f4887` 的 [CI 45159685193](https://github.com/SophiaData/AgentTerm/actions/runs/45159685193)、串行只读评审和 [Windows 新包 45163296814](https://github.com/SophiaData/AgentTerm/actions/runs/45163296814) 均通过。下一项是验收入口及模型代理可用后，在该新包验证 Agy 检测/终端交互及既有停止恢复；真实对话和受控派发不因 `--version/--help` 成功而标通过。#12 与 M4 状态不变，详见 [testing](testing.md)。
 

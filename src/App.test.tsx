@@ -5,10 +5,38 @@ import { isSupportedTarget, PRODUCT_NAME, SUPPORTED_TARGETS } from "./meta";
 import * as launcherModule from "./terminal/useLauncher";
 import * as historyModule from "./terminal/useSessionHistory";
 import * as toolsModule from "./tools/useTools";
+import * as projectsModule from "./projects/useProjects";
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("AgentTerm application shell", () => {
+  it.each([
+    [String.raw`\\?\E:\数据 项目`, String.raw`E:\数据 项目`],
+    [String.raw`\\?\UNC\server\共享\项目`, String.raw`\\server\共享\项目`],
+  ])("shows a readable home address for %s", (path, display) => {
+    const project = { id: path, name: "项目", path };
+    vi.spyOn(projectsModule, "useProjects").mockReturnValue({
+      projects: [project],
+      busy: false,
+      loading: false,
+      error: null,
+      pendingRemoval: null,
+      add: vi.fn(),
+      requestRemove: vi.fn(),
+      cancelRemove: vi.fn(),
+      confirmRemove: vi.fn(),
+      refresh: vi.fn(),
+    });
+
+    const html = renderToStaticMarkup(<App />);
+    expect(html).toContain(
+      `<p class="workspace-start-path" title="${display}">${display}</p>`,
+    );
+    expect(html).not.toContain(path);
+    expect(project.path).toBe(path);
+    expect(project.id).toBe(path);
+  });
+
   it("starts with projects and an agent session, keeping records optional", () => {
     const html = renderToStaticMarkup(<App />);
 
@@ -150,7 +178,7 @@ describe("AgentTerm application shell", () => {
           id: "closed-ok",
           toolId: "claude",
           toolName: "Claude Code",
-          projectPath: "E:\\AgentTerm",
+          projectPath: String.raw`\\?\E:\AgentTerm`,
           startedAtMs: 1_763_649_000_000,
           endedAtMs: 1_763_649_500_000,
           exitReason: "已停止",
@@ -177,6 +205,8 @@ describe("AgentTerm application shell", () => {
     expect(html).toContain("无法读取最近会话：历史校验失败");
     expect(html).toContain("重新读取");
     expect(html).toContain("Claude Code · AgentTerm");
+    expect(html).toContain('title="E:\\AgentTerm"');
+    expect(html).not.toContain(String.raw`\\?\E:\AgentTerm`);
     expect(html).toContain("已结束 · 已停止");
     expect(html).toContain("Codex · Other");
     expect(html).toContain("上次未正常退出");

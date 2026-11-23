@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { PRODUCT_NAME } from "./meta";
 import TaskWorkbench from "./TaskWorkbench";
+import { displayPath } from "./projects/displayPath";
 import { useProjects } from "./projects/useProjects";
 import SessionWorkspace from "./terminal/SessionWorkspace";
 import {
@@ -77,7 +78,7 @@ export default function App() {
       className="workspace-session-link"
       aria-current={launcher.activeId === session.info.id ? "true" : undefined}
       onClick={() => selectSession(session)}
-      title={session.info.projectPath}
+      title={displayPath(session.info.projectPath)}
     >
       <span
         className={`session-dot${session.running ? " is-running" : ""}`}
@@ -136,7 +137,7 @@ export default function App() {
                 aria-current={
                   selectedProject?.id === project.id ? "true" : undefined
                 }
-                title={project.path}
+                title={displayPath(project.path)}
                 onClick={() => {
                   setProjectId(project.id);
                   const recent = launcher.sessions
@@ -221,7 +222,7 @@ export default function App() {
           {selectedProject ? (
             <details className="sidebar-details">
               <summary>项目设置</summary>
-              <p>{selectedProject.path}</p>
+              <p>{displayPath(selectedProject.path)}</p>
               {projects.pendingRemoval ? (
                 <div className="sidebar-removal">
                   <p>
@@ -330,7 +331,7 @@ export default function App() {
                 }
                 className="workspace-tab"
                 key={session.info.id}
-                title={session.info.projectPath}
+                title={displayPath(session.info.projectPath)}
                 onClick={() => selectSession(session)}
                 onKeyDown={(event) => {
                   const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
@@ -489,9 +490,9 @@ export default function App() {
                   </button>
                   <p
                     className="workspace-start-path"
-                    title={selectedProject.path}
+                    title={displayPath(selectedProject.path)}
                   >
-                    {selectedProject.path}
+                    {displayPath(selectedProject.path)}
                   </p>
                 </>
               ) : (
@@ -538,7 +539,7 @@ export default function App() {
                             (item) => item.id === record.toolId,
                           );
                           const reasonTitle = reopenTool
-                            ? record.projectPath
+                            ? displayPath(record.projectPath)
                             : registeredTool
                               ? `${record.toolName}${badgeLabel(registeredTool.state)}`
                               : `未找到 ${record.toolName}`;
@@ -552,7 +553,7 @@ export default function App() {
                                   {record.toolName} ·{" "}
                                   {folderName(record.projectPath)}
                                 </strong>
-                                <span title={record.projectPath}>
+                                <span title={displayPath(record.projectPath)}>
                                   {historyStatusText(record)} ·{" "}
                                   {formatSessionTime(record.startedAtMs)}
                                 </span>
