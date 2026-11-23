@@ -63,6 +63,7 @@
 
 - 崩溃后账本可能仍为 `running/verifying/pausing/waitingInput`，快照按旧 owner 加执行记录返回只读恢复评估，不为展示而改写账本。接回时核对当前版本、所有已记录尝试的 `Exited`、后台派发已结束；跨 owner 时还在账本锁内确认旧协调进程已经退出。存活/未知 owner、缺进程身份、存活或复用 PID 继续阻断。接回增加 revision，保持任务、代次、文档与占用；旧进程不能以旧票据回写。
 - 停止按钮先持久化原始原因再设置停止令牌；relay 识别既有合法请求，不以另一原因覆盖它，停止确认仍由进程层生成。
+- 11 月 23 日补修：Unix 退出证据只来自合法 PID 的 `kill(pid, 0)` 明确 ESRCH，Linux 的 `/proc` 仅核身份；macOS 尚无启动身份探针，存活 PID 返回 `Unknown` 并阻断。relay 已写运行意图后的异常收尾有界推进待核实，绑定任务/代次/owner 和本次版本，不能覆盖后来的派发或审批状态。写入仍失败时，同 owner 的空闲后台加 `running/verifying/pausing` 显示只读恢复入口；人工接回在运行锁内重核进程退出后先写待核实、再接回，失败保留占用。
 - `reassociate_task_session_after_recovery` 仅在当前 owner 的 `recoveredReserved` 阶段执行，账本锁覆盖文档变更。新会话必须仍在运行、属于相同项目和工具；原会话仍存活时拒绝。文档添加有界的 `sessionLinkHistory`（32 条），换绑时追加旧关联，重复同值幂等；不允许静默覆盖、回退历史或复用旧关联 ID。空历史字段不序列化，保持旧文档摘要校验；旧版本遇到新字段会失败关闭，回滚不得直接覆盖新文档。
 - `workbench_snapshot.dispatchActive` 来自当前后端运行状态，界面只在其为真时每 350ms 核对，最长 650 秒，结束或卸载时停止；读取失败保持明确错误，不能把提交回执当成接力完成。恢复后重新派发创建新尝试，不等于 CLI 对话原生 resume。
 

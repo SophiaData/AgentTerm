@@ -282,13 +282,13 @@ pub(crate) fn run_with_start_control(
     output.map_err(|_| ProcessError::OutputRead)?
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn process_start_token(pid: u32) -> Option<String> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_start_token(&text)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_start_token(text: &str) -> Option<String> {
     text.rsplit_once(") ")?
         .1
@@ -299,15 +299,35 @@ fn parse_start_token(text: &str) -> Option<String> {
 
 #[cfg(unix)]
 fn observe_unix(identity: &ProcessIdentity) -> ProcessObservation {
-    if identity.pid == 0 {
+    if identity.pid == 0 || identity.pid > i32::MAX as u32 {
         return ProcessObservation::Unknown;
     }
+    // Signal zero only checks existence. A missing /proc mount (notably on
+    // macOS) is not evidence that a process has exited.
+    if unsafe { libc::kill(identity.pid as i32, 0) } != 0 {
+        return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            ProcessObservation::Exited
+        } else {
+            ProcessObservation::Unknown
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        observe_linux(identity)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Other Unix platforms have no supported birth-identity probe yet.
+        // A live or reused PID must keep recovery blocked.
+        ProcessObservation::Unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_linux(identity: &ProcessIdentity) -> ProcessObservation {
     let stat_path = format!("/proc/{}/stat", identity.pid);
     let text = match std::fs::read_to_string(stat_path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ProcessObservation::Exited;
-        }
         Err(_) => return ProcessObservation::Unknown,
     };
     let Some(expected_token) = identity.start_token.as_deref() else {
@@ -345,7 +365,7 @@ fn observe_windows(identity: &ProcessIdentity) -> ProcessObservation {
     windows_process::observe(identity)
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(crate) fn process_start_token(_pid: u32) -> Option<String> {
     None
 }
@@ -770,6 +790,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", windows))]
     fn process_probe_requires_matching_start_identity() {
         let pid = std::process::id();
         let identity = ProcessIdentity {
@@ -792,9 +813,29 @@ mod tests {
     }
 
     #[test]
-    fn process_probe_classifies_an_absent_pid_as_exited() {
+    fn live_process_without_start_identity_is_never_reported_exited() {
         let identity = ProcessIdentity {
-            pid: u32::MAX,
+            pid: std::process::id(),
+            executable: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            start_token: None,
+        };
+        assert_eq!(observe_process(&identity), ProcessObservation::Unknown);
+    }
+
+    #[test]
+    fn process_probe_classifies_an_absent_pid_as_exited() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let identity = ProcessIdentity {
+            pid,
             executable: std::env::current_exe()
                 .unwrap()
                 .to_string_lossy()
@@ -802,6 +843,19 @@ mod tests {
             start_token: Some("never-started".into()),
         };
         assert_eq!(observe_process(&identity), ProcessObservation::Exited);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn invalid_unix_pid_never_targets_a_process_group_or_proves_exit() {
+        for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+            let identity = ProcessIdentity {
+                pid,
+                executable: "unused".into(),
+                start_token: None,
+            };
+            assert_eq!(observe_process(&identity), ProcessObservation::Unknown);
+        }
     }
 
     #[test]

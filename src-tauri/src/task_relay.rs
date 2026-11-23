@@ -478,6 +478,57 @@ fn phase_from_current(
     phase(ledger, ticket, &current, next)
 }
 
+fn recover_after_failure(
+    ledger: &Ledger,
+    ticket: &Ticket,
+    last: &Snapshot,
+) -> Result<(), crate::task_ledger::LedgerError> {
+    use crate::task_ledger::LedgerError;
+    for retry in 0..5 {
+        let result = (|| {
+            let current = ledger.snapshot()?;
+            let Some(active) = &current.active else {
+                return Ok(());
+            };
+            if current.generation != ticket.generation
+                || active.task_id != ticket.task_id
+                || active.owner_id != ticket.owner_id
+                || !matches!(
+                    active.phase,
+                    Phase::Running | Phase::Verifying | Phase::Pausing
+                )
+            {
+                return Ok(());
+            }
+            // Only our last state or one intervening stop/handoff belongs to
+            // this dispatch. Recovery followed by a new dispatch advances
+            // further; an old failure must never overwrite that new attempt.
+            let next_revision = last.revision.checked_add(1) == Some(current.revision);
+            if current != *last
+                && !(next_revision && matches!(active.phase, Phase::Pausing | Phase::Verifying))
+            {
+                return Ok(());
+            }
+            ledger
+                .set_phase(
+                    &ticket.owner_id,
+                    &ticket.task_id,
+                    ticket.generation,
+                    current.revision,
+                    Phase::RecoveryRequired,
+                )
+                .map(|_| ())
+        })();
+        match result {
+            Err(LedgerError::LockUnavailable | LedgerError::Stale) if retry < 4 => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded recovery attempts always return")
+}
+
 fn run_with(
     ledger: &Ledger,
     ticket: &Ticket,
@@ -538,54 +589,71 @@ fn run_observed_with_start(
         issue: None,
         snapshot: running,
     };
-    let mut worker_session = None;
-    for (index, role) in [Role::Worker, Role::Reviewer].into_iter().enumerate() {
-        if role == Role::Reviewer {
-            outcome.snapshot = phase(ledger, ticket, &outcome.snapshot, Phase::Verifying)?;
-        }
-        let dispatch = format!(
-            "{}:{}:{index}",
-            ticket.generation, outcome.snapshot.revision
-        );
-        let event_sequence = outcome
-            .snapshot
-            .revision
-            .checked_mul(2)
-            .ok_or(RelayError::InvalidPlan)?;
-        let step = if role == Role::Worker {
-            "worker"
-        } else {
-            "reviewer"
-        };
-        let start = AttemptEvent {
-            id: format!("{dispatch}:start"),
-            sequence: event_sequence,
-            attempt_id: dispatch.clone(),
-            step_id: step.into(),
-            state: AttemptState::Running,
-            summary: "已记录执行意图，等待进程结果".into(),
-            process_identity: None,
-            stop: None,
-        };
-        if let Err(error) = record(start) {
-            phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
-            return Err(error);
-        }
-        let prompt = prompt(ticket, plan, role, &dispatch, outcome.worker.as_ref());
-        let cli = if role == Role::Worker {
-            plan.worker
-        } else {
-            plan.reviewer
-        };
-        let result = execute(
-            cli.spec(&binaries[index], &cwd, prompt),
-            plan.timeout,
-            &format!("{dispatch}:start"),
-        )
-        .and_then(|bytes| parse(&bytes, ticket, role, &dispatch));
-        let (report, session) = match result {
-            Ok(result) => result,
-            Err(error) => {
+    let result = (|| {
+        let mut worker_session = None;
+        for (index, role) in [Role::Worker, Role::Reviewer].into_iter().enumerate() {
+            if role == Role::Reviewer {
+                outcome.snapshot = phase(ledger, ticket, &outcome.snapshot, Phase::Verifying)?;
+            }
+            let dispatch = format!(
+                "{}:{}:{index}",
+                ticket.generation, outcome.snapshot.revision
+            );
+            let event_sequence = outcome
+                .snapshot
+                .revision
+                .checked_mul(2)
+                .ok_or(RelayError::InvalidPlan)?;
+            let step = if role == Role::Worker {
+                "worker"
+            } else {
+                "reviewer"
+            };
+            let start = AttemptEvent {
+                id: format!("{dispatch}:start"),
+                sequence: event_sequence,
+                attempt_id: dispatch.clone(),
+                step_id: step.into(),
+                state: AttemptState::Running,
+                summary: "已记录执行意图，等待进程结果".into(),
+                process_identity: None,
+                stop: None,
+            };
+            if let Err(error) = record(start) {
+                phase(ledger, ticket, &outcome.snapshot, Phase::RecoveryRequired)?;
+                return Err(error);
+            }
+            let prompt = prompt(ticket, plan, role, &dispatch, outcome.worker.as_ref());
+            let cli = if role == Role::Worker {
+                plan.worker
+            } else {
+                plan.reviewer
+            };
+            let result = execute(
+                cli.spec(&binaries[index], &cwd, prompt),
+                plan.timeout,
+                &format!("{dispatch}:start"),
+            )
+            .and_then(|bytes| parse(&bytes, ticket, role, &dispatch));
+            let (report, session) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    outcome.snapshot = phase_from_current(ledger, ticket, Phase::RecoveryRequired)?;
+                    record(AttemptEvent {
+                        id: format!("{dispatch}:result"),
+                        sequence: event_sequence + 1,
+                        attempt_id: dispatch,
+                        step_id: step.into(),
+                        state: AttemptState::Unknown,
+                        summary: format!("结果待核实：{error:?}"),
+                        process_identity: None,
+                        stop: Some(stop_evidence(&error)),
+                    })?;
+                    outcome.issue = Some(error);
+                    return Ok(());
+                }
+            };
+            if worker_session.as_ref() == Some(&session) {
                 outcome.snapshot = phase_from_current(ledger, ticket, Phase::RecoveryRequired)?;
                 record(AttemptEvent {
                     id: format!("{dispatch}:result"),
@@ -593,69 +661,60 @@ fn run_observed_with_start(
                     attempt_id: dispatch,
                     step_id: step.into(),
                     state: AttemptState::Unknown,
-                    summary: format!("结果待核实：{error:?}"),
+                    summary: "审查复用了执行会话，不能作为独立验收".into(),
                     process_identity: None,
-                    stop: Some(stop_evidence(&error)),
+                    stop: Some(StopEvidence {
+                        requested: false,
+                        confirmed: false,
+                        reason: "执行会话身份与审查会话相同，停止状态需核实".into(),
+                    }),
                 })?;
-                outcome.issue = Some(error);
-                return Ok(outcome);
+                outcome.issue = Some(RelayError::ReusedSession);
+                return Ok(());
             }
-        };
-        if worker_session.as_ref() == Some(&session) {
-            outcome.snapshot = phase_from_current(ledger, ticket, Phase::RecoveryRequired)?;
-            record(AttemptEvent {
+            let blocked = report.status == ReportStatus::Blocked;
+            let event = AttemptEvent {
                 id: format!("{dispatch}:result"),
                 sequence: event_sequence + 1,
                 attempt_id: dispatch,
                 step_id: step.into(),
-                state: AttemptState::Unknown,
-                summary: "审查复用了执行会话，不能作为独立验收".into(),
+                state: match report.status {
+                    ReportStatus::Blocked => AttemptState::Blocked,
+                    ReportStatus::Fail => AttemptState::Failed,
+                    _ => AttemptState::Reported,
+                },
+                summary: report.summary.clone(),
                 process_identity: None,
                 stop: Some(StopEvidence {
                     requested: false,
-                    confirmed: false,
-                    reason: "执行会话身份与审查会话相同，停止状态需核实".into(),
+                    confirmed: true,
+                    reason: "进程正常退出，隔离范围已清空".into(),
                 }),
-            })?;
-            outcome.issue = Some(RelayError::ReusedSession);
-            return Ok(outcome);
-        }
-        let blocked = report.status == ReportStatus::Blocked;
-        let event = AttemptEvent {
-            id: format!("{dispatch}:result"),
-            sequence: event_sequence + 1,
-            attempt_id: dispatch,
-            step_id: step.into(),
-            state: match report.status {
-                ReportStatus::Blocked => AttemptState::Blocked,
-                ReportStatus::Fail => AttemptState::Failed,
-                _ => AttemptState::Reported,
-            },
-            summary: report.summary.clone(),
-            process_identity: None,
-            stop: Some(StopEvidence {
-                requested: false,
-                confirmed: true,
-                reason: "进程正常退出，隔离范围已清空".into(),
-            }),
-        };
-        if let Err(error) = record(event) {
-            phase_from_current(ledger, ticket, Phase::RecoveryRequired)?;
-            return Err(error);
-        }
-        match role {
-            Role::Worker => {
-                outcome.worker = Some(report);
-                worker_session = Some(session);
+            };
+            if let Err(error) = record(event) {
+                phase_from_current(ledger, ticket, Phase::RecoveryRequired)?;
+                return Err(error);
             }
-            Role::Reviewer => outcome.reviewer = Some(report),
+            match role {
+                Role::Worker => {
+                    outcome.worker = Some(report);
+                    worker_session = Some(session);
+                }
+                Role::Reviewer => outcome.reviewer = Some(report),
+            }
+            if blocked {
+                break;
+            }
         }
-        if blocked {
-            break;
-        }
+        outcome.snapshot = phase(ledger, ticket, &outcome.snapshot, Phase::WaitingInput)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // Preserve the original failure; if persistence remains unavailable,
+        // the workbench also detects an idle runtime in an executing phase.
+        let _ = recover_after_failure(ledger, ticket, &outcome.snapshot);
     }
-    outcome.snapshot = phase(ledger, ticket, &outcome.snapshot, Phase::WaitingInput)?;
-    Ok(outcome)
+    result.map(|()| outcome)
 }
 
 fn stop_evidence(error: &RelayError) -> StopEvidence {
@@ -1108,6 +1167,95 @@ fn main() {
             Phase::WaitingApproval
         );
     }
+
+    #[test]
+    fn stop_racing_with_handoff_or_final_report_keeps_task_recoverable() {
+        for stop_after in ["worker", "reviewer"] {
+            let (ledger, ticket, plan, binaries) = fixture();
+            let mut launches = 0;
+            let result = run_observed(
+                &ledger,
+                &ticket,
+                &plan,
+                &binaries,
+                |spec, _| {
+                    launches += 1;
+                    Ok(response(&spec, |_| {}))
+                },
+                |event| {
+                    if event.step_id == stop_after && event.state == AttemptState::Reported {
+                        let current = ledger.snapshot().unwrap();
+                        ledger
+                            .set_phase(
+                                &ticket.owner_id,
+                                &ticket.task_id,
+                                ticket.generation,
+                                current.revision,
+                                Phase::Pausing,
+                            )
+                            .unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(RelayError::Ledger(_))));
+            assert_eq!(launches, if stop_after == "worker" { 1 } else { 2 });
+            let current = ledger.snapshot().unwrap();
+            assert_eq!(current.generation, ticket.generation);
+            let active = current.active.unwrap();
+            assert_eq!(active.task_id, ticket.task_id);
+            assert_eq!(active.phase, Phase::RecoveryRequired, "{stop_after}");
+        }
+    }
+    #[test]
+    fn late_failure_cleanup_cannot_overwrite_a_new_dispatch_or_owner() {
+        let (ledger, ticket, _, _) = fixture();
+        let last = ledger
+            .set_phase(
+                &ticket.owner_id,
+                &ticket.task_id,
+                ticket.generation,
+                ticket.revision,
+                Phase::Running,
+            )
+            .unwrap();
+        let recovery = ledger
+            .set_phase(
+                &ticket.owner_id,
+                &ticket.task_id,
+                ticket.generation,
+                last.revision,
+                Phase::RecoveryRequired,
+            )
+            .unwrap();
+        let resumed = ledger
+            .resume_after_recovery(
+                &ticket.owner_id,
+                &ticket.task_id,
+                ticket.generation,
+                recovery.revision,
+            )
+            .unwrap();
+        let new_dispatch = ledger
+            .set_phase(
+                &ticket.owner_id,
+                &ticket.task_id,
+                ticket.generation,
+                resumed.revision,
+                Phase::Running,
+            )
+            .unwrap();
+        recover_after_failure(&ledger, &ticket, &last).unwrap();
+        assert_eq!(ledger.snapshot().unwrap(), new_dispatch);
+
+        let wrong_owner = Ticket {
+            owner_id: "another-owner".into(),
+            ..ticket
+        };
+        recover_after_failure(&ledger, &wrong_owner, &new_dispatch).unwrap();
+        assert_eq!(ledger.snapshot().unwrap(), new_dispatch);
+    }
+
     #[test]
     fn persisted_reports_are_readable_and_storage_failure_blocks_handoff() {
         let (ledger, ticket, plan, binaries) = fixture();
@@ -1401,7 +1549,10 @@ fn main() {
             assessment[0].observation,
             RecoveryObservation::LaunchUncertain
         );
+        #[cfg(any(target_os = "linux", windows))]
         assert_eq!(assessment[1].observation, RecoveryObservation::Alive);
+        #[cfg(not(any(target_os = "linux", windows)))]
+        assert_eq!(assessment[1].observation, RecoveryObservation::Unknown);
         assert_eq!(
             ledger.snapshot().unwrap().active.unwrap().phase,
             Phase::Reserved
@@ -1411,6 +1562,13 @@ fn main() {
     #[test]
     fn explicit_recovery_resume_requires_exit_and_fences_late_report() {
         let (ledger, ticket, plan, _) = fixture();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let exited_pid = child.id();
+        child.wait().unwrap();
         let root = plan.project_dir.canonicalize().unwrap();
         let store = DocumentStore::at(&root, &ticket.task_id, ticket.generation).unwrap();
         store
@@ -1445,7 +1603,7 @@ fn main() {
                 state: AttemptState::Running,
                 summary: "旧尝试已停止，等待人工核实".into(),
                 process_identity: Some(crate::task_document::ProcessIdentity {
-                    pid: u32::MAX,
+                    pid: exited_pid,
                     executable: std::env::current_exe()
                         .unwrap()
                         .to_string_lossy()
