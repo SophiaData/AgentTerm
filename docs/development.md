@@ -15,12 +15,15 @@ acceptance criteria remain frozen unless a change is explicitly called out.
 Documentation-only work must preserve the commit and environment of historical
 runtime evidence instead of claiming those checks ran on a new application build.
 
-The user requires serial verification. `pnpm test` uses one worker and disables
-file parallelism. CI sets `RUST_TEST_THREADS=1` and `CARGO_BUILD_JOBS=1`, and the
-Windows quality job waits for the Linux quality job. For local Rust checks use
-the same environment or `-- --test-threads=1`. Concurrency regression fixtures
-still exercise competing processes inside one test; they are not separate
-development agents or parallel test workers.
+Test execution stays serial to keep results deterministic: `pnpm test` uses one
+worker without file parallelism, and CI keeps `RUST_TEST_THREADS=1` (use the
+same setting or `-- --test-threads=1` locally). Per user direction on
+2026-11-24, GitHub Actions allows multi-core compilation, caches Cargo/pnpm
+dependencies via `Swatinem/rust-cache` and `setup-node`, and runs independent
+Linux/Windows/macOS runner jobs concurrently so feedback and packaging do not
+wait serially across VMs. Concurrency regression fixtures still exercise
+competing processes inside one test; they are not separate development agents
+or parallel test workers.
 
 For a new stack, configure real test/typecheck/lint commands in `project-policy.json` before shipping source.
 

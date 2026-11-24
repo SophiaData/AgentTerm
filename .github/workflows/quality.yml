@@ -8,9 +8,12 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: quality-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   RUST_TEST_THREADS: '1'
-  CARGO_BUILD_JOBS: '1'
 
 jobs:
   quality:
@@ -38,6 +41,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+            agentterm-tui -> target
+
       - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update
@@ -50,7 +59,6 @@ jobs:
         run: pnpm check
 
   windows-frontend:
-    needs: quality
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
@@ -77,6 +85,10 @@ jobs:
         run: pnpm build
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
 
       - name: Test native persistence and recovery on Windows
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
