@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::journal;
 
 pub const HISTORY_LIMIT: usize = 50;
 const HISTORY_BYTES: u64 = 2 * 1024 * 1024;
@@ -77,14 +77,6 @@ enum HistoryEvent {
     },
 }
 
-struct HistoryLock(File);
-
-impl Drop for HistoryLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
 /// The immutable, validated storage location. Reads and writes take the
 /// companion lock and append verified event lines; a partial or damaged tail
 /// fails closed and never resets the original file.
@@ -149,15 +141,8 @@ impl SessionHistory {
             }
             return Ok(Vec::new());
         }
-        let guard = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&guard_path)
-            .map_err(storage_error)?;
-        guard
-            .try_lock()
+        let _lock = journal::lock_with_retry(&guard_path, false)
             .map_err(|_| "会话历史正被另一操作使用，请重试".to_string())?;
-        let _lock = HistoryLock(guard);
         let (_, mut records, _) = self.read_existing()?;
         trim_to_limit(&mut records);
         records.reverse();
@@ -168,23 +153,14 @@ impl SessionHistory {
         if !regular_or_missing(&self.path)? {
             return Ok((0, Vec::new(), 0));
         }
-        let file = File::open(&self.path).map_err(storage_error)?;
-        let length = file.metadata().map_err(storage_error)?.len();
-        if length > HISTORY_BYTES {
-            return Err("会话历史超过2 MiB上限，请核实".to_string());
-        }
-        let mut bytes = Vec::with_capacity(length as usize);
-        file.take(HISTORY_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(storage_error)?;
-        if bytes.len() as u64 > HISTORY_BYTES {
-            return Err("会话历史超过2 MiB上限，请核实".to_string());
-        }
+        let length = self.path.metadata().map_err(storage_error)?.len();
+        let bytes =
+            journal::read_bytes(&self.path, journal::HARD_READ_LIMIT).map_err(storage_error)?;
         if !bytes.is_empty() && !bytes.ends_with(b"\n") {
             return Err(invalid_store());
         }
         let text = std::str::from_utf8(&bytes).map_err(|_| invalid_store())?;
-        let mut revision = 0u64;
+        let mut revision = None;
         let mut records = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for line in text.split_terminator('\n') {
@@ -193,15 +169,15 @@ impl SessionHistory {
             }
             let saved: HistoryLine = serde_json::from_str(line).map_err(|_| invalid_store())?;
             if saved.schema != 2
-                || revision.checked_add(1) != Some(saved.revision)
+                || !journal::revision_follows(revision, saved.revision)
                 || saved.sha256 != history_hash(saved.revision, &saved.event)?
             {
                 return Err(invalid_store());
             }
             apply_event(&mut records, &mut seen, saved.event)?;
-            revision = saved.revision;
+            revision = Some(saved.revision);
         }
-        Ok((revision, records, length))
+        Ok((revision.unwrap_or_default(), records, length))
     }
 
     fn append(&self, event: HistoryEvent) -> Result<(), String> {
@@ -211,19 +187,9 @@ impl SessionHistory {
         if initial_data_exists && !guard_exists {
             return Err("会话历史缺少锁文件；保留原文件，需核实".to_string());
         }
-        let guard = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&guard_path)
-            .map_err(storage_error)?;
-        guard
-            .try_lock()
+        let _lock = journal::lock_with_retry(&guard_path, true)
             .map_err(|_| "会话历史正被另一操作使用，请重试".to_string())?;
-        let _lock = HistoryLock(guard);
 
-        let data_exists = regular_or_missing(&self.path)?;
         let (revision, mut records, existing_len) = self.read_existing()?;
         let mut seen = records
             .iter()
@@ -241,25 +207,30 @@ impl SessionHistory {
         let mut bytes = line;
         bytes.push(b'\n');
         if existing_len + bytes.len() as u64 > HISTORY_BYTES {
-            return Err("会话历史超过2 MiB上限，请核实".to_string());
+            trim_to_limit(&mut records);
+            let mut compacted = Vec::new();
+            let mut compact_revision = revision;
+            for record in records.into_iter() {
+                let revision = compact_revision.checked_add(1).ok_or_else(invalid_store)?;
+                let event = HistoryEvent::Start { record };
+                let row = serde_json::to_vec(&HistoryLine {
+                    schema: 2,
+                    revision,
+                    sha256: history_hash(revision, &event)?,
+                    event,
+                })
+                .map_err(|_| "会话历史无法序列化".to_string())?;
+                compacted.extend(row);
+                compacted.push(b'\n');
+                compact_revision = revision;
+            }
+            if compacted.len() as u64 > HISTORY_BYTES {
+                return Err("会话历史有效记录本身超过 2 MiB".into());
+            }
+            journal::replace_and_archive(&self.path, &compacted).map_err(storage_error)?;
+            return Ok(());
         }
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create_new(!data_exists)
-            .open(&self.path)
-            .map_err(storage_error)?;
-        file.write_all(&bytes).map_err(storage_error)?;
-        file.sync_all().map_err(storage_error)?;
-        #[cfg(unix)]
-        if !data_exists {
-            File::open(
-                self.path
-                    .parent()
-                    .ok_or_else(|| "会话历史位置无效".to_string())?,
-            )
-            .and_then(|dir| dir.sync_all())
-            .map_err(storage_error)?;
-        }
+        journal::append(&self.path, &bytes, existing_len == 0).map_err(storage_error)?;
         Ok(())
     }
 }
@@ -368,18 +339,11 @@ fn storage_error(_: std::io::Error) -> String {
 }
 
 fn companion(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".lock");
-    PathBuf::from(name)
+    journal::companion(path, ".lock")
 }
 
 fn regular_or_missing(path: &Path) -> Result<bool, String> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(true),
-        Ok(_) => Err("会话历史必须是普通文件，不能是链接".to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(storage_error(error)),
-    }
+    journal::regular_or_missing(path).map_err(|_| "会话历史必须是普通文件，不能是链接".to_string())
 }
 
 #[cfg(test)]
@@ -622,5 +586,54 @@ mod tests {
         history.record_rename("legacy-1", "旧记录改名").unwrap();
         let after = history.list().unwrap();
         assert_eq!(after[0].title.as_deref(), Some("旧记录改名"));
+    }
+
+    #[test]
+    fn append_compaction_keeps_recent_history_and_revision_sequence() {
+        let path = temp_store("compact");
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        let mut bytes = Vec::new();
+        let mut newest = 0;
+        for revision in 1..=400 {
+            let mut item = record(&format!("history-{revision}"), revision);
+            item.tool_name = "Claude Code ".to_string() + &"x".repeat(240);
+            item.project_path = root.to_string() + &"y".repeat(4000);
+            let event = super::HistoryEvent::Start { record: item };
+            let mut row = serde_json::to_vec(&super::HistoryLine {
+                schema: 2,
+                revision,
+                sha256: super::history_hash(revision, &event).unwrap(),
+                event,
+            })
+            .unwrap();
+            row.push(b'\n');
+            if bytes.len() as u64 + row.len() as u64 > super::HISTORY_BYTES {
+                break;
+            }
+            bytes.extend_from_slice(&row);
+            newest = revision;
+        }
+        assert!(newest > super::HISTORY_LIMIT as u64);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(PathBuf::from(format!("{}.lock", path.display())), b"").unwrap();
+        let history = SessionHistory::configure(path.clone()).unwrap();
+        history
+            .record_start({
+                let mut item = record("history-new", newest + 1);
+                item.tool_name = "Claude Code ".to_string() + &"x".repeat(240);
+                item.project_path = root.to_string() + &"y".repeat(4000);
+                item
+            })
+            .unwrap();
+        let listed = history.list().unwrap();
+        assert_eq!(listed.len(), super::HISTORY_LIMIT);
+        assert_eq!(listed[0].id, "history-new");
+        assert!(std::fs::metadata(&path).unwrap().len() <= super::HISTORY_BYTES);
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".archive-"))
+        );
     }
 }

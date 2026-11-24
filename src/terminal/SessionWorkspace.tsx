@@ -11,6 +11,10 @@ type Props = {
   onFocus: (id: string) => void;
   onClose: (id: string) => void;
   onExit: (id: string, reason: string) => void;
+  onConnection: (
+    id: string,
+    phase: "connecting" | "ready" | "exited" | "error",
+  ) => void;
   onRename: (id: string, title: string) => Promise<RenameResult>;
   onPromptLine: (id: string, line: string) => void;
 };
@@ -29,6 +33,7 @@ export default function SessionWorkspace({
   onFocus,
   onClose,
   onExit,
+  onConnection,
   onRename,
   onPromptLine,
 }: Props) {
@@ -109,11 +114,13 @@ export default function SessionWorkspace({
               focused={focused}
               focusRequest={focusRequest}
               running={session.running}
+              statusUnknown={session.statusUnknown}
               exitReason={session.exitReason}
               busy={closingId === session.info.id}
               closeError={session.closeError}
               onClose={() => onClose(session.info.id)}
               onExit={onExit}
+              onConnection={onConnection}
               onRename={(title) => onRename(session.info.id, title)}
               onPromptLine={onPromptLine}
             />

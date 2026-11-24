@@ -9,9 +9,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::journal;
+
 const HEADER: &[u8] = b"AGENTTERM_TASK_LEDGER\t1\n";
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_FIELD_BYTES: usize = 1024;
+const COMPACT_MARGIN: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -341,6 +344,39 @@ impl Ledger {
         })
     }
 
+    /// Explicit human-confirmed completion/recovery exit. A task in
+    /// `waitingInput` or `recoveryRequired` can release the single main-task
+    /// slot only after the caller has verified that no recorded process is
+    /// still alive. For a previous backend owner, OS absence is rechecked while
+    /// the ledger lock is held.
+    pub fn release_completed_or_recovered(
+        &self,
+        new_owner: &str,
+        task_id: &str,
+        generation: u64,
+        expected_revision: u64,
+    ) -> Result<Snapshot, LedgerError> {
+        validate_field(new_owner)?;
+        self.with_locked(|file| {
+            let mut state = read_snapshot(file)?;
+            let task = state.active.as_ref().ok_or(LedgerError::Stale)?;
+            if state.generation != generation
+                || state.revision != expected_revision
+                || task.task_id != task_id
+                || !matches!(task.phase, Phase::WaitingInput | Phase::RecoveryRequired)
+            {
+                return Err(LedgerError::CannotRelease);
+            }
+            if task.owner_id != new_owner && !owner_has_exited(&task.owner_id) {
+                return Err(LedgerError::RecoveryRequired);
+            }
+            state.active = None;
+            state.revision = next(state.revision)?;
+            append(file, &state)?;
+            Ok(state)
+        })
+    }
+
     /// Only an untouched reservation whose old process is demonstrably gone.
     /// The caller cannot supply a PID, owner, or a frontend "stopped" assertion.
     /// Old clients reject recoveredReserved as an unknown phase (fail closed).
@@ -444,10 +480,21 @@ impl Ledger {
         validate_file_path(&self.path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         lock(&file)?;
+        let current = read_snapshot(&mut file)?;
+        let file_len = file.metadata()?.len();
+        if file_len.saturating_add(COMPACT_MARGIN) > MAX_BYTES {
+            let mut compacted = HEADER.to_vec();
+            compacted.extend_from_slice(record(&current).as_bytes());
+            drop(file);
+            journal::replace_and_archive(&self.path, &compacted)?;
+            file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            lock(&file)?;
+        }
         let data = DataGuard(&mut file);
-        // The file itself is never replaced, renamed or truncated by this API.
-        // All operations acquire guard then data, in that order. Neither file
-        // is replaced or removed; process exit releases locks, not occupancy.
+        // All operations acquire guard then data, in that order. Compaction
+        // archives the prior journal and atomically installs one verified
+        // snapshot before the next mutation. Process exit releases locks, not
+        // durable occupancy.
         operation(data.0)
     }
 }
@@ -649,7 +696,16 @@ fn validate_transition(before: &Snapshot, after: &Snapshot) -> Result<(), Ledger
             before.generation.checked_add(1) == Some(after.generation)
                 && task.phase == Phase::Reserved
         }
-        (Some(task), None) => before.generation == after.generation && task.phase.is_reserved(),
+        (Some(task), None) => {
+            before.generation == after.generation
+                && matches!(
+                    task.phase,
+                    Phase::Reserved
+                        | Phase::RecoveredReserved
+                        | Phase::WaitingInput
+                        | Phase::RecoveryRequired
+                )
+        }
         (Some(old), Some(new)) => {
             before.generation == after.generation
                 && old.task_id == new.task_id
@@ -684,13 +740,18 @@ fn read_snapshot(file: &mut File) -> Result<Snapshot, LedgerError> {
         return Err(LedgerError::InvalidData);
     }
     let body = std::str::from_utf8(&bytes[HEADER.len()..]).map_err(|_| LedgerError::InvalidData)?;
-    let mut state = Snapshot::default();
+    let mut state: Option<Snapshot> = None;
     for line in body.split_terminator('\n') {
         let after = parse_record(line)?;
-        validate_transition(&state, &after)?;
-        state = after;
+        if after.revision == 0 {
+            return Err(LedgerError::InvalidData);
+        }
+        if let Some(before) = &state {
+            validate_transition(before, &after)?;
+        }
+        state = Some(after);
     }
-    Ok(state)
+    Ok(state.unwrap_or_default())
 }
 
 fn append(file: &mut File, state: &Snapshot) -> Result<(), LedgerError> {
@@ -880,6 +941,22 @@ mod tests {
                 Err(LedgerError::CannotRelease)
             ));
         }
+    }
+
+    #[test]
+    fn completed_task_can_be_explicitly_released_after_verification() {
+        let ledger = fresh();
+        let mut state = ledger.claim("task", "project", "owner").unwrap();
+        for phase in [Phase::Running, Phase::Verifying, Phase::WaitingInput] {
+            state = ledger
+                .set_phase("owner", "task", 1, state.revision, phase)
+                .unwrap();
+        }
+        let released = ledger
+            .release_completed_or_recovered("owner", "task", 1, state.revision)
+            .unwrap();
+        assert!(released.active.is_none());
+        ledger.claim("next", "project", "owner").unwrap();
     }
 
     #[test]
@@ -1342,5 +1419,57 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(&ledger.path).unwrap(), damaged);
+    }
+
+    #[test]
+    fn append_compaction_archives_history_and_allows_the_next_transition() {
+        let ledger = fresh();
+        let long = "x".repeat(900);
+        let mut state = Snapshot {
+            revision: 1,
+            generation: 1,
+            active: Some(ActiveTask {
+                task_id: long.clone(),
+                project_id: long.clone(),
+                owner_id: long,
+                phase: Phase::Reserved,
+            }),
+        };
+        let mut bytes = HEADER.to_vec();
+        bytes.extend_from_slice(record(&state).as_bytes());
+        for revision in 2..=1542 {
+            state.revision = revision;
+            state.active.as_mut().unwrap().phase = if revision % 2 == 0 {
+                Phase::Running
+            } else {
+                Phase::Verifying
+            };
+            bytes.extend_from_slice(record(&state).as_bytes());
+        }
+        assert!(bytes.len() as u64 <= MAX_BYTES);
+        fs::write(&ledger.path, &bytes).unwrap();
+
+        let active = state.active.as_ref().unwrap();
+        let updated = ledger
+            .set_phase(
+                &active.owner_id,
+                &active.task_id,
+                1,
+                1542,
+                Phase::WaitingInput,
+            )
+            .unwrap();
+        assert_eq!(updated.revision, 1543);
+        let compacted_len = fs::metadata(&ledger.path).unwrap().len();
+        assert!(
+            compacted_len < 64 * 1024,
+            "ledger remained {compacted_len} bytes"
+        );
+        assert!(
+            fs::read_dir(ledger.path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".archive-"))
+        );
     }
 }

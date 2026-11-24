@@ -11,6 +11,11 @@ type Props = {
   running: boolean;
   busy: boolean;
   onExit: (id: string, reason: string) => void;
+  onConnection: (
+    id: string,
+    phase: ConnectionPhase,
+    error: string | null,
+  ) => void;
   onPromptLine?: (id: string, line: string) => void;
 };
 
@@ -22,6 +27,7 @@ export default function TerminalView({
   running,
   busy,
   onExit,
+  onConnection,
   onPromptLine,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -31,6 +37,7 @@ export default function TerminalView({
     running,
     busy,
     onExit,
+    onConnection,
     onPromptLine,
   });
   current.current = {
@@ -39,6 +46,7 @@ export default function TerminalView({
     running,
     busy,
     onExit,
+    onConnection,
     onPromptLine,
   };
   const controls = useRef<{
@@ -168,6 +176,7 @@ export default function TerminalView({
             localPhase = next;
             setPhase(next);
             setProblem(error);
+            current.current.onConnection(session.id, next, error);
             input();
             if (next === "ready") {
               frames.push(

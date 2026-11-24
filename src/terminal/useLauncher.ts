@@ -1,4 +1,4 @@
-import { useMemo, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useSyncExternalStore } from "react";
 import type { Project } from "../projects/types";
 import type { ToolStatus } from "../tools/types";
 import {
@@ -18,6 +18,7 @@ export type ActiveSession = {
   label: string;
   titleSource: TitleSource;
   running: boolean;
+  statusUnknown: boolean;
   exitReason: string | null;
   closeError: string | null;
 };
@@ -51,6 +52,7 @@ export function createSessionStore(invoke: Invoke) {
   };
   let sequence = 0;
   let operation = false;
+  let reconciling = false;
   const renameEpochs = new Map<string, number>();
   const autoNaming = new Set<string>();
   const listeners = new Set<() => void>();
@@ -133,6 +135,7 @@ export function createSessionStore(invoke: Invoke) {
         label: info.title?.trim() || `${tool.name} · ${++sequence}`,
         titleSource: info.title?.trim() ? "manual" : "default",
         running: true,
+        statusUnknown: false,
         exitReason: null,
         closeError: null,
       };
@@ -150,9 +153,115 @@ export function createSessionStore(invoke: Invoke) {
     if (!state.sessions.some((s) => s.info.id === id)) return;
     update({
       sessions: state.sessions.map((s) =>
-        s.info.id === id ? { ...s, running: false, exitReason: reason } : s,
+        s.info.id === id
+          ? {
+              ...s,
+              running: false,
+              statusUnknown: false,
+              exitReason: reason,
+            }
+          : s,
       ),
     });
+  };
+
+  const handleConnection = (
+    id: string,
+    phase: "connecting" | "ready" | "exited" | "error",
+  ) => {
+    if (!state.sessions.some((session) => session.info.id === id)) return;
+    if (phase === "error") {
+      update({
+        sessions: state.sessions.map((session) =>
+          session.info.id === id
+            ? { ...session, statusUnknown: true }
+            : session,
+        ),
+      });
+    } else if (phase === "ready") {
+      update({
+        sessions: state.sessions.map((session) =>
+          session.info.id === id
+            ? { ...session, statusUnknown: false }
+            : session,
+        ),
+      });
+    }
+  };
+
+  /**
+   * Rebuilds the tab list from the backend-owned PTY map. This is the recovery
+   * path after a WebView reload, renderer crash, window restore or focus.
+   */
+  const reconcile = async (): Promise<boolean> => {
+    if (operation || reconciling) return false;
+    reconciling = true;
+    try {
+      const live = await invoke<SessionInfo[]>("list_sessions", {});
+      const liveById = new Map(live.map((info) => [info.id, info]));
+      const known = new Set(state.sessions.map((session) => session.info.id));
+      const sessions = state.sessions.map((session) => {
+        const info = liveById.get(session.info.id);
+        if (info) {
+          return {
+            ...session,
+            info: {
+              ...session.info,
+              ...info,
+              title: info.title ?? session.info.title,
+            },
+            running: true,
+            statusUnknown: false,
+            exitReason: null,
+          };
+        }
+        return session.running
+          ? {
+              ...session,
+              running: false,
+              statusUnknown: false,
+              exitReason: session.exitReason ?? "后端会话已结束",
+            }
+          : session;
+      });
+      for (const info of live) {
+        if (known.has(info.id)) continue;
+        sessions.push({
+          info,
+          label: info.title?.trim() || `${info.toolName} · ${++sequence}`,
+          titleSource: info.title?.trim() ? "manual" : "default",
+          running: true,
+          statusUnknown: false,
+          exitReason: null,
+          closeError: null,
+        });
+      }
+      const activeId =
+        state.activeId &&
+        sessions.some((item) => item.info.id === state.activeId)
+          ? state.activeId
+          : null;
+      const paneIds = state.paneIds.filter((id) =>
+        sessions.some((item) => item.info.id === id),
+      );
+      update({
+        sessions,
+        activeId,
+        paneIds: paneIds.length || !activeId ? paneIds : [activeId],
+        startError: null,
+      });
+      return true;
+    } catch (error) {
+      update({
+        sessions: state.sessions.map((session) =>
+          session.running ? { ...session, statusUnknown: true } : session,
+        ),
+        startError: `无法核对后台会话：${errorMessage(error)}`,
+      });
+      return false;
+    } finally {
+      reconciling = false;
+    }
   };
 
   const rename = async (
@@ -235,20 +344,29 @@ export function createSessionStore(invoke: Invoke) {
         s.info.id === id ? { ...s, closeError: null } : s,
       ),
     });
+    let forgotten = false;
     try {
       if (previous.running) {
         try {
           await invoke("stop_session", { sessionId: id });
         } catch (error) {
-          const snapshot = await invoke<{ running: boolean }>(
-            "session_snapshot",
-            { sessionId: id },
-          );
-          if (snapshot.running) throw error;
+          try {
+            const snapshot = await invoke<{ running: boolean }>(
+              "session_snapshot",
+              { sessionId: id },
+            );
+            if (snapshot.running) throw error;
+          } catch (snapshotError) {
+            if (snapshotError === error) throw error;
+            // No live backend record exists. forget_session also rejects a
+            // live PTY, so this safely removes an already-ended orphan tab.
+            await invoke("forget_session", { sessionId: id });
+            forgotten = true;
+          }
         }
       }
       // Release archived output as well; the native command rejects live PTYs.
-      await invoke("forget_session", { sessionId: id });
+      if (!forgotten) await invoke("forget_session", { sessionId: id });
       renameEpochs.delete(id);
       autoNaming.delete(id);
       const index = state.sessions.findIndex((s) => s.info.id === id);
@@ -298,6 +416,8 @@ export function createSessionStore(invoke: Invoke) {
     start,
     close,
     handleExit,
+    handleConnection,
+    reconcile,
     rename,
     autoName,
   };
@@ -319,6 +439,19 @@ export function useLauncher() {
     store.getSnapshot,
     store.getSnapshot,
   );
+  useEffect(() => {
+    void store.reconcile();
+    const reconcileOnFocus = () => void store.reconcile();
+    const reconcileWhenVisible = () => {
+      if (document.visibilityState === "visible") void store.reconcile();
+    };
+    window.addEventListener("focus", reconcileOnFocus);
+    document.addEventListener("visibilitychange", reconcileWhenVisible);
+    return () => {
+      window.removeEventListener("focus", reconcileOnFocus);
+      document.removeEventListener("visibilitychange", reconcileWhenVisible);
+    };
+  }, [store]);
   return {
     ...state,
     session: state.sessions.find((s) => s.info.id === state.activeId) ?? null,
@@ -331,6 +464,8 @@ export function useLauncher() {
     start: store.start,
     close: store.close,
     handleExit: store.handleExit,
+    handleConnection: store.handleConnection,
+    reconcile: store.reconcile,
     rename: store.rename,
     autoName: store.autoName,
   };

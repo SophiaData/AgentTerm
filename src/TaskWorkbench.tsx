@@ -46,6 +46,7 @@ export function TaskCard({
   onCancel,
   onRecover,
   onResumeAfterRecovery,
+  onReleaseCompleted,
   onRefresh,
   currentSession,
   onAssociateSession,
@@ -62,6 +63,7 @@ export function TaskCard({
   onCancel: () => void;
   onRecover: (release: boolean) => void;
   onResumeAfterRecovery: () => void;
+  onReleaseCompleted?: () => void;
   onRefresh: () => void;
   currentSession: SessionInfo | null;
   onAssociateSession: () => void;
@@ -69,9 +71,9 @@ export function TaskCard({
   onDispatch: () => void;
   onStop: () => void;
 }) {
-  const [confirmation, setConfirmation] = useState<"cancel" | "release" | null>(
-    null,
-  );
+  const [confirmation, setConfirmation] = useState<
+    "cancel" | "release" | "complete" | null
+  >(null);
   const confirmationRef = useRef<HTMLElement>(null);
   useEffect(() => {
     if (confirmation) confirmationRef.current?.focus();
@@ -86,6 +88,12 @@ export function TaskCard({
     reserved &&
     (!document || document.events.length === 0);
   const recovery = view.recovery;
+  const canManuallyCompleteRecovery =
+    active.recoveryRequired &&
+    !!recovery?.attempts.length &&
+    recovery.attempts.every((attempt) =>
+      ["exited", "launchUncertain"].includes(attempt.observation),
+    );
   const sessionLink = document?.sessionLink ?? null;
   const canAssociateSession =
     !!document &&
@@ -260,6 +268,15 @@ export function TaskCard({
                     核实并接回任务
                   </button>
                 ) : null}
+                {canManuallyCompleteRecovery ? (
+                  <button
+                    className="danger-button"
+                    disabled={busy}
+                    onClick={() => setConfirmation("complete")}
+                  >
+                    人工核实并结束任务
+                  </button>
+                ) : null}
               </div>
             </>
           )}
@@ -275,6 +292,21 @@ export function TaskCard({
             {phaseMessages[active.phase] ??
               "当前状态无法识别，系统保留任务占用，请重新读取后再决定下一步。"}
           </p>
+          {active.phase === "waitingInput" ? (
+            <div className="action-row">
+              <button
+                type="button"
+                className="primary-button"
+                disabled={busy}
+                onClick={() => setConfirmation("complete")}
+              >
+                确认完成并释放任务
+              </button>
+              <span>
+                系统会再次核验执行进程；进程全部退出后才能开始下一项任务。
+              </span>
+            </div>
+          ) : null}
         </section>
       ) : (
         <section className="task-notice" aria-label="下一步">
@@ -505,45 +537,54 @@ export function TaskCard({
           <span>停止请求会先写入任务记录；确认前任务仍保持占用。</span>
         </div>
       )}
-      {confirmation &&
-        ((confirmation === "cancel" && editable && reserved) ||
-          (confirmation === "release" && canRecover)) && (
-          <section
-            ref={confirmationRef}
-            tabIndex={-1}
-            className="confirmation-panel"
-            role="group"
-            aria-label="确认结束任务"
-          >
-            <h3>
+      {confirmation && (
+        <section
+          ref={confirmationRef}
+          tabIndex={-1}
+          className="confirmation-panel"
+          role="group"
+          aria-label="确认结束任务"
+        >
+          <h3>
+            {confirmation === "cancel"
+              ? "取消这项尚未执行的任务？"
+              : confirmation === "release"
+                ? "核实后结束本次安排？"
+                : "确认任务已完成并释放占用？"}
+          </h3>
+          <p>
+            {confirmation === "complete"
+              ? "请先人工核对交付结果和进程状态。释放后计划和文件记录保留，可以安排下一项任务。"
+              : "计划和文件记录会保留。确认后才能安排下一项任务。"}
+          </p>
+          <div className="action-row">
+            <button
+              className="ghost-button"
+              disabled={busy}
+              onClick={() => setConfirmation(null)}
+            >
+              返回任务
+            </button>
+            <button
+              className="danger-button"
+              disabled={busy}
+              onClick={() => {
+                const action = confirmation;
+                setConfirmation(null);
+                if (action === "cancel") onCancel();
+                else if (action === "release") onRecover(true);
+                else onReleaseCompleted?.();
+              }}
+            >
               {confirmation === "cancel"
-                ? "取消这项尚未执行的任务？"
-                : "核实后结束本次安排？"}
-            </h3>
-            <p>计划和文件记录会保留。确认后才能安排下一项任务。</p>
-            <div className="action-row">
-              <button
-                className="ghost-button"
-                disabled={busy}
-                onClick={() => setConfirmation(null)}
-              >
-                返回任务
-              </button>
-              <button
-                className="danger-button"
-                disabled={busy}
-                onClick={() => {
-                  const action = confirmation;
-                  setConfirmation(null);
-                  if (action === "cancel") onCancel();
-                  else onRecover(true);
-                }}
-              >
-                {confirmation === "cancel" ? "确认取消任务" : "核实并结束安排"}
-              </button>
-            </div>
-          </section>
-        )}
+                ? "确认取消任务"
+                : confirmation === "release"
+                  ? "核实并结束安排"
+                  : "确认完成并释放"}
+            </button>
+          </div>
+        </section>
+      )}
     </article>
   );
 }
@@ -1065,6 +1106,13 @@ export default function TaskWorkbench({
               "resume_main_task_after_recovery",
               ticket(),
               "旧执行尝试已确认退出，任务已接回，可以继续派发。",
+            )
+          }
+          onReleaseCompleted={() =>
+            void act(
+              "release_completed_task",
+              ticket(),
+              "任务已完成并释放，可以安排下一项任务。",
             )
           }
           onRefresh={() => {

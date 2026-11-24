@@ -618,6 +618,7 @@ fn wait_for_drain(
     true
 }
 
+#[derive(Clone)]
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
     /// Last output of sessions that have already exited, keyed by session id.
@@ -965,6 +966,18 @@ impl SessionManager {
             .ok_or_else(|| "会话不存在或已结束".to_string())
     }
 
+    /// The renderer uses this snapshot to recover tabs after a WebView reload
+    /// or renderer crash. Only live PTYs owned by this backend are returned.
+    pub fn list_live(&self) -> Result<Vec<SessionInfo>, String> {
+        let sessions = self.lock()?;
+        let mut result = sessions
+            .values()
+            .map(|session| session.info.clone())
+            .collect::<Vec<_>>();
+        result.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(result)
+    }
+
     pub fn write(&self, session_id: &str, data: &str) -> Result<(), String> {
         let mut sessions = self.lock()?;
         let session = sessions
@@ -1165,12 +1178,20 @@ pub fn session_snapshot(
 }
 
 #[tauri::command]
-pub fn write_session_input(
+pub fn list_sessions(state: tauri::State<'_, SessionManager>) -> Result<Vec<SessionInfo>, String> {
+    state.list_live()
+}
+
+#[tauri::command]
+pub async fn write_session_input(
     state: tauri::State<'_, SessionManager>,
     session_id: String,
     data: String,
 ) -> Result<(), String> {
-    state.write(&session_id, &data)
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.write(&session_id, &data))
+        .await
+        .map_err(|error| format!("终端输入线程异常：{error}"))?
 }
 
 #[tauri::command]
@@ -1782,6 +1803,21 @@ mod tests {
         assert_eq!(info.id, "owned");
         assert_eq!(info.tool_id, "claude");
         assert!(manager.session_info("missing").is_err());
+    }
+
+    #[test]
+    fn list_sessions_returns_only_live_sessions_in_stable_order() {
+        let manager = super::SessionManager::default();
+        insert_fake_session(&manager, "b-session", false);
+        insert_fake_session(&manager, "a-session", false);
+        let listed = manager.list_live().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-session", "b-session"]
+        );
     }
 
     #[test]

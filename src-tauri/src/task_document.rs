@@ -2,8 +2,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+
+use crate::journal;
 
 const HEADER: &str = "AGENTTERM_TASK_DOCUMENT\t1\n";
 const JOURNAL_LIMIT: u64 = 8 * 1024 * 1024;
@@ -135,13 +137,6 @@ pub struct DocumentStore {
     guard: PathBuf,
 }
 
-struct DocumentGuard(File);
-impl Drop for DocumentGuard {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
 fn io_error(_: impl std::fmt::Display) -> String {
     "任务文档读写失败；保留占用，请重新核实".into()
 }
@@ -182,20 +177,12 @@ impl DocumentStore {
         let guard = directory.join(format!("{name}.lock"));
         Ok(Self { path, guard })
     }
-    fn lock(&self, create: bool) -> Result<DocumentGuard, String> {
+    fn lock(&self, create: bool) -> Result<journal::JournalLock, String> {
         if self.guard.exists() || fs::symlink_metadata(&self.guard).is_ok() {
             regular(&self.guard)?;
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(create)
-            .truncate(false)
-            .open(&self.guard)
-            .map_err(io_error)?;
-        file.try_lock()
-            .map_err(|_| "任务文档正被其他操作占用，请重试".to_string())?;
-        Ok(DocumentGuard(file))
+        journal::lock_with_retry(&self.guard, create)
+            .map_err(|_| "任务文档正被其他操作占用，请重试".to_string())
     }
     fn open(&self) -> Result<File, String> {
         regular(&self.path)?;
@@ -227,17 +214,11 @@ impl DocumentStore {
             session_link: None,
             session_link_history: Vec::new(),
         };
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.path)
-            .map_err(io_error)?;
-        file.write_all(HEADER.as_bytes()).map_err(io_error)?;
-        append(&mut file, &document)?;
-        #[cfg(unix)]
-        File::open(self.path.parent().ok_or_else(invalid)?)
-            .and_then(|parent| parent.sync_all())
-            .map_err(io_error)?;
+        let line = encoded_record(&document)?;
+        let mut bytes = Vec::with_capacity(HEADER.len() + line.len());
+        bytes.extend_from_slice(HEADER.as_bytes());
+        bytes.extend_from_slice(&line);
+        journal::append(&self.path, &bytes, true).map_err(io_error)?;
         Ok(document)
     }
     pub fn snapshot(&self) -> Result<Document, String> {
@@ -268,7 +249,8 @@ impl DocumentStore {
         if apply(&mut document)? {
             document.revision = document.revision.checked_add(1).ok_or_else(invalid)?;
             validate_document(&document)?;
-            append(&mut file, &document)?;
+            drop(file);
+            append_or_compact(&self.path, &document)?;
         }
         Ok(document)
     }
@@ -650,11 +632,12 @@ fn read(file: &mut File) -> Result<Document, String> {
             {
                 return Err(invalid());
             }
-        } else if record.document.revision != 1
-            || !record.document.events.is_empty()
-            || !record.document.artifacts.is_empty()
-            || record.document.session_link.is_some()
-            || !record.document.session_link_history.is_empty()
+        } else if record.document.revision == 0
+            || (record.document.revision == 1
+                && (!record.document.events.is_empty()
+                    || !record.document.artifacts.is_empty()
+                    || record.document.session_link.is_some()
+                    || !record.document.session_link_history.is_empty()))
         {
             return Err(invalid());
         }
@@ -704,7 +687,7 @@ fn event_history_preserved(old: &AttemptEvent, current: &AttemptEvent) -> bool {
     let stop_preserved = old.stop == current.stop || stop_added;
     identity_preserved && stop_preserved && (identity_added || stop_added)
 }
-fn append(file: &mut File, document: &Document) -> Result<(), String> {
+fn encoded_record(document: &Document) -> Result<Vec<u8>, String> {
     let encoded = serde_json::to_vec(document).map_err(io_error)?;
     let record = Record {
         document: document.clone(),
@@ -712,14 +695,24 @@ fn append(file: &mut File, document: &Document) -> Result<(), String> {
     };
     let mut line = serde_json::to_vec(&record).map_err(io_error)?;
     line.push(b'\n');
-    if line.len() > RECORD_LIMIT
-        || file.metadata().map_err(io_error)?.len() + line.len() as u64 > JOURNAL_LIMIT
-    {
+    if line.len() > RECORD_LIMIT {
         return Err("任务文档容量已满，请人工归档".into());
     }
-    file.write_all(&line)
-        .and_then(|_| file.sync_all())
-        .map_err(io_error)
+    Ok(line)
+}
+
+fn append_or_compact(path: &Path, document: &Document) -> Result<(), String> {
+    let line = encoded_record(document)?;
+    let existing_len = path.metadata().map_err(io_error)?.len();
+    if existing_len.saturating_add(line.len() as u64) > JOURNAL_LIMIT {
+        let mut compacted = Vec::with_capacity(HEADER.len() + line.len());
+        compacted.extend_from_slice(HEADER.as_bytes());
+        compacted.extend_from_slice(&line);
+        journal::replace_and_archive(path, &compacted).map_err(io_error)?;
+    } else {
+        journal::append(path, &line, false).map_err(io_error)?;
+    }
+    Ok(())
 }
 fn safe_relative(raw: &str) -> bool {
     text(raw, 4096)
@@ -767,6 +760,7 @@ fn artifact_bytes(plan: &TaskPlan, relative: &str) -> Result<(PathBuf, Vec<u8>),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     fn fixture() -> (DocumentStore, TaskPlan) {
         let root = std::env::temp_dir().canonicalize().unwrap();
         let id = format!(
@@ -1079,14 +1073,71 @@ mod tests {
         drop(guard);
         assert_eq!(store.snapshot().unwrap().revision, 1);
     }
+
+    #[test]
+    fn short_lock_contention_is_retried_without_entering_recovery() {
+        let (store, plan) = fixture();
+        store.create(plan).unwrap();
+        let worker = store.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = worker.lock(false).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(store.snapshot().unwrap().revision, 1);
+        holder.join().unwrap();
+    }
     #[test]
     fn document_unlock_does_not_wait_for_duplicated_handles() {
         let (store, plan) = fixture();
         store.create(plan).unwrap();
         let guard = store.lock(false).unwrap();
-        let duplicate = guard.0.try_clone().unwrap();
+        let duplicate = guard.duplicate().unwrap();
         drop(guard);
         assert_eq!(store.snapshot().unwrap().revision, 1);
         drop(duplicate);
+    }
+
+    #[test]
+    fn append_compaction_retains_current_revision_and_previous_journal() {
+        let (store, plan) = fixture();
+        store.create(plan).unwrap();
+        let mut document = store.snapshot().unwrap();
+        document.artifacts = (0..32)
+            .map(|index| {
+                let relative_path = format!("{index}/{}", "x".repeat(3900));
+                Artifact {
+                    id: hash(format!("{relative_path}\0{}", "0".repeat(64)).as_bytes()),
+                    relative_path,
+                    sha256: "0".repeat(64),
+                    bytes: 1,
+                    version: 1,
+                    label: format!("artifact-{index}"),
+                }
+            })
+            .collect();
+        let mut bytes = HEADER.as_bytes().to_vec();
+        for revision in 2..=58 {
+            document.revision = revision;
+            validate_document(&document).unwrap();
+            bytes.extend_from_slice(&encoded_record(&document).unwrap());
+        }
+        fs::write(&store.path, bytes).unwrap();
+
+        let link = SessionLink {
+            id: "compaction-session".into(),
+            tool_id: "claude".into(),
+            tool_name: "Claude Code".into(),
+            project_path: document.plan.project_id.clone(),
+        };
+        let updated = store.associate_session(link).unwrap();
+        assert_eq!(updated.artifacts.len(), 32);
+        assert!(fs::metadata(&store.path).unwrap().len() <= JOURNAL_LIMIT);
+        assert!(
+            fs::read_dir(store.path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".archive-"))
+        );
     }
 }

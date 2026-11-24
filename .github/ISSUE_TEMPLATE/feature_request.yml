@@ -1,0 +1,24 @@
+name: Feature request
+description: 提议新的用户能力或体验改进
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 请描述实际使用中的触发场景和目前的不便。
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 期望结果
+      description: 描述用户能观察到的结果，以及如何判断完成。
+    validations:
+      required: true
+  - type: textarea
+    id: limits
+    attributes:
+      label: 边界与替代方案
+      description: 哪些情况不应处理？已有临时办法是什么？

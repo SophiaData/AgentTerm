@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use crate::journal;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -78,7 +79,10 @@ impl ProjectStore {
     }
 }
 
-const PROJECT_BYTES: u64 = 1024 * 1024;
+// The valid 200-project snapshot can exceed 1 MiB when every registered path
+// is near the Windows path limit. The soft cap must leave room for that single
+// compacted snapshot; repeated append snapshots still roll over and archive.
+const PROJECT_BYTES: u64 = 4 * 1024 * 1024;
 const PROJECT_LIMIT: usize = 200;
 
 #[derive(Serialize, Deserialize)]
@@ -120,7 +124,7 @@ fn read_projects(bytes: &[u8]) -> Result<(u64, Vec<Project>, bool), String> {
         return Err(invalid_store());
     }
     let text = std::str::from_utf8(bytes).map_err(|_| invalid_store())?;
-    let mut revision = 0u64;
+    let mut revision = None;
     let mut projects = Vec::new();
     for (index, line) in text.split_terminator('\n').enumerate() {
         if index == 0
@@ -135,23 +139,16 @@ fn read_projects(bytes: &[u8]) -> Result<(u64, Vec<Project>, bool), String> {
         }
         let record: ProjectRecord = serde_json::from_str(line).map_err(|_| invalid_store())?;
         if record.schema != 2
-            || revision.checked_add(1) != Some(record.revision)
+            || !journal::revision_follows(revision, record.revision)
             || record.sha256 != project_hash(record.revision, &record.projects)?
         {
             return Err(invalid_store());
         }
         validate_projects(&record.projects)?;
-        revision = record.revision;
+        revision = Some(record.revision);
         projects = record.projects;
     }
-    Ok((revision, projects, false))
-}
-
-struct ProjectLock(File);
-impl Drop for ProjectLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
+    Ok((revision.unwrap_or_default(), projects, false))
 }
 
 fn storage_error(_: std::io::Error) -> String {
@@ -212,32 +209,14 @@ fn persisted<T>(
     if data_exists && !guard_exists {
         return Err("项目存储缺少锁文件；保留原件，需核实".into());
     }
-    let guard = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(write)
-        .truncate(false)
-        .open(&guard_path)
-        .map_err(storage_error)?;
-    guard
-        .try_lock()
+    let _guard = journal::lock_with_retry(&guard_path, write)
         .map_err(|_| "项目列表正被另一操作使用，请重试".to_string())?;
-    let _guard = ProjectLock(guard);
     if regular_or_missing(&pending)? {
         return Err("项目列表有未完成写入；保留原件与pending文件，需核实".into());
     }
     let mut existing = Vec::new();
     let (revision, mut projects, add_newline) = if regular_or_missing(path)? {
-        let file = File::open(path).map_err(storage_error)?;
-        if file.metadata().map_err(storage_error)?.len() > PROJECT_BYTES {
-            return Err("项目存储超过1 MiB上限".into());
-        }
-        file.take(PROJECT_BYTES + 1)
-            .read_to_end(&mut existing)
-            .map_err(storage_error)?;
-        if existing.len() as u64 > PROJECT_BYTES {
-            return Err("项目存储超过1 MiB上限".into());
-        }
+        existing = journal::read_bytes(path, PROJECT_BYTES).map_err(storage_error)?;
         read_projects(&existing)?
     } else {
         (0, Vec::new(), false)
@@ -258,24 +237,12 @@ fn persisted<T>(
         }
         bytes.push(b'\n');
         if existing.len() as u64 + bytes.len() as u64 > PROJECT_BYTES {
-            return Err("项目存储超过1 MiB上限".into());
+            journal::replace_and_archive(path, &bytes).map_err(storage_error)?;
+        } else {
+            // A partial tail blocks all later operations, never rolls back or
+            // pretends to be empty.
+            journal::append(path, &bytes, existing.is_empty()).map_err(storage_error)?;
         }
-        // Append complete snapshots under the same stable lock. A partial tail
-        // blocks all later operations, never rolls back or pretends to be empty.
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create_new(existing.is_empty())
-            .open(path)
-            .map_err(storage_error)?;
-        file.write_all(&bytes).map_err(storage_error)?;
-        file.sync_all().map_err(storage_error)?;
-        #[cfg(unix)]
-        File::open(
-            path.parent()
-                .ok_or_else(|| "项目存储位置无效".to_string())?,
-        )
-        .and_then(|file| file.sync_all())
-        .map_err(storage_error)?;
     }
     Ok(result)
 }
@@ -638,6 +605,38 @@ mod tests {
         assert!(store.add(&store_path().to_string_lossy()).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!companion(&path, ".pending").exists());
+    }
+
+    #[test]
+    fn append_compaction_keeps_projects_usable_and_preserves_an_archive() {
+        let path = store_path();
+        let prefix = if cfg!(windows) {
+            r"C:\project-"
+        } else {
+            "/project-"
+        };
+        let projects = (0..120)
+            .map(|index| Project {
+                id: format!("{prefix}{index}"),
+                path: format!("{prefix}{index}"),
+                name: "x".repeat(800),
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..40 {
+            super::persisted(&path, true, |current| {
+                *current = projects.clone();
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() <= super::PROJECT_BYTES);
+        assert_eq!(persistent(&path).list().unwrap().len(), projects.len());
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".archive-"))
+        );
     }
 
     #[cfg(unix)]

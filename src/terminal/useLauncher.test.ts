@@ -100,6 +100,49 @@ describe("independent CLI sessions", () => {
     expect(store.getSnapshot().sessions).toHaveLength(2);
   });
 
+  it("marks a failed transport as unknown instead of claiming the CLI is running", async () => {
+    const { store } = fixture();
+    await store.start(project, tool);
+    const id = store.getSnapshot().sessions[0].info.id;
+    store.handleConnection(id, "error");
+    expect(store.getSnapshot().sessions[0].running).toBe(true);
+    expect(store.getSnapshot().sessions[0].statusUnknown).toBe(true);
+    store.handleConnection(id, "ready");
+    expect(store.getSnapshot().sessions[0].statusUnknown).toBe(false);
+  });
+
+  it("reconciles a live backend PTY after a WebView reload", async () => {
+    const { store, invoke } = fixture();
+    invoke.mockResolvedValueOnce([
+      {
+        id: "recovered-pty",
+        toolId: "claude",
+        toolName: "Claude Code",
+        projectPath: project.path,
+        title: "重载后恢复",
+      },
+    ]);
+    await expect(store.reconcile()).resolves.toBe(true);
+    const state = store.getSnapshot();
+    expect(state.sessions).toHaveLength(1);
+    expect(state.sessions[0].info.id).toBe("recovered-pty");
+    expect(state.sessions[0].label).toBe("重载后恢复");
+    expect(state.sessions[0].running).toBe(true);
+    store.select("recovered-pty");
+    expect(store.getSnapshot().activeId).toBe("recovered-pty");
+  });
+
+  it("stops showing running when backend reconciliation no longer lists the PTY", async () => {
+    const { store, invoke } = fixture();
+    await store.start(project, tool);
+    invoke.mockResolvedValueOnce([]);
+    await expect(store.reconcile()).resolves.toBe(true);
+    const session = store.getSnapshot().sessions[0];
+    expect(session.running).toBe(false);
+    expect(session.exitReason).toBe("后端会话已结束");
+    expect(session.statusUnknown).toBe(false);
+  });
+
   it("closing one session leaves the other and ignores late events", async () => {
     const { store, invoke } = fixture();
     await store.start(project, tool);
@@ -161,6 +204,23 @@ describe("independent CLI sessions", () => {
     expect(invoke).toHaveBeenCalledWith("session_snapshot", { sessionId: id });
     expect(invoke).toHaveBeenCalledWith("forget_session", { sessionId: id });
     expect(store.getSnapshot().sessions).toHaveLength(0);
+  });
+
+  it("removes a status-unknown tab when the backend no longer has the PTY", async () => {
+    const { store, invoke } = fixture();
+    await store.start(project, tool);
+    const id = store.getSnapshot().sessions[0].info.id;
+    store.handleConnection(id, "error");
+    invoke.mockRejectedValueOnce(new Error("stop failed"));
+    invoke.mockRejectedValueOnce(new Error("snapshot missing"));
+    invoke.mockResolvedValueOnce(undefined);
+    await store.close(id);
+    expect(store.getSnapshot().sessions).toHaveLength(0);
+    expect(invoke.mock.calls.slice(1).map(([command]) => command)).toEqual([
+      "stop_session",
+      "session_snapshot",
+      "forget_session",
+    ]);
   });
 
   it("does not replace a tab selected while another is closing", async () => {
