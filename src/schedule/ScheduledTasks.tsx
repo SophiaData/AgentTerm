@@ -1,15 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Project } from "../projects/types";
-import type { ToolStatus } from "../tools/types";
-import {
-  EMPTY_SCHEDULE_DRAFT,
-  type ScheduledTask,
-  type ScheduledTaskDraft,
-} from "./types";
+import { parseScheduleRequest } from "./parseSchedule";
+import type { ScheduledTask } from "./types";
 
 type Props = {
   projects: Project[];
-  tools: ToolStatus[];
+  context: { projectPath: string; toolId: string; model?: string | null };
   onClose: () => void;
 };
 
@@ -24,10 +20,9 @@ function timeText(value: number): string {
     : date.toLocaleString("zh-CN", { hour12: false });
 }
 
-export default function ScheduledTasks({ projects, tools, onClose }: Props) {
+export default function ScheduledTasks({ context, onClose }: Props) {
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
-  const [draft, setDraft] = useState<ScheduledTaskDraft>(EMPTY_SCHEDULE_DRAFT);
-  const [editingId, setEditingId] = useState<string | null>(null);
+  const [request, setRequest] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
@@ -42,27 +37,19 @@ export default function ScheduledTasks({ projects, tools, onClose }: Props) {
   }, [load]);
 
   const save = async () => {
+    const draft = parseScheduleRequest(request, context);
+    if (!draft) {
+      setError("请直接说任务，例如：每天 09:30 总结项目进展");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const payload = {
-        ...draft,
-        model: draft.model.trim() || null,
-        projectPath: draft.projectPath || projects[0]?.path || "",
-      };
-      await invoke(
-        editingId ? "update_scheduled_task" : "save_scheduled_task",
-        {
-          id: editingId,
-          draft: payload,
-        },
-      );
-      setDraft({
-        ...EMPTY_SCHEDULE_DRAFT,
-        projectPath: projects[0]?.path ?? "",
+      await invoke("save_scheduled_task", {
+        draft: { ...draft, model: draft.model.trim() || null },
       });
-      setEditingId(null);
+      setRequest("");
       await load();
     } catch (cause) {
       setError(`无法保存定时任务：${errorText(cause)}`);
@@ -104,8 +91,7 @@ export default function ScheduledTasks({ projects, tools, onClose }: Props) {
       </div>
       <div className="schedule-panel">
         <p className="workspace-records-note">
-          到点后按所选 CLI 和模型执行一条指令。权限由该 CLI
-          自己的配置决定，AgentTerm 不额外限制。同一时间只运行一个任务。
+          直接说想让当前 Agent 定时做什么。这里只查看、暂停和查看结果。
         </p>
         {error ? <p role="alert">{error}</p> : null}
         <form
@@ -115,86 +101,14 @@ export default function ScheduledTasks({ projects, tools, onClose }: Props) {
             void save();
           }}
         >
-          <input
-            aria-label="任务名称"
-            placeholder="任务名称"
-            value={draft.name}
-            onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-          />
-          <select
-            aria-label="项目"
-            value={draft.projectPath || projects[0]?.path || ""}
-            onChange={(e) =>
-              setDraft({ ...draft, projectPath: e.target.value })
-            }
-          >
-            {projects.map((project) => (
-              <option key={project.id} value={project.path}>
-                {project.name}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label="CLI"
-            value={draft.toolId}
-            onChange={(e) => setDraft({ ...draft, toolId: e.target.value })}
-          >
-            {tools.map((tool) => (
-              <option key={tool.id} value={tool.id}>
-                {tool.name}
-              </option>
-            ))}
-          </select>
-          <input
-            aria-label="模型"
-            placeholder="模型（可留空）"
-            value={draft.model}
-            onChange={(e) => setDraft({ ...draft, model: e.target.value })}
-          />
           <textarea
-            aria-label="任务指令"
-            placeholder="到点执行的指令"
-            value={draft.prompt}
-            onChange={(e) => setDraft({ ...draft, prompt: e.target.value })}
+            aria-label="用一句话添加定时任务"
+            placeholder="例如：每天 09:30 总结项目进展"
+            value={request}
+            onChange={(event) => setRequest(event.target.value)}
           />
-          <label>
-            间隔（分钟）
-            <input
-              aria-label="间隔分钟"
-              type="number"
-              min={1}
-              max={10080}
-              value={draft.intervalMinutes}
-              onChange={(e) =>
-                setDraft({ ...draft, intervalMinutes: Number(e.target.value) })
-              }
-            />
-          </label>
-          <label>
-            超时（分钟）
-            <input
-              aria-label="超时分钟"
-              type="number"
-              min={1}
-              max={180}
-              value={draft.timeoutMinutes}
-              onChange={(e) =>
-                setDraft({ ...draft, timeoutMinutes: Number(e.target.value) })
-              }
-            />
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={draft.enabled}
-              onChange={(e) =>
-                setDraft({ ...draft, enabled: e.target.checked })
-              }
-            />
-            启用
-          </label>
           <button className="primary-button" disabled={busy}>
-            {editingId ? "保存修改" : "添加定时任务"}
+            交给当前 Agent
           </button>
         </form>
         <ul className="schedule-list">
@@ -209,16 +123,6 @@ export default function ScheduledTasks({ projects, tools, onClose }: Props) {
                 {task.enabled ? `下次 ${timeText(task.nextRunAtMs)}` : "已停用"}
               </span>
               <div>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => {
-                    setEditingId(task.id);
-                    setDraft({ ...task, model: task.model ?? "" });
-                  }}
-                >
-                  编辑
-                </button>
                 <button
                   type="button"
                   disabled={busy}
