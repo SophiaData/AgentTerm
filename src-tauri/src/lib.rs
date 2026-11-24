@@ -1,5 +1,6 @@
 mod project_files;
 mod projects;
+mod scheduled_tasks;
 mod session_history;
 mod sessions;
 mod task_commands;
@@ -20,6 +21,7 @@ pub fn run() {
         .manage(projects::ProjectStore::default())
         .manage(sessions::SessionManager::default())
         .manage(task_commands::TaskLedgerState::default())
+        .manage(scheduled_tasks::Scheduler::default())
         .invoke_handler(tauri::generate_handler![
             tools::detect_tools,
             projects::list_projects,
@@ -50,7 +52,13 @@ pub fn run() {
             task_commands::reassociate_task_session_after_recovery,
             task_commands::dispatch_controlled_task,
             task_commands::request_stop_controlled_task,
-            task_commands::preview_task_artifact
+            task_commands::preview_task_artifact,
+            scheduled_tasks::list_scheduled_tasks,
+            scheduled_tasks::save_scheduled_task,
+            scheduled_tasks::update_scheduled_task,
+            scheduled_tasks::set_scheduled_task_enabled,
+            scheduled_tasks::remove_scheduled_task,
+            scheduled_tasks::run_scheduled_task_now
         ])
         .setup(|app| {
             tray::install_tray(app)?;
@@ -67,6 +75,18 @@ pub fn run() {
             app.state::<sessions::SessionManager>()
                 .configure_history(directory.join("agentterm-session-history.json"))
                 .map_err(std::io::Error::other)?;
+            app.state::<scheduled_tasks::Scheduler>()
+                .configure(directory.join("agentterm-scheduled-tasks.json"))
+                .map_err(std::io::Error::other)?;
+            let scheduler = app.state::<scheduled_tasks::Scheduler>().handle();
+            std::thread::spawn(move || {
+                loop {
+                    if let Err(error) = scheduler.tick() {
+                        eprintln!("AgentTerm scheduled task tick failed: {error}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                }
+            });
 
             let window = app
                 .get_webview_window("main")

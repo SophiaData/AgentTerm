@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { PRODUCT_NAME } from "./meta";
 import TaskWorkbench from "./TaskWorkbench";
 import ProjectFiles from "./files/ProjectFiles";
+import ScheduledTasks from "./schedule/ScheduledTasks";
 import { displayPath } from "./projects/displayPath";
 import { useProjects } from "./projects/useProjects";
 import SessionWorkspace from "./terminal/SessionWorkspace";
@@ -37,6 +38,7 @@ export default function App() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [toolId, setToolId] = useState<string | null>(null);
   const [recordsOpen, setRecordsOpen] = useState(false);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(true);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
@@ -95,7 +97,7 @@ export default function App() {
 
   return (
     <main
-      className={`session-workspace${recordsOpen ? " with-records" : ""}${filesOpen && fileProject ? " with-files" : ""}`}
+      className={`session-workspace${recordsOpen || scheduleOpen ? " with-records" : ""}${filesOpen && fileProject ? " with-files" : ""}`}
     >
       <aside className="workspace-sidebar" aria-label="项目与会话">
         <div className="workspace-brand">
@@ -302,6 +304,7 @@ export default function App() {
               onClick={() => {
                 setFilesOpen((open) => !open);
                 setRecordsOpen(false);
+                setScheduleOpen(false);
               }}
             >
               文件
@@ -323,10 +326,24 @@ export default function App() {
             <button
               type="button"
               className="ghost-button"
+              aria-expanded={scheduleOpen}
+              aria-controls="scheduled-tasks"
+              onClick={() => {
+                setScheduleOpen((open) => !open);
+                setRecordsOpen(false);
+                setFilesOpen(false);
+              }}
+            >
+              {scheduleOpen ? "收起定时任务" : "定时任务"}
+            </button>
+            <button
+              type="button"
+              className="ghost-button"
               aria-expanded={recordsOpen}
               aria-controls="session-records"
               onClick={() => {
                 setRecordsOpen((open) => !open);
+                setScheduleOpen(false);
                 setFilesOpen(false);
               }}
             >
@@ -628,6 +645,13 @@ export default function App() {
           key={fileProject.id}
           project={fileProject}
           onClose={() => setFilesOpen(false)}
+        />
+      ) : null}
+      {scheduleOpen ? (
+        <ScheduledTasks
+          projects={projects.projects}
+          tools={tools.tools}
+          onClose={() => setScheduleOpen(false)}
         />
       ) : null}
       {recordsOpen ? (
