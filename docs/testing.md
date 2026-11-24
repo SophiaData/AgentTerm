@@ -1,5 +1,16 @@
 # Testing policy
 
+## Agent 原生定时任务与 rc.5（2026-11-24）
+
+- 交互改造由 PR #52 交付并合入 `main`，合并提交 `25ca6dd362e0c14797b471a067584e5a4fc7db30`。CI `45386670629` 的 Linux `quality` 与 Windows `windows-frontend` 均通过；Windows Rust 测试启动时的 `STATUS_ENTRYPOINT_NOT_FOUND` 通过给测试链接目标嵌入 Common Controls v6 manifest 修复，未跳过测试。
+- PR #52 使用 Windows 构建 `45387134963` 生成 rc.4；同目录替换后继续发现 Agy 报错 `unknown setting "mcpServers"`。因此没有把“会话能启动”当成 Agy 集成通过，转由 PR #53 修复。
+- PR #53 将 Agy 改为使用其标准 `~/.gemini/config/mcp_config.json`，只在会话期间合并 `agentterm_scheduler`，退出时只移除自己的条目。CI `45389835964` 两端通过；Windows 构建 `45390261144` 成功并生成 rc.5。
+- 本机完整 Rust 回归：183 passed / 2 ignored，`cargo clippy --lib -- -D warnings` 通过；前端 123 passed，TypeScript、Prettier、模板治理通过。新增 Agy 配置回归验证保留其他 MCP，并验证清理只删除 AgentTerm 条目。
+- rc.5 安装器 SHA-256 为 `71c8b289f90c533af1ca3ff635fe6789a8047b2941056d8ce9da09c1be297063`。安装器退出 0，覆盖同一目录 `E:\AgentTerm\app-25ca6dd`；实际 EXE 为 11464704 bytes，SHA-256 `04af13a322425d12bee324c718172c13d545b029ef47cfeb15588f7d03a3c29b`。桌面与开始菜单快捷方式都指向该目录，测试时只存在一个 AgentTerm 进程。
+- Windows UI Automation 实际启动 Agy 1.5.15，会话显示“运行中”；其配置指向本机 `agentterm-scheduler`，MCP initialize 返回协议 `2024-11-05`，工具列表为 `schedule_task,list_scheduled_tasks`。确认结束 Agy 后，进程退出且 `mcp_config.json` 中 AgentTerm 条目被移除。
+- 定时任务面板实机显示紧凑任务卡，运行结果折叠，底部只显示“创建入口在会话里”的说明，不再有自然语言输入框或手工表单。旧版曾经误建的“每 1 小时”任务仍保留，需用户在新面板中删除后重新通过 Agent 创建。
+- 真实交互由主 Agent 串行自检；不宣称独立评审或用户验收。macOS 真机、真实模型发出工具调用和长期定时触发仍需单独验收。
+
 ## 项目文件浏览切片（2026-11-23）
 
 - 用户明确要求解决 CLI 查看文件不方便的问题。本切片增加当前项目文件面板：目录展开/收起、刷新、点击只读预览、关闭预览及打开系统资源管理器。面板跟随当前项目，与任务记录互斥，现有终端保持挂载；窄窗以抽屉展示。
