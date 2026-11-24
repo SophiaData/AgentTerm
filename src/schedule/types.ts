@@ -6,6 +6,10 @@ export type ScheduledRun = {
   output: string;
 };
 
+export type ScheduleSpec =
+  | { kind: "interval"; minutes: number }
+  | { kind: "daily"; hour: number; minute: number };
+
 export type ScheduledTask = {
   id: string;
   name: string;
@@ -13,7 +17,8 @@ export type ScheduledTask = {
   toolId: string;
   model: string | null;
   prompt: string;
-  intervalMinutes: number;
+  intervalMinutes?: number;
+  schedule?: ScheduleSpec | null;
   timeoutMinutes: number;
   enabled: boolean;
   nextRunAtMs: number;
@@ -26,7 +31,7 @@ export type ScheduledTaskDraft = {
   toolId: string;
   model: string;
   prompt: string;
-  intervalMinutes: number;
+  schedule: ScheduleSpec;
   timeoutMinutes: number;
   enabled: boolean;
 };
@@ -37,7 +42,7 @@ export const EMPTY_SCHEDULE_DRAFT: ScheduledTaskDraft = {
   toolId: "claude",
   model: "",
   prompt: "",
-  intervalMinutes: 60,
+  schedule: { kind: "interval", minutes: 60 },
   timeoutMinutes: 20,
   enabled: true,
 };
