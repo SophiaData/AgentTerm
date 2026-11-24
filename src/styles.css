@@ -1839,10 +1839,6 @@ h2 {
     width: 100%;
   }
 }
-/* Project files sit beside the terminal and collapse into a drawer on narrow windows. */
-.session-workspace.with-files {
-  grid-template-columns: 204px minmax(0, 1fr) 390px;
-}
 .workspace-files {
   display: flex;
   flex-direction: column;
@@ -1991,29 +1987,6 @@ h2 {
   margin: auto;
   color: #8d98a6;
   font-size: 12px;
-}
-.file-preview .file-message {
-  overflow: auto;
-  margin: 8px 14px;
-}
-@media (max-width: 1000px) {
-  .session-workspace.with-files {
-    grid-template-columns: 204px minmax(0, 1fr);
-  }
-  .workspace-files {
-    position: fixed;
-    top: 55px;
-    right: 0;
-    bottom: 0;
-    width: min(420px, calc(100vw - 170px));
-    z-index: 10;
-    box-shadow: -15px 0 35px #0005;
-  }
-}
-@media (max-width: 650px) {
-  .session-workspace.with-files {
-    grid-template-columns: 160px minmax(0, 1fr);
-  }
 }
 
 /* Issue #13: shared workbench status language. */
