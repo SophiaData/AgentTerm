@@ -64,11 +64,13 @@ export default function App() {
     const saved = localStorage.getItem("agentterm-layout");
     if (!saved) return;
     const layout = JSON.parse(saved) as {
+      version?: number;
       sidebarWidth?: number;
       sideWidth?: number;
       filesOpen?: boolean;
       projectId?: string;
     };
+    if (layout.version !== 2) return;
     if (layout.sidebarWidth) setSidebarWidth(layout.sidebarWidth);
     if (layout.sideWidth) setSideWidth(layout.sideWidth);
     if (typeof layout.filesOpen === "boolean") setFilesOpen(layout.filesOpen);
@@ -77,7 +79,13 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(
       "agentterm-layout",
-      JSON.stringify({ sidebarWidth, sideWidth, filesOpen, projectId }),
+      JSON.stringify({
+        version: 2,
+        sidebarWidth,
+        sideWidth,
+        filesOpen,
+        projectId,
+      }),
     );
   }, [sidebarWidth, sideWidth, filesOpen, projectId]);
   useEffect(() => {
