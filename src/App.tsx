@@ -6,9 +6,8 @@ import { displayPath } from "./projects/displayPath";
 import { useProjects } from "./projects/useProjects";
 import SessionWorkspace from "./terminal/SessionWorkspace";
 import {
-  folderName,
-  formatSessionTime,
-  historyStatusText,
+  historyDisplayTitle,
+  historySubtitleText,
   installedToolForRecord,
   projectFromRecord,
   recentClosedHistory,
@@ -289,7 +288,9 @@ export default function App() {
                 : (selectedProject?.name ?? "工作区")}
             </span>
             <span className="workspace-context-separator">/</span>
-            <strong>{currentSession ? "终端会话" : "新建会话"}</strong>
+            <strong>
+              {currentSession ? currentSession.label : "新建会话"}
+            </strong>
           </div>
           <div className="workspace-topbar-actions">
             <button
@@ -412,6 +413,8 @@ export default function App() {
           }}
           onClose={(id) => void launcher.close(id)}
           onExit={launcher.handleExit}
+          onRename={launcher.rename}
+          onPromptLine={(id, line) => void launcher.autoName(id, line)}
         />
         {!currentSession ? (
           <div className="workspace-start">
@@ -572,13 +575,9 @@ export default function App() {
                               className="workspace-history-item"
                             >
                               <div className="workspace-history-meta">
-                                <strong>
-                                  {record.toolName} ·{" "}
-                                  {folderName(record.projectPath)}
-                                </strong>
+                                <strong>{historyDisplayTitle(record)}</strong>
                                 <span title={displayPath(record.projectPath)}>
-                                  {historyStatusText(record)} ·{" "}
-                                  {formatSessionTime(record.startedAtMs)}
+                                  {historySubtitleText(record)}
                                 </span>
                               </div>
                               <button

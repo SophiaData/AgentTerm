@@ -34,6 +34,7 @@ pub fn run() {
             sessions::resize_session,
             sessions::stop_session,
             sessions::forget_session,
+            sessions::rename_session,
             sessions::session_history,
             task_commands::task_ledger_initialize,
             task_commands::task_ledger_snapshot,

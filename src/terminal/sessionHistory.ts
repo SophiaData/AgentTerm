@@ -7,6 +7,20 @@ export function folderName(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+export function historyDisplayTitle(record: SessionHistoryRecord): string {
+  const custom = record.title?.trim();
+  if (custom) return custom;
+  return `${record.toolName} · ${folderName(record.projectPath)}`;
+}
+
+export function historySubtitleText(record: SessionHistoryRecord): string {
+  const base = `${historyStatusText(record)} · ${formatSessionTime(record.startedAtMs)}`;
+  if (record.title?.trim()) {
+    return `${record.toolName} · ${folderName(record.projectPath)} · ${base}`;
+  }
+  return base;
+}
+
 export function projectFromRecord(record: SessionHistoryRecord): Project {
   return {
     id: record.projectPath,

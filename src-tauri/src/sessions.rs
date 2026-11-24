@@ -2,7 +2,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::session_history::{SessionHistory, SessionRecord, now_ms};
+use crate::session_history::{SessionHistory, SessionRecord, normalize_session_title, now_ms};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,8 @@ pub struct SessionInfo {
     pub tool_id: String,
     pub tool_name: String,
     pub project_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -727,6 +729,7 @@ impl SessionManager {
             tool_id: tool.id.to_string(),
             tool_name: tool.name.to_string(),
             project_path: project_dir.display().to_string(),
+            title: None,
         };
 
         #[cfg(unix)]
@@ -761,6 +764,7 @@ impl SessionManager {
             tool_id: tool.id.to_string(),
             tool_name: tool.name.to_string(),
             project_path: info.project_path.clone(),
+            title: None,
             started_at_ms: now_ms(),
             ended_at_ms: None,
             exit_reason: None,
@@ -971,6 +975,47 @@ impl SessionManager {
         self.stop_with_reason(session_id, "已停止")
     }
 
+    pub fn rename(&self, session_id: &str, title: &str) -> Result<String, String> {
+        if session_id.trim().is_empty() {
+            return Err("会话标识无效".to_string());
+        }
+        let normalized = normalize_session_title(title)?;
+        let history = self
+            .history
+            .lock()
+            .map_err(|_| "会话历史暂时不可用，请重试".to_string())?
+            .clone();
+        let saved = match history {
+            Some(history) => match history.record_rename(session_id, &normalized) {
+                Ok(saved) => saved,
+                Err(error) => {
+                    // If history recording failed when the session started,
+                    // allow renaming the live in-memory session instead of
+                    // blocking the user; still fail closed for missing/corrupt
+                    // non-live ids.
+                    let sessions = self.lock()?;
+                    if error == "会话历史记录不存在" && sessions.contains_key(session_id) {
+                        normalized
+                    } else {
+                        return Err(error);
+                    }
+                }
+            },
+            None => {
+                let sessions = self.lock()?;
+                if !sessions.contains_key(session_id) {
+                    return Err("会话不存在或已结束".to_string());
+                }
+                normalized
+            }
+        };
+        let mut sessions = self.lock()?;
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.info.title = Some(saved.clone());
+        }
+        Ok(saved)
+    }
+
     fn stop_with_reason(&self, session_id: &str, reason: &str) -> Result<(), String> {
         // Kill first, only then drop the record. Removing before a successful
         // kill lost the session on failure, leaving the process alive with no
@@ -1103,6 +1148,15 @@ pub fn stop_session(
     session_id: String,
 ) -> Result<(), String> {
     state.stop(&session_id)
+}
+
+#[tauri::command]
+pub fn rename_session(
+    state: tauri::State<'_, SessionManager>,
+    session_id: String,
+    title: String,
+) -> Result<String, String> {
+    state.rename(&session_id, &title)
 }
 
 #[tauri::command]
@@ -1257,6 +1311,7 @@ mod tests {
                     tool_id: "claude".into(),
                     tool_name: "Claude Code".into(),
                     project_path: std::env::current_dir().unwrap().to_string_lossy().into(),
+                    title: None,
                 },
                 master: Box::new(FakeMaster),
                 #[cfg(unix)]
@@ -1904,6 +1959,7 @@ mod tests {
             tool_id: "claude".to_string(),
             tool_name: "Claude Code".to_string(),
             project_path: history_project(),
+            title: None,
             started_at_ms: 10,
             ended_at_ms: None,
             exit_reason: None,
@@ -1932,6 +1988,7 @@ mod tests {
                 tool_id: "claude".to_string(),
                 tool_name: "Claude Code".to_string(),
                 project_path: history_project(),
+                title: None,
                 started_at_ms: 10,
                 ended_at_ms: None,
                 exit_reason: None,
@@ -2000,5 +2057,45 @@ mod tests {
         assert_eq!(cmd.get_cwd().unwrap().to_string_lossy(), r"E:\AgentTerm");
         assert_eq!(cmd.get_env("PYTHONUTF8").unwrap(), "1");
         assert_eq!(cmd.get_env("PYTHONIOENCODING").unwrap(), "utf-8");
+    }
+
+    #[test]
+    fn rename_updates_live_and_persisted_history_and_fails_closed() {
+        let manager = SessionManager::default();
+        let path = history_store("rename-manager");
+        manager.configure_history(path).unwrap();
+        insert_fake_session(&manager, "s-live", false);
+        manager.record_start(super::SessionRecord {
+            id: "s-live".to_string(),
+            tool_id: "claude".to_string(),
+            tool_name: "Claude Code".to_string(),
+            project_path: history_project(),
+            title: None,
+            started_at_ms: 10,
+            ended_at_ms: None,
+            exit_reason: None,
+            output_bytes: None,
+        });
+
+        let saved = manager.rename("s-live", "  接口联调排查  ").unwrap();
+        assert_eq!(saved, "接口联调排查");
+        assert_eq!(
+            manager.session_info("s-live").unwrap().title.as_deref(),
+            Some("接口联调排查")
+        );
+
+        // Invalid rename must fail and keep previous live/persisted title intact.
+        assert!(manager.rename("s-live", "   ").is_err());
+        assert_eq!(
+            manager.session_info("s-live").unwrap().title.as_deref(),
+            Some("接口联调排查")
+        );
+
+        // Stopped sessions still present in history can also be renamed.
+        manager.stop("s-live").unwrap();
+        let after_stop = manager.rename("s-live", "归档：接口排查").unwrap();
+        assert_eq!(after_stop, "归档：接口排查");
+        let listed = manager.list_history().unwrap();
+        assert_eq!(listed[0].title.as_deref(), Some("归档：接口排查"));
     }
 }

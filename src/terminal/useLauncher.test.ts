@@ -33,6 +33,9 @@ function fixture() {
         projectPath: args.projectPath,
       };
     }
+    if (command === "rename_session") {
+      return String(args.title).trim().replace(/\s+/g, " ");
+    }
     return undefined;
   });
   const store = createSessionStore(
@@ -337,5 +340,62 @@ describe("independent CLI sessions", () => {
     store.select(a);
     store.split();
     expect(store.getSnapshot().paneIds).toEqual([a, b]);
+  });
+
+  it("auto-names once from the first meaningful prompt and never overwrites manual renames", async () => {
+    const { store, invoke } = fixture();
+    await store.start(project, tool);
+    const id = store.getSnapshot().sessions[0].info.id;
+
+    await store.autoName(id, "/help");
+    await store.autoName(id, "yes");
+    expect(store.getSnapshot().sessions[0].titleSource).toBe("default");
+
+    await store.autoName(id, "排查广告表主键重复问题");
+    expect(store.getSnapshot().sessions[0].label).toBe(
+      "排查广告表主键重复问题",
+    );
+    expect(store.getSnapshot().sessions[0].titleSource).toBe("auto");
+    expect(invoke).toHaveBeenCalledWith("rename_session", {
+      sessionId: id,
+      title: "排查广告表主键重复问题",
+    });
+
+    // Subsequent prompts must not overwrite an already auto-named session.
+    await store.autoName(id, "第二个问题不应覆盖标题");
+    expect(store.getSnapshot().sessions[0].label).toBe(
+      "排查广告表主键重复问题",
+    );
+
+    // Manual rename overrides the auto title and persists through backend.
+    const renamed = await store.rename(id, "  核心广告表修复  ");
+    expect(renamed).toEqual({ ok: true, title: "核心广告表修复" });
+    expect(store.getSnapshot().sessions[0].label).toBe("核心广告表修复");
+    expect(store.getSnapshot().sessions[0].titleSource).toBe("manual");
+    expect(store.getSnapshot().sessions[0].info.title).toBe("核心广告表修复");
+
+    // Invalid manual rename fails closed without touching the current title.
+    const bad = await store.rename(id, "   ");
+    expect(bad.ok).toBe(false);
+    expect(store.getSnapshot().sessions[0].label).toBe("核心广告表修复");
+  });
+
+  it("manual rename wins over an in-flight automatic naming request", async () => {
+    const { store, invoke } = fixture();
+    await store.start(project, tool);
+    const id = store.getSnapshot().sessions[0].info.id;
+
+    const pendingAuto = deferred<string>();
+    invoke.mockImplementationOnce(() => pendingAuto.promise);
+    const autoTask = store.autoName(id, "自动命名的第一条指令");
+
+    const manual = await store.rename(id, "用户手动命名");
+    expect(manual).toEqual({ ok: true, title: "用户手动命名" });
+
+    pendingAuto.resolve("自动命名的第一条指令");
+    await autoTask;
+
+    expect(store.getSnapshot().sessions[0].label).toBe("用户手动命名");
+    expect(store.getSnapshot().sessions[0].titleSource).toBe("manual");
   });
 });

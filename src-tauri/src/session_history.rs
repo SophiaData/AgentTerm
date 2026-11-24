@@ -7,6 +7,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const HISTORY_LIMIT: usize = 50;
 const HISTORY_BYTES: u64 = 2 * 1024 * 1024;
+pub const SESSION_TITLE_MAX_CHARS: usize = 60;
+const SESSION_TITLE_MAX_BYTES: usize = 240;
+
+pub fn normalize_session_title(raw: &str) -> Result<String, String> {
+    if raw.chars().any(char::is_control) {
+        return Err("会话名称不能包含控制字符或换行".to_string());
+    }
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return Err("会话名称不能为空".to_string());
+    }
+    if normalized.chars().count() > SESSION_TITLE_MAX_CHARS
+        || normalized.len() > SESSION_TITLE_MAX_BYTES
+    {
+        return Err(format!("会话名称最多 {SESSION_TITLE_MAX_CHARS} 个字符"));
+    }
+    Ok(normalized)
+}
 
 /// A persisted manual terminal session. Only identity, timestamps and end state
 /// are kept; no output, credentials or environment are stored.
@@ -17,6 +35,8 @@ pub struct SessionRecord {
     pub tool_id: String,
     pub tool_name: String,
     pub project_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub exit_reason: Option<String>,
@@ -50,6 +70,10 @@ enum HistoryEvent {
         ended_at_ms: u64,
         exit_reason: Option<String>,
         output_bytes: Option<u64>,
+    },
+    Rename {
+        id: String,
+        title: String,
     },
 }
 
@@ -103,6 +127,15 @@ impl SessionHistory {
             exit_reason: reason,
             output_bytes,
         })
+    }
+
+    pub fn record_rename(&self, id: &str, title: &str) -> Result<String, String> {
+        let normalized = normalize_session_title(title)?;
+        self.append(HistoryEvent::Rename {
+            id: id.to_string(),
+            title: normalized.clone(),
+        })?;
+        Ok(normalized)
     }
 
     /// Newest first. A read never creates or rewrites the store.
@@ -275,10 +308,29 @@ fn apply_event(
             *record = updated;
             Ok(())
         }
+        HistoryEvent::Rename { id, title } => {
+            let normalized = normalize_session_title(&title)?;
+            if normalized != title {
+                return Err("会话名称格式无效；保留原文件，需核实".to_string());
+            }
+            let record = records
+                .iter_mut()
+                .find(|existing| existing.id == id)
+                .ok_or_else(|| "会话历史记录不存在".to_string())?;
+            let mut updated = record.clone();
+            updated.title = Some(normalized);
+            validate_record(&updated)?;
+            *record = updated;
+            Ok(())
+        }
     }
 }
 
 fn validate_record(record: &SessionRecord) -> Result<(), String> {
+    let title_ok = record
+        .title
+        .as_deref()
+        .is_none_or(|title| normalize_session_title(title).is_ok_and(|clean| clean == title));
     let reason_ok = record.exit_reason.as_deref().is_none_or(|reason| {
         !reason.is_empty() && reason.len() <= 1024 && !reason.chars().any(char::is_control)
     });
@@ -298,6 +350,7 @@ fn validate_record(record: &SessionRecord) -> Result<(), String> {
         || record.tool_id.chars().any(char::is_control)
         || record.tool_name.chars().any(char::is_control)
         || record.started_at_ms == 0
+        || !title_ok
         || !reason_ok
         || !ended_ok
     {
@@ -331,7 +384,8 @@ fn regular_or_missing(path: &Path) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionHistory, SessionRecord, now_ms};
+    use super::{SessionHistory, SessionRecord, normalize_session_title, now_ms};
+    use sha2::{Digest, Sha256};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -356,6 +410,7 @@ mod tests {
                 "/tmp/agentterm"
             }
             .to_string(),
+            title: None,
             started_at_ms: started,
             ended_at_ms: None,
             exit_reason: None,
@@ -510,5 +565,62 @@ mod tests {
             &std::fs::read(&path).unwrap()[..before.len()],
             before.as_slice()
         );
+    }
+
+    #[test]
+    fn rename_persists_across_reopen_and_rejects_invalid_titles() {
+        let path = temp_store("rename");
+        let history = SessionHistory::configure(path.clone()).unwrap();
+        history.record_start(record("s1", 10)).unwrap();
+
+        let saved = history
+            .record_rename("s1", "  修复   首页地址乱码  ")
+            .unwrap();
+        assert_eq!(saved, "修复 首页地址乱码");
+        let updated = history.record_rename("s1", "排查 SQL 性能问题").unwrap();
+        assert_eq!(updated, "排查 SQL 性能问题");
+
+        assert!(history.record_rename("s1", "   ").is_err());
+        assert!(history.record_rename("s1", "换行\n不行").is_err());
+        assert!(history.record_rename("s1", &"字".repeat(61)).is_err());
+        assert!(history.record_rename("missing", "有效名称").is_err());
+        assert_eq!(
+            normalize_session_title("  Codex  调试 ").unwrap(),
+            "Codex 调试"
+        );
+
+        let reopened = SessionHistory::configure(path).unwrap();
+        let listed = reopened.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title.as_deref(), Some("排查 SQL 性能问题"));
+    }
+
+    #[test]
+    fn legacy_start_line_without_title_still_verifies_checksum() {
+        let path = temp_store("legacy-no-title");
+        let project_path = if cfg!(windows) {
+            r"E:\\AgentTerm"
+        } else {
+            "/tmp/agentterm"
+        };
+        let legacy_event = format!(
+            r#"{{"kind":"start","record":{{"id":"legacy-1","toolId":"claude","toolName":"Claude Code","projectPath":"{project_path}","startedAtMs":100,"endedAtMs":null,"exitReason":null,"outputBytes":null}}}}"#
+        );
+        let hash_payload = format!("[1,{legacy_event}]");
+        let digest = format!("{:x}", Sha256::digest(hash_payload.as_bytes()));
+        let legacy_line =
+            format!(r#"{{"schema":2,"revision":1,"event":{legacy_event},"sha256":"{digest}"}}"#);
+        std::fs::write(&path, format!("{legacy_line}\n")).unwrap();
+        std::fs::write(PathBuf::from(format!("{}.lock", path.display())), b"").unwrap();
+
+        let history = SessionHistory::configure(path).unwrap();
+        let listed = history.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "legacy-1");
+        assert_eq!(listed[0].title, None);
+
+        history.record_rename("legacy-1", "旧记录改名").unwrap();
+        let after = history.list().unwrap();
+        assert_eq!(after[0].title.as_deref(), Some("旧记录改名"));
     }
 }

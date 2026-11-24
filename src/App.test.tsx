@@ -191,6 +191,7 @@ describe("AgentTerm application shell", () => {
           toolId: "codex",
           toolName: "Codex",
           projectPath: "E:\\Other",
+          title: "排查夜间任务异常",
           startedAtMs: 1_763_648_000_000,
           endedAtMs: null,
           exitReason: null,
@@ -210,6 +211,7 @@ describe("AgentTerm application shell", () => {
     expect(html).toContain('title="E:\\AgentTerm"');
     expect(html).not.toContain(String.raw`\\?\E:\AgentTerm`);
     expect(html).toContain("已结束 · 已停止");
+    expect(html).toContain("排查夜间任务异常");
     expect(html).toContain("Codex · Other");
     expect(html).toContain("上次未正常退出");
     expect(html).not.toContain("Claude Code · Data");
