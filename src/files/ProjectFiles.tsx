@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { displayPath } from "../projects/displayPath";
 import type { Project } from "../projects/types";
 import {
@@ -105,6 +105,21 @@ export function ProjectFilesView({
   store: FileBrowserStore;
   onClose: () => void;
 }) {
+  const [query, setQuery] = useState("");
+  const filtered = {
+    ...state,
+    directories: Object.fromEntries(
+      Object.entries(state.directories).map(([path, directory]) => [
+        path,
+        {
+          ...directory,
+          entries: directory.entries.filter((entry) =>
+            entry.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
+          ),
+        },
+      ]),
+    ),
+  };
   return (
     <aside className="workspace-files" id="project-files" aria-label="项目文件">
       <div className="file-panel-heading">
@@ -128,6 +143,13 @@ export function ProjectFilesView({
           </button>
         </div>
       </div>
+      <input
+        className="file-search"
+        aria-label="搜索文件名"
+        placeholder="搜索文件名"
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+      />
       <div className="file-project-heading">
         <strong>{project.name}</strong>
         <small title={displayPath(project.path)}>
@@ -148,7 +170,7 @@ export function ProjectFilesView({
         </p>
       ) : null}
       <nav className="file-tree" aria-label="项目目录">
-        <Directory path="" state={state} store={store} />
+        <Directory path="" state={filtered} store={store} />
       </nav>
       <section className="file-preview" aria-label="文件预览">
         {state.selectedPath === null ? (

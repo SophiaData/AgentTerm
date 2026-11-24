@@ -1019,11 +1019,19 @@ h2 {
 }
 
 .session-title {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: text;
   overflow: hidden;
   font-size: 15px;
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.session-title:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .terminal-host {
@@ -1103,13 +1111,17 @@ h2 {
 /* The primary surface is the agent's own terminal session. */
 .session-workspace {
   display: grid;
-  grid-template-columns: 204px minmax(0, 1fr);
   height: 100dvh;
   overflow: hidden;
   background: #0d1117;
 }
-.session-workspace.with-records {
-  grid-template-columns: 204px minmax(0, 1fr) 380px;
+.workspace-splitter {
+  width: 6px;
+  cursor: col-resize;
+  background: #1d2630;
+}
+.workspace-splitter:hover {
+  background: #8cdec2;
 }
 .workspace-sidebar {
   display: flex;
@@ -2205,4 +2217,16 @@ h2 {
   .session-workspace.with-records {
     grid-template-columns: 176px minmax(0, 1fr);
   }
+}
+.workspace-task-notice {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 20;
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid #385246;
+  border-radius: 8px;
+  background: #17241d;
 }

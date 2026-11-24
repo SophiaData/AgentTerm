@@ -50,6 +50,7 @@ export default function TerminalView({
   const [phase, setPhase] = useState<ConnectionPhase>("connecting");
   const [problem, setProblem] = useState<string | null>(null);
   const [connection, setConnection] = useState(0);
+  const [compact, setCompact] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -237,15 +238,24 @@ export default function TerminalView({
     <div className="terminal-view">
       <div className="terminal-toolbar">
         <span role="status">
-          {phase === "connecting"
-            ? "正在连接终端…"
-            : phase === "error"
-              ? "终端连接需要处理"
-              : !running || phase === "exited"
-                ? "进程已结束，输出保留在下方"
-                : "可直接输入 · Ctrl+C 中断当前命令"}
+          {compact
+            ? "简洁模式只保留最近输出"
+            : phase === "connecting"
+              ? "正在连接终端…"
+              : phase === "error"
+                ? "终端连接需要处理"
+                : !running || phase === "exited"
+                  ? "进程已结束，输出保留在下方"
+                  : "可直接输入 · Ctrl+C 中断当前命令"}
         </span>
         <div className="terminal-actions">
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => setCompact((value) => !value)}
+          >
+            {compact ? "完整输出" : "简洁模式"}
+          </button>
           <button
             type="button"
             className="ghost-button"

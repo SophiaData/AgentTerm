@@ -51,7 +51,7 @@ describe("terminal split presentation", () => {
     expect(html).toContain('aria-label="调整终端分屏"');
     expect(html).toContain('aria-valuenow="50"');
     expect(html).toContain('aria-orientation="vertical"');
-    expect(html).toContain('aria-label="重命名会话"');
+    expect(html).toContain("点击修改名称");
   });
 
   it("single view removes the divider but retains the other mounted terminals", () => {
