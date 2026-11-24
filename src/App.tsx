@@ -40,6 +40,7 @@ export default function App() {
   const [recordsOpen, setRecordsOpen] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(true);
+  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
     projects.projects.find((p) => p.id === projectId) ?? projects.projects[0];
@@ -323,6 +324,36 @@ export default function App() {
             >
               {launcher.paneIds.length === 2 ? "返回单屏" : "分屏查看"}
             </button>
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => {
+                void (async () => {
+                  const { invoke } = await import("@tauri-apps/api/core");
+                  const status = await invoke<{
+                    currentVersion: string;
+                    latestVersion: string | null;
+                    updateAvailable: boolean;
+                    downloadUrl: string | null;
+                  }>("check_for_update");
+                  if (!status.updateAvailable || !status.downloadUrl) {
+                    setUpdateMessage(`当前已是 ${status.currentVersion}`);
+                    return;
+                  }
+                  await invoke("install_update", {
+                    downloadUrl: status.downloadUrl,
+                  });
+                  setUpdateMessage(`已开始安装 ${status.latestVersion}`);
+                })().catch((error: unknown) =>
+                  setUpdateMessage(
+                    error instanceof Error ? error.message : String(error),
+                  ),
+                );
+              }}
+            >
+              检查更新
+            </button>
+            {updateMessage ? <span role="status">{updateMessage}</span> : null}
             <button
               type="button"
               className="ghost-button"
