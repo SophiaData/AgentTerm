@@ -121,9 +121,13 @@ export default function App() {
 
   return (
     <main
-      className={`session-workspace${recordsOpen || scheduleOpen ? " with-records" : ""}${filesOpen && fileProject ? " with-files" : ""}`}
+      className="session-workspace"
       style={{
-        gridTemplateColumns: `${sidebarWidth}px minmax(0, 1fr)${recordsOpen || scheduleOpen || (filesOpen && fileProject) ? ` ${sideWidth}px` : ""}`,
+        gridTemplateColumns: `${sidebarWidth}px 6px minmax(0, 1fr)${
+          recordsOpen || scheduleOpen || (filesOpen && fileProject)
+            ? ` 6px ${sideWidth}px`
+            : ""
+        }`,
       }}
     >
       <aside className="workspace-sidebar" aria-label="项目与会话">

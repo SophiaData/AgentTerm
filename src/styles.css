@@ -1111,6 +1111,7 @@ h2 {
 /* The primary surface is the agent's own terminal session. */
 .session-workspace {
   display: grid;
+  grid-template-columns: 204px 6px minmax(0, 1fr);
   height: 100dvh;
   overflow: hidden;
   background: #0d1117;
