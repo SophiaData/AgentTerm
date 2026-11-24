@@ -13,9 +13,40 @@
   会话列表对账、更新器 SemVer/资产/digest 分支。
 - TUI：15 passed；格式与 clippy 通过，release 构建通过。
 - 模板契约：13 passed；治理检查确认 15 个必需文件存在。
-- 本确认绑定当前 `codex/issues-55-66` 分支，尚未冒充 GitHub CI、合并、Release
-  或 Windows 原生实机验收。最终提交的 CI、Windows 覆盖安装和窗口截图结果将在
-  完成后补入本节。
+- PR [#67](https://github.com/SophiaData/AgentTerm/pull/67) 的 CI
+  `45452101582` 全绿后合入 `main`，合并提交为
+  `524f23e6196447c17bee5d2cfa9f10bb87b4647e`；合并后的 main CI
+  [45452732328](https://github.com/SophiaData/AgentTerm/actions/runs/45452732328)
+  在 Linux 与 Windows 两端均通过。GitHub 当前 open issue 为 0。
+- Windows 包构建
+  [45453294628](https://github.com/SophiaData/AgentTerm/actions/runs/45453294628)
+  成功。rc.6 安装器已覆盖安装到 `E:\AgentTerm\app-25ca6dd`，退出码为 0；
+  桌面与开始菜单快捷方式均指向该 EXE，测试时只保留一个 AgentTerm 进程。
+  UI Automation 确认窗口响应正常，实际安装 EXE 的 SHA-256 为
+  `c723e94ff1173bbb390fc086a27784c46f092425cf7bc885b27938224f2feb58`。
+- 已在
+  [v0.2.0-rc.6 Pre-release](https://github.com/SophiaData/AgentTerm/releases/tag/v0.2.0-rc.6)
+  发布 Windows 安装器、Windows TUI、npm tgz 和 `SHA256SUMS.txt`。Release
+  绑定合并提交 `524f23e`，GitHub 回读 digest 与本地一致：
+
+| 资产                                         |   bytes | SHA-256                                                            |
+| -------------------------------------------- | ------: | ------------------------------------------------------------------ |
+| `AgentTerm-0.2.0-rc.6-windows-x64-setup.exe` | 2685345 | `82025ed495b9a0305c0d06ce215e92b0bc8b690693b7f7ed49b43ebb9e742a0a` |
+| `agentterm-0.2.0-rc.6-windows-x64.exe`       |  455680 | `91589ac0864364ab9ef08657713d885ed314f66a3149e55eb0563a1df433ceb1` |
+| `agentterm-0.2.0-rc.6.tgz`                   |  237388 | `498749422f096685e33a10a5683e92f74c65d7e8c4e0adbfc3602219caf3581a` |
+
+- 720×720 原生窗口完成 UIA 与截图验收：侧栏从窗口外展开时显示完整项目、
+  CLI 状态和新建会话入口；收起后文件抽屉占 493px，可展开 `source`、搜索、
+  打开 `README.md` 并显示 `2975 字节 · 只读` 的中文纯文本预览。证据在
+  `E:\AgentTerm\runtime\acceptance-rc6-524f23e\agentterm-rc6-720-sidebar.png`
+  与 `agentterm-rc6-720-files.png`、`agentterm-rc6-720-readme.png`。
+- 真实启动 Claude Code `2.1.336` 后，会话显示“运行中”，终端中英文与路径显示
+  正常；运行中标签的关闭按钮弹出二次确认。验证“继续使用”后标签保留，再确认
+  结束后标签、运行中状态和对应 CLI 进程均消失，没有残留会话。定时任务面板
+  实机显示 Agent 创建入口、空状态和管理边界。
+- 点击“检查更新”后，rc.6 客户端读取已发布 Release 并显示
+  “当前已是 0.2.0-rc.6”。本机验收由主 Agent 串行执行，不冒充用户验收；
+  macOS 真机、真实用户工作流和实际等待到点后的 AI 定时执行仍单列观察。
 
 ## Agent 原生定时任务与 rc.5（2026-11-24）
 
