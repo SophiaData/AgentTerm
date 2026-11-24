@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { parseScheduleRequest, scheduleLabel } from "./parseSchedule";
-import type { ScheduledTask, ScheduledTaskDraft } from "./types";
+import { scheduleLabel } from "./parseSchedule";
+import type { ScheduledTask } from "./types";
 
 type Props = {
-  context: { projectPath: string; toolId: string; model?: string | null };
   onClose: () => void;
   onNotice: (message: string) => void;
 };
@@ -25,10 +24,6 @@ function timeText(value: number): string {
       });
 }
 
-function projectName(path: string): string {
-  return path.split(/[\\/]/).filter(Boolean).at(-1) || path;
-}
-
 function toolName(id: string): string {
   return id === "claude" ? "Claude Code" : id === "codex" ? "Codex" : "Agy";
 }
@@ -42,51 +37,52 @@ function taskSchedule(task: ScheduledTask) {
   );
 }
 
-export default function ScheduledTasks({ context, onClose, onNotice }: Props) {
+export default function ScheduledTasks({ onClose, onNotice }: Props) {
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
-  const [request, setRequest] = useState("");
-  const [pending, setPending] = useState<ScheduledTaskDraft | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const { invoke } = await import("@tauri-apps/api/core");
     setTasks(await invoke<ScheduledTask[]>("list_scheduled_tasks"));
+    setError(null);
+    setLoading(false);
   }, []);
 
   useEffect(() => {
-    void load().catch((cause) => setError(errorText(cause)));
+    void load().catch((cause) => {
+      setError(errorText(cause));
+      setLoading(false);
+    });
   }, [load]);
 
-  const preview = () => {
-    const result = parseScheduleRequest(request, context);
-    if (!result.ok) {
-      setError(result.error);
-      return;
-    }
-    setError(null);
-    setPending(result.draft);
-  };
-
-  const confirm = async () => {
-    if (!pending) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("save_scheduled_task", {
-        draft: { ...pending, model: pending.model.trim() || null },
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const refresh = () => {
+      void load().catch((cause) => setError(errorText(cause)));
+    };
+    const timer = window.setInterval(refresh, 5_000);
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen("scheduled-tasks-changed", () => {
+          refresh();
+        }),
+      )
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {
+        // The next open or manual action still reads authoritative backend data.
       });
-      setPending(null);
-      setRequest("");
-      await load();
-      onNotice("定时任务已添加");
-    } catch (cause) {
-      setError(`无法保存定时任务：${errorText(cause)}`);
-    } finally {
-      setBusy(false);
-    }
-  };
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      unlisten?.();
+    };
+  }, [load]);
 
   const act = async (command: string, args: Record<string, unknown>) => {
     setBusy(true);
@@ -128,10 +124,14 @@ export default function ScheduledTasks({ context, onClose, onNotice }: Props) {
             {error}
           </p>
         ) : null}
-        {!tasks.length ? (
+        {loading ? (
+          <div className="schedule-empty" aria-live="polite">
+            <span>正在读取 Agent 创建的定时任务…</span>
+          </div>
+        ) : !tasks.length ? (
           <div className="schedule-empty">
             <strong>还没有定时任务</strong>
-            <span>在下面用一句话告诉 Agent 要按时做什么。</span>
+            <span>回到会话里直接告诉 Agent 要按时做什么。</span>
           </div>
         ) : (
           <ul className="schedule-list">
@@ -155,6 +155,13 @@ export default function ScheduledTasks({ context, onClose, onNotice }: Props) {
                     ? `下次 ${timeText(task.nextRunAtMs)}`
                     : "不会自动运行"}
                 </p>
+                {task.sourceSessionId ? (
+                  <p className="schedule-source">Agent 会话创建</p>
+                ) : null}
+                <details className="schedule-result">
+                  <summary>查看任务指令</summary>
+                  <pre>{task.prompt}</pre>
+                </details>
                 <div className="schedule-actions">
                   <button
                     type="button"
@@ -205,58 +212,19 @@ export default function ScheduledTasks({ context, onClose, onNotice }: Props) {
         )}
       </div>
 
-      <div className="schedule-composer">
-        {pending ? (
-          <div className="schedule-preview">
-            <span>
-              {scheduleLabel(pending.schedule)} ·{" "}
-              {projectName(pending.projectPath)} · {toolName(pending.toolId)}
-            </span>
-            <strong>{pending.name}</strong>
-            <div>
-              <button
-                type="button"
-                className="primary-button"
-                disabled={busy}
-                onClick={() => void confirm()}
-              >
-                确认安排
-              </button>
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => setPending(null)}
-              >
-                取消
-              </button>
-            </div>
-          </div>
-        ) : (
-          <>
-            <textarea
-              aria-label="用一句话添加定时任务"
-              rows={2}
-              placeholder="例如：每天九点汇报 GitHub 热搜"
-              value={request}
-              onChange={(event) => setRequest(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  preview();
-                }
-              }}
-            />
-            <button
-              type="button"
-              className="primary-button"
-              disabled={busy || !request.trim()}
-              onClick={preview}
-            >
-              安排
-            </button>
-          </>
-        )}
-      </div>
+      <section
+        className="schedule-agent-note"
+        aria-label="由 Agent 创建定时任务"
+      >
+        <span>创建入口在会话里</span>
+        <strong>“每天 09:00 汇总项目进展”</strong>
+        <p>
+          Agent 会结合当前项目、CLI 和对话内容创建任务；这里只负责查看和管理。
+        </p>
+        <button type="button" onClick={onClose}>
+          回到会话创建
+        </button>
+      </section>
     </aside>
   );
 }

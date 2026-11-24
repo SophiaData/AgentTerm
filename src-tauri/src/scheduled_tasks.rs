@@ -20,9 +20,9 @@ const RUN_LIMIT: usize = 10;
 const OUTPUT_LIMIT: usize = 12_000;
 const MIN_INTERVAL_MINUTES: u64 = 1;
 const MAX_INTERVAL_MINUTES: u64 = 10_080;
-const MIN_TIMEOUT_MINUTES: u64 = 1;
-const MAX_TIMEOUT_MINUTES: u64 = 180;
-const TEXT_LIMIT: usize = 2_000;
+pub(crate) const MIN_TIMEOUT_MINUTES: u64 = 1;
+pub(crate) const MAX_TIMEOUT_MINUTES: u64 = 180;
+pub(crate) const TEXT_LIMIT: usize = 2_000;
 const MODEL_LIMIT: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +48,8 @@ pub struct ScheduledTask {
     pub enabled: bool,
     pub next_run_at_ms: u64,
     pub runs: Vec<ScheduledRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +73,8 @@ pub struct ScheduledTaskDraft {
     pub schedule: ScheduleSpec,
     pub timeout_minutes: u64,
     pub enabled: bool,
+    #[serde(default)]
+    pub source_session_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -284,6 +288,15 @@ fn normalize_draft(
         Some(value) => Some(clean_token(value, "模型名称", MODEL_LIMIT)?),
         None => None,
     };
+    let source_session_id = match draft
+        .source_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => Some(clean_token(value, "来源会话", 160)?),
+        None => existing.and_then(|task| task.source_session_id.clone()),
+    };
     if !matches!(draft.tool_id.as_str(), "claude" | "codex" | "agy") {
         return Err("请选择 Claude Code、Codex 或 Agy".into());
     }
@@ -319,6 +332,7 @@ fn normalize_draft(
         enabled: draft.enabled,
         next_run_at_ms: next,
         runs: existing.map(|task| task.runs.clone()).unwrap_or_default(),
+        source_session_id,
     })
 }
 
@@ -759,6 +773,7 @@ mod tests {
             schedule: ScheduleSpec::Interval { minutes: 60 },
             timeout_minutes: 20,
             enabled: true,
+            source_session_id: None,
         }
     }
 
