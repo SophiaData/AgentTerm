@@ -453,6 +453,8 @@ fn command_for_tool(
         "claude" => {
             args.extend([
                 "--print".into(),
+                "--permission-mode".into(),
+                "acceptEdits".into(),
                 "--permission-prompts".into(),
                 "none".into(),
             ]);
@@ -473,6 +475,7 @@ fn command_for_tool(
         }
         "agy" => {
             args.push("--print".into());
+            args.extend(["--mode".into(), "accept-edits".into(), "--sandbox".into()]);
             if let Some(model) = model {
                 args.extend(["--model".into(), model.into()]);
             }
@@ -623,6 +626,45 @@ fn storage_error(error: std::io::Error) -> String {
 mod tests {
     use super::{ScheduledTaskDraft, Scheduler};
     use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn scheduled_commands_edit_only_the_selected_project() {
+        let claude = super::command_for_tool(Path::new("claude"), "claude", None)
+            .unwrap()
+            .1;
+        assert!(
+            claude
+                .windows(2)
+                .any(|item| item == ["--permission-mode", "acceptEdits"])
+        );
+        assert!(
+            claude
+                .windows(2)
+                .any(|item| item == ["--permission-prompts", "none"])
+        );
+        assert!(!claude.iter().any(|arg| arg.contains("dangerously")));
+
+        let codex = super::command_for_tool(Path::new("codex"), "codex", None)
+            .unwrap()
+            .1;
+        assert!(
+            codex
+                .windows(2)
+                .any(|item| item == ["--sandbox", "workspace-write"])
+        );
+        assert!(!codex.iter().any(|arg| arg.contains("dangerously")));
+
+        let agy = super::command_for_tool(Path::new("agy"), "agy", None)
+            .unwrap()
+            .1;
+        assert!(
+            agy.windows(2)
+                .any(|item| item == ["--mode", "accept-edits"])
+        );
+        assert!(agy.iter().any(|arg| arg == "--sandbox"));
+        assert!(!agy.iter().any(|arg| arg.contains("dangerously")));
+    }
 
     fn draft(prompt: &str) -> ScheduledTaskDraft {
         ScheduledTaskDraft {
