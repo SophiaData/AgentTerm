@@ -114,11 +114,14 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("AgentTerm should build")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event
-                && let Err(error) = app.state::<sessions::SessionManager>().stop_all()
-            {
-                api.prevent_exit();
-                tray::report_shutdown_error(app, &error);
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                match app.state::<sessions::SessionManager>().stop_all() {
+                    Ok(()) => app.state::<schedule_mcp::ScheduleMcp>().cleanup(),
+                    Err(error) => {
+                        api.prevent_exit();
+                        tray::report_shutdown_error(app, &error);
+                    }
+                }
             }
         });
 }

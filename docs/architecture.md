@@ -32,6 +32,7 @@
 ## Agent 原生定时任务
 
 - 定时任务由当前 Agent 在对话中发起，不在前端做自然语言规则解析。每个交互会话启动时获得随机会话令牌，并通过会话级 MCP 配置连接本进程内的 `agentterm_scheduler`。
+- Claude Code 与 Codex 通过各自启动参数注入 MCP。Agy 不识别 `--settings.mcpServers`，因此 AgentTerm 仅在 Agy 会话运行期间向 Agy 标准 `~/.gemini/config/mcp_config.json` 合并 `agentterm_scheduler` 条目，退出时只移除该条目并保留其他 MCP；同时限制一个 Agy 调度会话，避免共享配置竞争。
 - MCP HTTP 服务只监听 `127.0.0.1` 的随机端口；项目、CLI 与来源会话由后端按令牌绑定，Agent 只能提交任务名称、完整执行指令、排期、可选模型与超时。
 - AgentTerm 的 `Scheduler` 是唯一持久化与执行源。Claude Code、Codex、Agy 不各建一套独立定时器；到点后仍由 AgentTerm 启动对应 CLI。
 - 会话关闭时撤销令牌。任务管理面板只读取 `Scheduler` 并调用暂停、立即运行、删除等管理命令，不提供自然语言创建入口；创建事件会通知已打开的面板刷新。

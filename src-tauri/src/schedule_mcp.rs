@@ -5,13 +5,16 @@ use crate::scheduled_tasks::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 const REQUEST_LIMIT: usize = 64 * 1024;
+const AI_CONFIG_LIMIT: u64 = 1024 * 1024;
 const TOOL_NAME: &str = "agentterm_scheduler";
 const CHANGED_EVENT: &str = "scheduled-tasks-changed";
 
@@ -48,7 +51,7 @@ impl SessionBridge {
                     format!("mcp_servers.{TOOL_NAME}.url={url}"),
                 ])
             }
-            "agy" => Ok(vec!["--settings".into(), config.to_string()]),
+            "agy" => Ok(Vec::new()),
             _ => Err("不支持的工具".into()),
         }
     }
@@ -128,8 +131,23 @@ impl ScheduleMcp {
         if state.scheduler.is_none() {
             return Err("Agent 定时任务工具尚未启动".into());
         }
+        if tool_id == "agy"
+            && state
+                .sessions
+                .values()
+                .any(|context| context.tool_id == "agy")
+        {
+            return Err("Agy 定时任务工具一次只能绑定一个运行中的会话".into());
+        }
         state.sequence = state.sequence.wrapping_add(1);
         let token = random_token(state.sequence, session_id);
+        let endpoint = format!(
+            "http://127.0.0.1:{}/mcp/{}/{}",
+            state.port, state.server_token, token
+        );
+        if tool_id == "agy" {
+            write_agy_mcp_config(&endpoint)?;
+        }
         state.tokens.insert(token.clone(), session_id.to_string());
         state.sessions.insert(
             session_id.to_string(),
@@ -140,18 +158,36 @@ impl ScheduleMcp {
                 model,
             },
         );
-        Ok(SessionBridge {
-            endpoint: format!(
-                "http://127.0.0.1:{}/mcp/{}/{}",
-                state.port, state.server_token, token
-            ),
-        })
+        Ok(SessionBridge { endpoint })
     }
 
     pub fn revoke_session(&self, session_id: &str) {
-        if let Ok(mut state) = self.state.lock() {
-            state.sessions.remove(session_id);
+        let remove_agy = if let Ok(mut state) = self.state.lock() {
+            let removed = state.sessions.remove(session_id);
             state.tokens.retain(|_, owner| owner != session_id);
+            removed.is_some_and(|context| context.tool_id == "agy")
+        } else {
+            false
+        };
+        if remove_agy && let Err(error) = remove_agy_mcp_config() {
+            eprintln!("AgentTerm could not remove Agy scheduling MCP entry: {error}");
+        }
+    }
+
+    pub fn cleanup(&self) {
+        let remove_agy = if let Ok(mut state) = self.state.lock() {
+            let remove_agy = state
+                .sessions
+                .values()
+                .any(|context| context.tool_id == "agy");
+            state.sessions.clear();
+            state.tokens.clear();
+            remove_agy
+        } else {
+            false
+        };
+        if remove_agy && let Err(error) = remove_agy_mcp_config() {
+            eprintln!("AgentTerm could not clean Agy scheduling MCP entry: {error}");
         }
     }
 
@@ -411,6 +447,92 @@ fn format_time(value: u64) -> String {
         .unwrap_or_else(|| "时间未知".into())
 }
 
+fn agy_mcp_config_path() -> Result<PathBuf, String> {
+    let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(variable)
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME"))
+        .ok_or_else(|| format!("无法定位 Agy 配置目录：{variable} 未设置"))?;
+    Ok(PathBuf::from(home)
+        .join(".gemini")
+        .join("config")
+        .join("mcp_config.json"))
+}
+
+fn write_agy_mcp_config(endpoint: &str) -> Result<(), String> {
+    write_agy_mcp_config_at(&agy_mcp_config_path()?, endpoint)
+}
+
+fn write_agy_mcp_config_at(path: &Path, endpoint: &str) -> Result<(), String> {
+    let mut root = read_agy_mcp_config(path)?;
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| "Agy mcpServers 配置不是对象".to_string())?;
+    servers.insert(TOOL_NAME.into(), json!({"type": "http", "url": endpoint}));
+    write_json_atomic(path, &Value::Object(root))
+}
+
+fn remove_agy_mcp_config() -> Result<(), String> {
+    remove_agy_mcp_config_at(&agy_mcp_config_path()?)
+}
+
+fn remove_agy_mcp_config_at(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut root = read_agy_mcp_config(path)?;
+    let Some(servers) = root.get_mut("mcpServers") else {
+        return Ok(());
+    };
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| "Agy mcpServers 配置不是对象".to_string())?;
+    if servers.remove(TOOL_NAME).is_none() {
+        return Ok(());
+    }
+    write_json_atomic(path, &Value::Object(root))
+}
+
+fn read_agy_mcp_config(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+    let metadata =
+        std::fs::metadata(path).map_err(|error| format!("无法读取 Agy MCP 配置：{error}"))?;
+    if !metadata.is_file() || metadata.len() > AI_CONFIG_LIMIT {
+        return Err("Agy MCP 配置不是普通文件或超过 1 MiB".into());
+    }
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("无法读取 Agy MCP 配置：{error}"))?;
+    if text.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("Agy MCP 配置不是有效 JSON：{error}"))?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Agy MCP 配置顶层必须是对象".to_string())
+}
+
+fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Agy MCP 配置路径无效".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建 Agy MCP 配置目录：{error}"))?;
+    let mut temporary: OsString = path.as_os_str().to_owned();
+    temporary.push(".agentterm.tmp");
+    let temporary = PathBuf::from(temporary);
+    let mut body =
+        serde_json::to_vec_pretty(value).map_err(|_| "无法编码 Agy MCP 配置".to_string())?;
+    body.push(b'\n');
+    std::fs::write(&temporary, body).map_err(|error| format!("无法写入 Agy MCP 配置：{error}"))?;
+    std::fs::rename(&temporary, path).map_err(|error| format!("无法替换 Agy MCP 配置：{error}"))
+}
+
 fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -611,9 +733,7 @@ mod tests {
         assert!(codex[1].contains(&bridge.endpoint()));
 
         let agy = bridge.command_args("agy").unwrap();
-        assert_eq!(agy[0], "--settings");
-        assert!(agy[1].contains("\"mcpServers\""));
-        assert!(agy[1].contains(&bridge.endpoint()));
+        assert!(agy.is_empty());
     }
 
     #[test]
@@ -711,6 +831,40 @@ mod tests {
         assert_eq!(
             response["structuredContent"]["toolId"],
             Value::String("agy".into())
+        );
+    }
+
+    #[test]
+    fn agy_config_merge_preserves_other_servers_and_removes_only_agentterm() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-agy-mcp-{}-{}.json",
+            std::process::id(),
+            super::random_token(3, "test")
+        ));
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"existing":{"type":"http","url":"http://127.0.0.1:1/mcp"}}}"#,
+        )
+        .unwrap();
+        super::write_agy_mcp_config_at(&path, "http://127.0.0.1:2/mcp/server/session").unwrap();
+        let configured: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            configured["mcpServers"]["agentterm_scheduler"]["url"],
+            "http://127.0.0.1:2/mcp/server/session"
+        );
+        assert_eq!(
+            configured["mcpServers"]["existing"]["url"],
+            "http://127.0.0.1:1/mcp"
+        );
+
+        super::remove_agy_mcp_config_at(&path).unwrap();
+        let restored: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(restored["mcpServers"].get("agentterm_scheduler").is_none());
+        assert_eq!(
+            restored["mcpServers"]["existing"]["url"],
+            "http://127.0.0.1:1/mcp"
         );
     }
 }
