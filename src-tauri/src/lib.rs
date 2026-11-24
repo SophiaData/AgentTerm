@@ -10,6 +10,7 @@ mod task_process;
 pub mod task_relay;
 mod tools;
 mod tray;
+mod updates;
 
 use tauri::{Manager, WindowEvent};
 
@@ -58,7 +59,9 @@ pub fn run() {
             scheduled_tasks::update_scheduled_task,
             scheduled_tasks::set_scheduled_task_enabled,
             scheduled_tasks::remove_scheduled_task,
-            scheduled_tasks::run_scheduled_task_now
+            scheduled_tasks::run_scheduled_task_now,
+            updates::check_for_update,
+            updates::install_update
         ])
         .setup(|app| {
             tray::install_tray(app)?;
