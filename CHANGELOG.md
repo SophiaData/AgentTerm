@@ -2,6 +2,12 @@
 
 > 给老板看的白话流水账：每完成一个功能记一条，新条目在最上面。
 
+## 2026-11-24（Agy 定时任务能力修复）
+
+- 修正 Agy 不接受 `--settings` 中 `mcpServers` 的问题。Agy 会话现在使用它自己的标准 `mcp_config.json` 接入 `agentterm_scheduler`。
+- AgentTerm 在 Agy 会话期间只合并自己的 MCP 条目，退出时只移除该条目，不覆盖其他 MCP、插件或规则；同一时间只允许一个 Agy 调度会话，避免配置竞争。
+- 版本号统一为 `0.2.0-rc.5`。
+
 ## 2026-11-24（Agent 自己创建定时任务）
 
 - 定时任务的创建入口回到会话：Claude Code、Codex、Agy 会话会自动获得同一套 `agentterm_scheduler` MCP 工具，Agent 理解需求后直接创建任务。
