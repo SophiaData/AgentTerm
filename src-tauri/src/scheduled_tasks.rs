@@ -412,7 +412,7 @@ fn run_process(task: &ScheduledTask) -> Result<(i32, String), String> {
         let _ = stderr.read_to_string(&mut err);
         if !err.trim().is_empty() {
             if !output.is_empty() {
-                output.push_str("\n");
+                output.push('\n');
             }
             output.push_str(&err);
         }
