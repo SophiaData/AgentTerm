@@ -104,8 +104,8 @@ export default function ScheduledTasks({ projects, tools, onClose }: Props) {
       </div>
       <div className="schedule-panel">
         <p className="workspace-records-note">
-          到点后按所选 CLI
-          和模型执行一条指令。任务可以修改所选项目里的文件；项目以外的操作不会自动放行。同一时间只运行一个任务。
+          到点后按所选 CLI 和模型执行一条指令。权限由该 CLI
+          自己的配置决定，AgentTerm 不额外限制。同一时间只运行一个任务。
         </p>
         {error ? <p role="alert">{error}</p> : null}
         <form
