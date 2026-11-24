@@ -12,11 +12,16 @@ type Props = {
   focused: boolean;
   focusRequest: number;
   running: boolean;
+  statusUnknown: boolean;
   exitReason: string | null;
   busy: boolean;
   closeError?: string | null;
   onClose: () => void;
   onExit: (id: string, reason: string) => void;
+  onConnection: (
+    id: string,
+    phase: "connecting" | "ready" | "exited" | "error",
+  ) => void;
   onRename: (title: string) => Promise<RenameResult>;
   onPromptLine: (id: string, line: string) => void;
 };
@@ -28,11 +33,13 @@ export default function SessionPanel({
   focused,
   focusRequest,
   running,
+  statusUnknown,
   exitReason,
   busy,
   closeError,
   onClose,
   onExit,
+  onConnection,
   onRename,
   onPromptLine,
 }: Props) {
@@ -129,7 +136,9 @@ export default function SessionPanel({
           )}
           <span className={`badge ${running ? "badge-installed" : ""}`}>
             {running
-              ? "运行中"
+              ? statusUnknown
+                ? "状态未知"
+                : "运行中"
               : exitReason
                 ? `已退出：${exitReason}`
                 : "已结束"}
@@ -141,7 +150,13 @@ export default function SessionPanel({
           onClick={() => (running ? setConfirmClose(true) : onClose())}
           disabled={busy}
         >
-          {busy ? "正在结束…" : running ? "结束会话" : "关闭会话"}
+          {busy
+            ? "正在结束…"
+            : running
+              ? statusUnknown
+                ? "核实并停止"
+                : "结束会话"
+              : "关闭会话"}
         </button>
       </div>
       {renameError ? (
@@ -187,6 +202,7 @@ export default function SessionPanel({
         running={running}
         busy={busy}
         onExit={onExit}
+        onConnection={onConnection}
         onPromptLine={onPromptLine}
       />
     </section>

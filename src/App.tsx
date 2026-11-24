@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { PRODUCT_NAME } from "./meta";
+import { loadStoredLayout, saveStoredLayout } from "./layout";
 import TaskWorkbench from "./TaskWorkbench";
 import ProjectFiles from "./files/ProjectFiles";
 import ScheduledTasks from "./schedule/ScheduledTasks";
@@ -42,6 +43,9 @@ export default function App() {
   const [filesOpen, setFilesOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(204);
   const [sideWidth, setSideWidth] = useState(390);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [closeConfirmation, setCloseConfirmation] =
+    useState<ActiveSession | null>(null);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [taskNotice, setTaskNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState(emptyPlan);
@@ -57,36 +61,24 @@ export default function App() {
   const projectBusy = projects.loading || projects.busy || launcher.busy;
   const activeSessionIds = new Set(launcher.sessions.map((s) => s.info.id));
   const recentHistory = recentClosedHistory(history.records, activeSessionIds);
-  const runningCount = launcher.sessions.filter((s) => s.running).length;
+  const runningCount = launcher.sessions.filter(
+    (s) => s.running && !s.statusUnknown,
+  ).length;
+  const unknownCount = launcher.sessions.filter((s) => s.statusUnknown).length;
+  const hasSidePanel =
+    recordsOpen || scheduleOpen || (filesOpen && !!fileProject);
   const historyReloaded = useRef(false);
   const reloadHistory = history.reload;
   useEffect(() => {
-    const saved = localStorage.getItem("agentterm-layout");
-    if (!saved) return;
-    const layout = JSON.parse(saved) as {
-      version?: number;
-      sidebarWidth?: number;
-      sideWidth?: number;
-      filesOpen?: boolean;
-      projectId?: string;
-    };
-    if (layout.version !== 2) return;
-    if (layout.sidebarWidth) setSidebarWidth(layout.sidebarWidth);
-    if (layout.sideWidth) setSideWidth(layout.sideWidth);
-    if (typeof layout.filesOpen === "boolean") setFilesOpen(layout.filesOpen);
+    const layout = loadStoredLayout();
+    if (!layout) return;
+    setSidebarWidth(layout.sidebarWidth);
+    setSideWidth(layout.sideWidth);
+    setFilesOpen(layout.filesOpen);
     if (layout.projectId) setProjectId(layout.projectId);
   }, []);
   useEffect(() => {
-    localStorage.setItem(
-      "agentterm-layout",
-      JSON.stringify({
-        version: 2,
-        sidebarWidth,
-        sideWidth,
-        filesOpen,
-        projectId,
-      }),
-    );
+    saveStoredLayout({ sidebarWidth, sideWidth, filesOpen, projectId });
   }, [sidebarWidth, sideWidth, filesOpen, projectId]);
   useEffect(() => {
     if (!historyReloaded.current) {
@@ -108,6 +100,11 @@ export default function App() {
     );
     if (project) setProjectId(project.id);
     launcher.select(session.info.id);
+    setSidebarOpen(false);
+  };
+  const requestClose = (session: ActiveSession) => {
+    if (session.running) setCloseConfirmation(session);
+    else void launcher.close(session.info.id);
   };
   const sessionLink = (session: ActiveSession) => (
     <button
@@ -119,25 +116,41 @@ export default function App() {
       title={displayPath(session.info.projectPath)}
     >
       <span
-        className={`session-dot${session.running ? " is-running" : ""}`}
+        className={`session-dot${session.statusUnknown ? " is-unknown" : session.running ? " is-running" : ""}`}
         aria-hidden="true"
       />
       <span>{session.label}</span>
-      <small>{session.running ? "运行中" : "已结束"}</small>
+      <small>
+        {session.statusUnknown
+          ? "状态未知"
+          : session.running
+            ? "运行中"
+            : "已结束"}
+      </small>
     </button>
   );
 
   return (
     <main
-      className="session-workspace"
-      style={{
-        gridTemplateColumns: `${sidebarWidth}px 6px minmax(0, 1fr)${
-          recordsOpen || scheduleOpen || (filesOpen && fileProject)
-            ? ` 6px ${sideWidth}px`
-            : ""
-        }`,
-      }}
+      className={`session-workspace${hasSidePanel ? " has-side-panel" : ""}${sidebarOpen ? " is-sidebar-open" : ""}`}
+      style={
+        {
+          "--sidebar-width": `${sidebarWidth}px`,
+          "--side-panel-width": `${sideWidth}px`,
+          gridTemplateColumns: `${sidebarWidth}px 6px minmax(0, 1fr)${
+            hasSidePanel ? ` 6px ${sideWidth}px` : ""
+          }`,
+        } as CSSProperties
+      }
     >
+      {sidebarOpen ? (
+        <button
+          type="button"
+          className="workspace-sidebar-backdrop"
+          aria-label="收起项目与会话栏"
+          onClick={() => setSidebarOpen(false)}
+        />
+      ) : null}
       <aside className="workspace-sidebar" aria-label="项目与会话">
         <div className="workspace-brand">
           <span className="workspace-brand-icon" aria-hidden="true">
@@ -312,13 +325,13 @@ export default function App() {
           ) : null}
           <p className="workspace-note">
             {launcher.sessions.length
-              ? `${launcher.sessions.length} 个会话 · ${launcher.sessions.filter((s) => s.running).length} 个进程运行中`
+              ? `${launcher.sessions.length} 个会话 · ${runningCount} 个进程运行中${unknownCount ? ` · ${unknownCount} 个状态未知` : ""}`
               : "本机 CLI 会话工作区"}
           </p>
         </div>
       </aside>
       <div
-        className="workspace-splitter"
+        className="workspace-splitter workspace-sidebar-splitter"
         role="separator"
         aria-orientation="vertical"
         aria-label="调整项目栏宽度"
@@ -340,6 +353,15 @@ export default function App() {
 
       <section className="workspace-main" aria-label="Agent 会话工作区">
         <header className="workspace-topbar">
+          <button
+            type="button"
+            className="workspace-mobile-sidebar-toggle"
+            aria-label="打开项目与会话栏"
+            aria-expanded={sidebarOpen}
+            onClick={() => setSidebarOpen((open) => !open)}
+          >
+            ☰
+          </button>
           <div className="workspace-context">
             <span>
               {currentSession
@@ -394,9 +416,11 @@ export default function App() {
                     updateAvailable: boolean;
                     downloadUrl: string | null;
                     notes: string | null;
+                    channel: string;
+                    message: string;
                   }>("check_for_update");
                   if (!status.updateAvailable || !status.downloadUrl) {
-                    setUpdateMessage(`当前已是 ${status.currentVersion}`);
+                    setUpdateMessage(status.message);
                     return;
                   }
                   const accepted = window.confirm(
@@ -453,61 +477,64 @@ export default function App() {
             aria-label="已打开的会话"
           >
             {launcher.sessions.map((session) => (
-              <button
-                type="button"
-                role="tab"
-                id={`tab-${session.info.id}`}
-                aria-controls={`pane-${session.info.id}`}
-                aria-selected={launcher.activeId === session.info.id}
-                tabIndex={
-                  launcher.activeId === session.info.id ||
-                  (!launcher.activeId && launcher.sessions[0] === session)
-                    ? 0
-                    : -1
-                }
-                className="workspace-tab"
-                key={session.info.id}
-                title={displayPath(session.info.projectPath)}
-                onClick={() => selectSession(session)}
-                onKeyDown={(event) => {
-                  const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
-                  if (!keys.includes(event.key)) return;
-                  event.preventDefault();
-                  const tabs = Array.from(
-                    event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
-                      '[role="tab"]',
-                    ) ?? [],
-                  );
-                  const index = tabs.indexOf(event.currentTarget);
-                  const next =
-                    event.key === "Home"
+              <div className="workspace-tab-item" key={session.info.id}>
+                <button
+                  type="button"
+                  role="tab"
+                  id={`tab-${session.info.id}`}
+                  aria-controls={`pane-${session.info.id}`}
+                  aria-selected={launcher.activeId === session.info.id}
+                  tabIndex={
+                    launcher.activeId === session.info.id ||
+                    (!launcher.activeId && launcher.sessions[0] === session)
                       ? 0
-                      : event.key === "End"
-                        ? tabs.length - 1
-                        : (index +
-                            (event.key === "ArrowRight" ? 1 : -1) +
-                            tabs.length) %
-                          tabs.length;
-                  tabs[next]?.focus();
-                }}
-              >
-                <span
-                  className={`session-dot${session.running ? " is-running" : ""}`}
-                  aria-hidden="true"
-                />
-                {session.label}
-                <span
-                  className="workspace-tab-close"
-                  role="button"
-                  aria-label={`关闭 ${session.label}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    void launcher.close(session.info.id);
+                      : -1
+                  }
+                  className="workspace-tab"
+                  title={displayPath(session.info.projectPath)}
+                  onClick={() => selectSession(session)}
+                  onKeyDown={(event) => {
+                    if (["Delete", "Backspace"].includes(event.key)) {
+                      event.preventDefault();
+                      requestClose(session);
+                      return;
+                    }
+                    const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+                    if (!keys.includes(event.key)) return;
+                    event.preventDefault();
+                    const tabs = Array.from(
+                      event.currentTarget.parentElement?.parentElement?.querySelectorAll<HTMLButtonElement>(
+                        '[role="tab"]',
+                      ) ?? [],
+                    );
+                    const index = tabs.indexOf(event.currentTarget);
+                    const next =
+                      event.key === "Home"
+                        ? 0
+                        : event.key === "End"
+                          ? tabs.length - 1
+                          : (index +
+                              (event.key === "ArrowRight" ? 1 : -1) +
+                              tabs.length) %
+                            tabs.length;
+                    tabs[next]?.focus();
                   }}
                 >
+                  <span
+                    className={`session-dot${session.statusUnknown ? " is-unknown" : session.running ? " is-running" : ""}`}
+                    aria-hidden="true"
+                  />
+                  <span className="workspace-tab-label">{session.label}</span>
+                </button>
+                <button
+                  type="button"
+                  className="workspace-tab-close"
+                  aria-label={`关闭 ${session.label}`}
+                  onClick={() => requestClose(session)}
+                >
                   ×
-                </span>
-              </button>
+                </button>
+              </div>
             ))}
             <button
               type="button"
@@ -517,6 +544,42 @@ export default function App() {
               disabled={launcher.starting}
             >
               ＋
+            </button>
+          </div>
+        ) : null}
+        {closeConfirmation ? (
+          <div
+            className="workspace-close-confirmation"
+            role="group"
+            aria-label="确认结束运行中的会话"
+          >
+            <span>
+              “{closeConfirmation.label}”仍在
+              {closeConfirmation.statusUnknown
+                ? "后台运行，当前连接状态未知"
+                : "运行"}
+              。结束会停止这个 CLI，尚未提交的输入可能丢失。
+            </span>
+            <button
+              type="button"
+              className="ghost-button"
+              autoFocus
+              disabled={launcher.busy}
+              onClick={() => setCloseConfirmation(null)}
+            >
+              继续使用
+            </button>
+            <button
+              type="button"
+              className="danger-button"
+              disabled={launcher.busy}
+              onClick={() => {
+                const target = closeConfirmation;
+                setCloseConfirmation(null);
+                void launcher.close(target.info.id);
+              }}
+            >
+              确认结束
             </button>
           </div>
         ) : null}
@@ -536,6 +599,7 @@ export default function App() {
           }}
           onClose={(id) => void launcher.close(id)}
           onExit={launcher.handleExit}
+          onConnection={launcher.handleConnection}
           onRename={launcher.rename}
           onPromptLine={(id, line) => void launcher.autoName(id, line)}
         />
@@ -748,7 +812,7 @@ export default function App() {
       </section>
       {recordsOpen || scheduleOpen || (filesOpen && fileProject) ? (
         <div
-          className="workspace-splitter"
+          className="workspace-splitter workspace-side-panel-splitter"
           role="separator"
           aria-orientation="vertical"
           aria-label="调整右侧面板宽度"

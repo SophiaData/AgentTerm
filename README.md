@@ -1,39 +1,69 @@
 # AgentTerm
 
-AgentTerm 的产品方向是本地优先的轻量数据开发 Agent 工作台：接入任务，安排专业 Agent，组织交接与独立验收，集中展示产物和证据。
+AgentTerm 是一个本地优先的桌面 Agent 会话工作台。它把 Claude Code、Codex
+和 Agy 放进统一的项目、标签页和文件工作区，并让 Agent 在对话中创建可管理、
+可定时执行的本地任务。
 
-**当前代码包含多 CLI 会话工作区、任务抽屉、单主任务账本和受限 Claude 顺序派发入口。** 已有停止请求、重启后的进程核实与显式接回；安全接回后可显式关联同项目的新会话，保留原关联历史。手动终端独立于受管执行，“再次打开”会创建新进程。完整原生验收、证据闸门与完成释放仍待收口，Teambition 尚未接入。实际实现与验收状态分别见 [功能台账](docs/tasks.md) 和 [测试记录](docs/testing.md)。
+当前版本是**公开测试版**。Windows x64 已有可安装包；macOS Apple Silicon
+安装包会随测试版构建发布，但尚未完成同等强度的真机验收。安装包未签名或公证，
+Windows 首次运行时可能出现 SmartScreen 提示。
 
-下一阶段参考 Orca 的任务派发、结果回报与恢复能力，复用现有 CLI、数仓工具和检查器。主 Agent 在整个本地工作台内同时最多推进一个主任务；首版执行者与验收者顺序接力。具体范围、完成条件与恢复规则见 [产品需求](docs/PRD.md) 和 [架构约束](docs/architecture.md)。
+[下载最新测试版](https://github.com/SophiaData/AgentTerm/releases) ·
+[查看当前开发状态](docs/tasks.md) ·
+[参与贡献](CONTRIBUTING.md) ·
+[安全说明](SECURITY.md)
 
-桌面底座采用 Tauri 2、Rust、React 与 TypeScript，目标平台为 macOS Apple Silicon 和 Windows x64。现有 TUI 保留为工具启动入口；工作台首先以现有桌面界面承载任务页。
+![AgentTerm 项目与会话工作区](docs/images/agentterm-agents.png)
 
-## 本地启动
+## 现在能做什么
 
-开发环境需要 Node.js 22.13+、pnpm、Rust 和 Python 3；**不需要完整 Xcode**。
+| 已支持                                                     | 尚未支持                              |
+| ---------------------------------------------------------- | ------------------------------------- |
+| Windows x64 安装与更新检查                                 | 外部 Windows Terminal 会话接管        |
+| 同一窗口保留多个 Claude Code / Codex / Agy 会话            | 把任意 CLI 原生对话断点恢复为同一进程 |
+| 项目文件树、只读文本预览和资源管理器入口                   | 文件编辑、删除、重命名                |
+| WebView 重载或窗口恢复后对账存活 PTY                       | macOS 原生实机验收、签名和公证        |
+| Agent 通过会话工具创建定时任务，工作台管理、暂停和立即运行 | 任意 `.cmd` / `.bat` 静默调度         |
+| 单主任务账本、恢复核实和完成后显式释放                     | 通用持久任务队列和外部生产作业撤销    |
+
+![AgentTerm 三栏工作区](docs/images/agentterm-workspace.png)
+
+## 安装
+
+系统要求：
+
+- Windows 10/11 x64，已安装 WebView2；
+- 需要使用的 CLI 已安装并完成各自的账号登录：Claude Code、Codex 或 Agy；
+- 从 Release 的 **Assets** 下载文件名以 `windows-x64-setup.exe` 结尾的安装包。
+
+macOS 预览包要求 Apple Silicon；当前测试版不提供 Intel Mac 包。
+
+![AgentTerm 项目文件浏览](docs/images/agentterm-files.png)
+
+AgentTerm 不读取或复制 CLI 账号凭据。Claude Code、Codex、Agy
+继续使用本机各自的原生配置、登录状态和权限策略，定时任务也不会替 Agent
+自动批准权限。
+
+## 本地开发
+
+需要 Node.js 22.13+、pnpm、Rust 1.90+、Python 3，以及对应平台的 Tauri
+系统依赖。
 
 ```bash
 pnpm install
 pnpm dev:app
 ```
 
-## 质量检查
+提交前运行：
 
 ```bash
 pnpm check
 ```
 
-该命令检查项目规范、格式、lint、类型、前端测试、Rust 测试和模板契约。测试证据与边界见 [docs/testing.md](docs/testing.md)。
+完整测试和 Windows/macOS 打包优先由 GitHub Actions 串行执行。项目结构、存储
+边界和原生验收记录分别见 [架构说明](docs/architecture.md)、
+[测试记录](docs/testing.md) 和 [任务日志](docs/task-log/2026-11.md)。
 
-## 文档
+## 许可证
 
-- [产品需求](docs/PRD.md)
-- [架构与技术约束](docs/architecture.md)
-- [功能台账](docs/tasks.md)
-- [协作手册](docs/workflow.md)
-
-## 双端安装包
-
-GitHub Actions 的 **Build desktop packages** 工作流可手动构建 macOS arm64 和 Windows x64 安装包，并保存为工作流附件。普通构建不会自动发布正式版本。
-
-本仓库基于 [SophiaData agent-project-template](https://github.com/SophiaData/agent-project-template) 的工程规范初始化。
+AgentTerm 使用 [MIT License](LICENSE)。

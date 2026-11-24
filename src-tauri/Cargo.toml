@@ -1,6 +1,6 @@
 [package]
 name = "agentterm"
-version = "0.2.0-rc.5"
+version = "0.2.0-rc.6"
 description = "A focused desktop manager for AI command-line tools"
 edition = "2024"
 rust-version = "1.90"
@@ -20,6 +20,7 @@ sha2 = "0.10.9"
 tauri-plugin-dialog = "2.8.4"
 portable-pty = "0.9.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+semver = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

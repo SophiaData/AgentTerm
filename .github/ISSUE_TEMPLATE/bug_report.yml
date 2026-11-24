@@ -1,0 +1,42 @@
+name: Bug report
+description: 报告可复现的 AgentTerm 问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: 请勿粘贴 Cookie、令牌、账号信息或私有项目内容。
+  - type: input
+    id: version
+    attributes:
+      label: AgentTerm 版本
+      placeholder: v0.2.0-rc.6
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - Windows x64
+        - macOS Apple Silicon
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: 1. 打开… 2. 点击… 3. 观察到…
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据
+      description: 可提供脱敏截图、错误文本和发生时间。

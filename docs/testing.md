@@ -1,5 +1,22 @@
 # Testing policy
 
+## issues #55–#66 与 v0.2.0-rc.6（2026-11-25）
+
+- 本轮按仓库 `project-policy.json` 逐项执行质量门。Windows 环境没有 `python3`
+  命令别名，因此 `pnpm check` 包装器在命令解析处退出；随后用 `python`
+  执行同一份 13 项检查，未跳过检查项。完整 Git Bash/Linux 原命令由 GitHub CI
+  再执行一次。
+- 前端：135 passed；Prettier、ESLint、TypeScript、Vite 生产构建通过。
+- Rust：203 passed / 2 ignored；`cargo fmt --check` 与
+  `cargo clippy -- -D warnings` 通过。新增覆盖包括超过 1 MiB 的输出排空、
+  进程树超时、调度 tick、并发运行拒绝、四套存储归档压实、文档锁短竞争重试、
+  会话列表对账、更新器 SemVer/资产/digest 分支。
+- TUI：15 passed；格式与 clippy 通过，release 构建通过。
+- 模板契约：13 passed；治理检查确认 15 个必需文件存在。
+- 本确认绑定当前 `codex/issues-55-66` 分支，尚未冒充 GitHub CI、合并、Release
+  或 Windows 原生实机验收。最终提交的 CI、Windows 覆盖安装和窗口截图结果将在
+  完成后补入本节。
+
 ## Agent 原生定时任务与 rc.5（2026-11-24）
 
 - 交互改造由 PR #52 交付并合入 `main`，合并提交 `25ca6dd362e0c14797b471a067584e5a4fc7db30`。CI `45386670629` 的 Linux `quality` 与 Windows `windows-frontend` 均通过；Windows Rust 测试启动时的 `STATUS_ENTRYPOINT_NOT_FOUND` 通过给测试链接目标嵌入 Common Controls v6 manifest 修复，未跳过测试。

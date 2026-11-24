@@ -13,6 +13,7 @@ const sessions: ActiveSession[] = ["a", "b", "c"].map((id) => ({
   label: `CLI ${id}`,
   titleSource: "default",
   running: true,
+  statusUnknown: false,
   exitReason: null,
   closeError: null,
 }));
@@ -28,6 +29,7 @@ function render(paneIds: string[], activeId: string | null) {
       onFocus={vi.fn()}
       onClose={vi.fn()}
       onExit={vi.fn()}
+      onConnection={vi.fn()}
       onRename={vi.fn(async (title) => ({ ok: true as const, title }))}
       onPromptLine={vi.fn()}
     />,

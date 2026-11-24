@@ -1,18 +1,15 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, NaiveTime, TimeZone};
 
+use crate::journal;
 use crate::projects::normalize_project_dir;
-use crate::tools::{
-    candidate_search_dirs, is_windows_batch, resolve_binary, windows_cmd_executable,
-};
+use crate::task_process::{self, ProcessError};
+use crate::tools::{candidate_search_dirs, resolve_binary};
 
 const STORE_BYTES: u64 = 1024 * 1024;
 const TASK_LIMIT: usize = 50;
@@ -215,6 +212,13 @@ impl Scheduler {
     }
 
     pub fn tick(&self) -> Result<(), String> {
+        self.tick_with(execute_task)
+    }
+
+    fn tick_with(
+        &self,
+        execute: impl FnOnce(&ScheduledTask) -> ScheduledRun,
+    ) -> Result<(), String> {
         let due = {
             let mut inner = self.lock()?;
             load_if_configured(&mut inner)?;
@@ -236,7 +240,7 @@ impl Scheduler {
         let Some(task) = due else {
             return Ok(());
         };
-        let run = execute_task(&task);
+        let run = execute(&task);
         let mut inner = self.lock()?;
         inner.running = false;
         load_if_configured(&mut inner)?;
@@ -420,9 +424,11 @@ fn clean_token(value: &str, label: &str, limit: usize) -> Result<String, String>
     if value.chars().count() > limit
         || value
             .chars()
-            .any(|ch| ch.is_whitespace() || ch.is_control())
+            .any(|ch| !(ch.is_ascii_alphanumeric() || "._:/@+-".contains(ch)))
     {
-        return Err(format!("{label}只能是一行且最多 {limit} 个字符"));
+        return Err(format!(
+            "{label}只能包含字母、数字和 . _ : / @ + -，且最多 {limit} 个字符"
+        ));
     }
     Ok(value.to_string())
 }
@@ -466,56 +472,33 @@ fn run_process(task: &ScheduledTask) -> Result<(i32, String), String> {
     let cwd = normalize_project_dir(&task.project_path)?;
     let (program, mut args) = command_for_tool(&binary, &task.tool_id, task.model.as_deref())?;
     args.push(task.prompt.clone());
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("无法启动定时任务：{error}"))?;
     let timeout = Duration::from_secs(task.timeout_minutes.saturating_mul(60));
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "任务超时（{} 分钟），已停止本次运行",
-                    task.timeout_minutes
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(error) => {
-                let _ = child.kill();
-                return Err(format!("无法确认任务状态：{error}"));
-            }
+    let captured =
+        task_process::run_scheduler_process(program, args, cwd, timeout, OUTPUT_LIMIT * 4)
+            .map_err(|error| process_error_text(error, task.timeout_minutes))?;
+    Ok((
+        captured.exit_code,
+        trim_output(&String::from_utf8_lossy(&captured.output)),
+    ))
+}
+
+fn process_error_text(error: ProcessError, timeout_minutes: u64) -> String {
+    match error {
+        ProcessError::Start => "无法安全启动任务 CLI".into(),
+        ProcessError::Input => "无法向任务 CLI 写入输入".into(),
+        ProcessError::Timeout => {
+            format!("任务超时（{timeout_minutes} 分钟），已停止整个进程树")
         }
-    };
-    let mut output = String::new();
-    if let Some(mut stdout) = child.stdout {
-        let _ = stdout.read_to_string(&mut output);
+        ProcessError::OutputLimit => "任务输出超过限制".into(),
+        ProcessError::OutputRead => "无法读取任务输出".into(),
+        ProcessError::NonZero => "任务 CLI 返回失败状态".into(),
+        ProcessError::Descendants => "任务退出后仍有子进程，已停止整个进程树".into(),
+        ProcessError::StopUnconfirmed => "无法确认任务进程树已经停止".into(),
+        ProcessError::StopRequested => "任务已被停止".into(),
+        ProcessError::StopRequestUnconfirmed => "无法确认任务进程树已经停止".into(),
+        ProcessError::StopRequestUnrecorded => "任务停止状态未能记录".into(),
+        ProcessError::StartIdentityUnrecorded => "任务启动身份无法记录".into(),
     }
-    if let Some(mut stderr) = child.stderr {
-        let mut err = String::new();
-        let _ = stderr.read_to_string(&mut err);
-        if !err.trim().is_empty() {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(&err);
-        }
-    }
-    Ok((status.code().unwrap_or(-1), trim_output(&output)))
 }
 
 fn resolve_tool(tool_id: &str) -> Result<PathBuf, String> {
@@ -539,14 +522,15 @@ fn command_for_tool(
     tool_id: &str,
     model: Option<&str>,
 ) -> Result<(PathBuf, Vec<String>), String> {
-    let binary_arg = binary.display().to_string();
     let mut args = Vec::new();
-    let program = if cfg!(windows) && is_windows_batch(binary) {
-        args.extend(["/D".into(), "/C".into(), binary_arg]);
-        windows_cmd_executable()
-    } else {
-        binary.to_path_buf()
-    };
+    #[cfg(windows)]
+    if !binary
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return Err("Windows 定时任务只允许直接启动 .exe CLI".into());
+    }
+    let program = binary.to_path_buf();
     match tool_id {
         "claude" => {
             args.push("--print".into());
@@ -603,22 +587,49 @@ fn read_store(path: &Path) -> Result<Vec<ScheduledTask>, String> {
 fn write_store(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> {
     validate_tasks(tasks)?;
     let _lock = lock_store(path)?;
-    let (revision, _) = read_existing(path)?;
-    let record = StoreRecord {
-        schema: 1,
-        revision: revision + 1,
-        sha256: hash(revision + 1, tasks)?,
-        tasks: tasks.to_vec(),
+    let existing_len = if journal::regular_or_missing(path).map_err(storage_error)? {
+        path.metadata().map_err(storage_error)?.len()
+    } else {
+        0
     };
-    let mut line = serde_json::to_vec(&record).map_err(|_| "定时任务无法保存".to_string())?;
-    line.push(b'\n');
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(storage_error)?;
-    file.write_all(&line).map_err(storage_error)?;
-    file.sync_all().map_err(storage_error)
+    let (revision, _) = read_existing(path)?;
+    let next_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| "定时任务版本号已耗尽".to_string())?;
+    let mut stored_tasks = tasks.to_vec();
+    let line = loop {
+        let record = StoreRecord {
+            schema: 1,
+            revision: next_revision,
+            sha256: hash(next_revision, &stored_tasks)?,
+            tasks: stored_tasks.clone(),
+        };
+        let mut line = serde_json::to_vec(&record).map_err(|_| "定时任务无法保存".to_string())?;
+        line.push(b'\n');
+        if line.len() as u64 <= STORE_BYTES {
+            break line;
+        }
+        let mut to_remove = (line.len() as u64 - STORE_BYTES)
+            .div_ceil((OUTPUT_LIMIT + 256) as u64)
+            .max(1) as usize;
+        while to_remove > 0 {
+            let index = stored_tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, task)| !task.runs.is_empty())
+                .max_by_key(|(_, task)| task.runs.len())
+                .map(|(index, _)| index)
+                .ok_or_else(|| "定时任务有效内容超过 1 MiB，请减少任务数量".to_string())?;
+            stored_tasks[index].runs.pop();
+            to_remove -= 1;
+        }
+    };
+    if existing_len.saturating_add(line.len() as u64) > STORE_BYTES {
+        journal::replace_and_archive(path, &line).map_err(storage_error)?;
+        Ok(())
+    } else {
+        journal::append(path, &line, existing_len == 0).map_err(storage_error)
+    }
 }
 
 fn read_locked(path: &Path) -> Result<(u64, Vec<ScheduledTask>), String> {
@@ -630,14 +641,10 @@ fn read_existing(path: &Path) -> Result<(u64, Vec<ScheduledTask>), String> {
     if !path.exists() {
         return Ok((0, Vec::new()));
     }
-    let file = File::open(path).map_err(storage_error)?;
-    let mut bytes = Vec::new();
-    file.take(STORE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(storage_error)?;
-    if bytes.len() as u64 > STORE_BYTES {
-        return Err("定时任务存储超过 1 MiB".into());
+    if !journal::regular_or_missing(path).map_err(storage_error)? {
+        return Ok((0, Vec::new()));
     }
+    let bytes = journal::read_bytes(path, journal::HARD_READ_LIMIT).map_err(storage_error)?;
     if bytes.is_empty() {
         return Ok((0, Vec::new()));
     }
@@ -645,44 +652,27 @@ fn read_existing(path: &Path) -> Result<(u64, Vec<ScheduledTask>), String> {
         return Err("定时任务存储校验失败".into());
     }
     let text = std::str::from_utf8(&bytes).map_err(|_| "定时任务存储不是有效文本".to_string())?;
-    let mut revision = 0u64;
+    let mut revision = None;
     let mut tasks = Vec::new();
     for line in text.split_terminator('\n') {
         let record: StoreRecord =
             serde_json::from_str(line).map_err(|_| "定时任务存储校验失败".to_string())?;
         if record.schema != 1
-            || revision + 1 != record.revision
+            || !journal::revision_follows(revision, record.revision)
             || record.sha256 != hash(record.revision, &record.tasks)?
         {
             return Err("定时任务存储校验失败".into());
         }
         validate_tasks(&record.tasks)?;
-        revision = record.revision;
+        revision = Some(record.revision);
         tasks = record.tasks;
     }
-    Ok((revision, tasks))
+    Ok((revision.unwrap_or_default(), tasks))
 }
 
-struct StoreLock(File);
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
-fn lock_store(path: &Path) -> Result<StoreLock, String> {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".lock");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(PathBuf::from(name))
-        .map_err(storage_error)?;
-    file.try_lock()
-        .map_err(|_| "定时任务正被另一操作使用，请重试".to_string())?;
-    Ok(StoreLock(file))
+fn lock_store(path: &Path) -> Result<journal::JournalLock, String> {
+    journal::lock(&journal::companion(path, ".lock"), true)
+        .map_err(|_| "定时任务正被另一操作使用，请重试".to_string())
 }
 
 fn hash(revision: u64, tasks: &[ScheduledTask]) -> Result<String, String> {
@@ -724,7 +714,11 @@ mod tests {
 
     #[test]
     fn scheduled_commands_leave_permissions_to_each_agent() {
-        let claude = super::command_for_tool(Path::new("claude"), "claude", None)
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let claude_name = format!("claude{suffix}");
+        let codex_name = format!("codex{suffix}");
+        let agy_name = format!("agy{suffix}");
+        let claude = super::command_for_tool(Path::new(&claude_name), "claude", None)
             .unwrap()
             .1;
         assert!(claude.iter().any(|arg| arg == "--print"));
@@ -732,7 +726,7 @@ mod tests {
             arg.contains("permission") || arg.contains("sandbox") || arg.contains("dangerously")
         }));
 
-        let codex = super::command_for_tool(Path::new("codex"), "codex", None)
+        let codex = super::command_for_tool(Path::new(&codex_name), "codex", None)
             .unwrap()
             .1;
         assert!(codex.iter().any(|arg| arg == "exec"));
@@ -740,7 +734,7 @@ mod tests {
             arg.contains("sandbox") || arg.contains("skip-git") || arg.contains("dangerously")
         }));
 
-        let agy = super::command_for_tool(Path::new("agy"), "agy", None)
+        let agy = super::command_for_tool(Path::new(&agy_name), "agy", None)
             .unwrap()
             .1;
         assert!(agy.iter().any(|arg| arg == "--print"));
@@ -811,6 +805,138 @@ mod tests {
         bad.tool_id = "shell".into();
         assert!(scheduler.save(bad).is_err());
     }
+
+    #[test]
+    fn model_rejects_command_metacharacters() {
+        for model in ["x&calc", "x|calc", "x>out", "x<in", "x^calc", "x\"calc"] {
+            let mut bad = draft("有效指令");
+            bad.model = Some(model.into());
+            let error = Scheduler::default().save(bad).unwrap_err();
+            assert!(error.contains("模型名称"), "{model}: {error}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scheduled_command_rejects_cmd_and_bat_wrappers() {
+        for binary in ["codex.cmd", "codex.bat"] {
+            let error = super::command_for_tool(Path::new(binary), "codex", None).unwrap_err();
+            assert!(error.contains(".exe"), "{binary}: {error}");
+        }
+    }
+
+    #[test]
+    fn concurrent_manual_runs_are_rejected() {
+        let scheduler = Scheduler::default();
+        scheduler.lock().unwrap().running = true;
+        let error = scheduler.run_now("missing").unwrap_err();
+        assert!(error.contains("已有定时任务正在运行"), "{error}");
+    }
+
+    #[test]
+    fn tick_runs_one_due_task_and_advances_its_next_schedule() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-schedule-tick-{}-{}.json",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let mut task = super::normalize_draft(draft("有效指令"), None).unwrap();
+        task.id = "task-due".into();
+        task.next_run_at_ms = 1;
+        super::write_store(&path, std::slice::from_ref(&task)).unwrap();
+        let scheduler = Scheduler::default();
+        scheduler.configure(path).unwrap();
+        let mut calls = 0;
+        scheduler
+            .tick_with(|selected| {
+                calls += 1;
+                assert_eq!(selected.id, "task-due");
+                super::ScheduledRun {
+                    started_at_ms: 10,
+                    finished_at_ms: 11,
+                    status: "成功".into(),
+                    exit_code: Some(0),
+                    output: "ok".into(),
+                }
+            })
+            .unwrap();
+        scheduler
+            .tick_with(|_| panic!("advanced task must not run twice"))
+            .unwrap();
+        let saved = scheduler.list().unwrap().remove(0);
+        assert_eq!(calls, 1);
+        assert_eq!(saved.runs.len(), 1);
+        assert!(saved.next_run_at_ms > super::now_ms());
+    }
+
+    #[test]
+    fn append_compaction_keeps_scheduled_storage_usable() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-schedule-compact-{}-{}.json",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let mut task = super::normalize_draft(draft("有效指令"), None).unwrap();
+        task.id = "task-compact".into();
+        task.runs = (0..super::RUN_LIMIT)
+            .map(|index| super::ScheduledRun {
+                started_at_ms: index as u64 + 1,
+                finished_at_ms: index as u64 + 2,
+                status: "成功".into(),
+                exit_code: Some(0),
+                output: "x".repeat(super::OUTPUT_LIMIT),
+            })
+            .collect();
+        for _ in 0..20 {
+            super::write_store(&path, std::slice::from_ref(&task)).unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() <= super::STORE_BYTES);
+        let loaded = super::read_store(&path).unwrap();
+        assert_eq!(loaded[0].id, "task-compact");
+        assert!(
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("agentterm-schedule-compact-")
+                    && entry.file_name().to_string_lossy().contains(".archive-"))
+        );
+    }
+
+    #[test]
+    fn compaction_reduces_oldest_run_outputs_to_the_effective_snapshot_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-schedule-effective-limit-{}-{}.json",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let tasks = (0..super::TASK_LIMIT)
+            .map(|task_index| {
+                let mut task = super::normalize_draft(draft("有效指令"), None).unwrap();
+                task.id = format!("task-{task_index}");
+                task.runs = (0..super::RUN_LIMIT)
+                    .map(|run_index| super::ScheduledRun {
+                        started_at_ms: run_index as u64 + 1,
+                        finished_at_ms: run_index as u64 + 2,
+                        status: "成功".into(),
+                        exit_code: Some(0),
+                        output: "x".repeat(super::OUTPUT_LIMIT),
+                    })
+                    .collect();
+                task
+            })
+            .collect::<Vec<_>>();
+        super::write_store(&path, &tasks).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= super::STORE_BYTES);
+        let loaded = super::read_store(&path).unwrap();
+        assert_eq!(loaded.len(), super::TASK_LIMIT);
+        assert!(
+            loaded.iter().map(|task| task.runs.len()).sum::<usize>()
+                < super::TASK_LIMIT * super::RUN_LIMIT
+        );
+    }
 }
 
 #[tauri::command]
@@ -852,9 +978,12 @@ pub fn remove_scheduled_task(state: tauri::State<'_, Scheduler>, id: String) -> 
 }
 
 #[tauri::command]
-pub fn run_scheduled_task_now(
+pub async fn run_scheduled_task_now(
     state: tauri::State<'_, Scheduler>,
     id: String,
 ) -> Result<ScheduledTask, String> {
-    state.run_now(&id)
+    let scheduler = state.handle();
+    tauri::async_runtime::spawn_blocking(move || scheduler.run_now(&id))
+        .await
+        .map_err(|error| format!("定时任务执行线程异常：{error}"))?
 }

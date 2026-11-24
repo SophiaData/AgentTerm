@@ -21,6 +21,12 @@ pub(crate) struct ProcessSpec {
     pub input: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapturedProcessOutput {
+    pub exit_code: i32,
+    pub output: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProcessControl(Arc<AtomicBool>);
 
@@ -89,6 +95,139 @@ pub(crate) fn observe_process(identity: &ProcessIdentity) -> ProcessObservation 
 
 pub(crate) fn run(spec: ProcessSpec, timeout: Duration) -> Result<Vec<u8>, ProcessError> {
     run_with_start(spec, timeout, |_| true)
+}
+
+/// Run a scheduled Agent CLI without a shell, drain stdout/stderr concurrently,
+/// and retain a bounded tail. Unlike the relay path, a non-zero exit is a
+/// completed run whose code and output are returned to the scheduler.
+pub(crate) fn run_scheduler_process(
+    binary: PathBuf,
+    args: Vec<String>,
+    cwd: PathBuf,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<CapturedProcessOutput, ProcessError> {
+    if timeout.is_zero() || output_limit == 0 {
+        return Err(ProcessError::Start);
+    }
+    #[cfg(windows)]
+    if !binary
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return Err(ProcessError::Start);
+    }
+
+    let mut command = Command::new(&binary);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for key in [
+        "ELECTRON_RUN_AS_NODE",
+        "ELECTRON_RENDERER_PORT",
+        "TMUX",
+        "TMUX_PANE",
+        "STY",
+    ] {
+        command.env_remove(key);
+    }
+    let mut scope = ProcessScope::new().map_err(|_| ProcessError::Start)?;
+    scope.configure(&mut command);
+    let mut child = command.spawn().map_err(|_| ProcessError::Start)?;
+    if scope.attach(&child).is_err() {
+        let _ = child.kill();
+        return Err(if reap(&mut child) {
+            ProcessError::Start
+        } else {
+            ProcessError::StopUnconfirmed
+        });
+    }
+
+    let stdout = child.stdout.take().ok_or(ProcessError::OutputRead)?;
+    let stderr = child.stderr.take().ok_or(ProcessError::OutputRead)?;
+    let per_stream_limit = (output_limit / 2).max(1);
+    let stdout_thread = std::thread::spawn(move || read_tail(stdout, per_stream_limit));
+    let stderr_thread = std::thread::spawn(move || read_tail(stderr, per_stream_limit));
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Err(_) => {
+                let _ = scope.stop(&mut child);
+                return Err(ProcessError::StopUnconfirmed);
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let stopped = scope.stop(&mut child);
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(if stopped {
+                    ProcessError::Timeout
+                } else {
+                    ProcessError::StopUnconfirmed
+                });
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+
+    let settle = Instant::now();
+    while scope.has_processes() && settle.elapsed() < Duration::from_millis(100) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let had_descendants = scope.has_processes();
+    let stopped = scope.stop(&mut child);
+    let stdout = stdout_thread.join().map_err(|_| ProcessError::OutputRead)?;
+    let stderr = stderr_thread.join().map_err(|_| ProcessError::OutputRead)?;
+    if !stopped {
+        return Err(ProcessError::StopUnconfirmed);
+    }
+    let mut output = stdout.map_err(|_| ProcessError::OutputRead)?;
+    let stderr = stderr.map_err(|_| ProcessError::OutputRead)?;
+    if !stderr.is_empty() {
+        if !output.is_empty() {
+            output.push(b'\n');
+        }
+        output.extend_from_slice(&stderr);
+    }
+    if had_descendants {
+        return Err(ProcessError::Descendants);
+    }
+    Ok(CapturedProcessOutput {
+        exit_code: status.code().unwrap_or(-1),
+        output,
+    })
+}
+
+fn read_tail(mut reader: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut tail = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(tail),
+            Ok(count) => {
+                let incoming = &chunk[..count];
+                if incoming.len() >= limit {
+                    tail.clear();
+                    tail.extend_from_slice(&incoming[incoming.len() - limit..]);
+                } else {
+                    let remove = tail
+                        .len()
+                        .saturating_add(incoming.len())
+                        .saturating_sub(limit);
+                    if remove > 0 {
+                        tail.drain(..remove);
+                    }
+                    tail.extend_from_slice(incoming);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Calls `on_started` after the child has been attached to its containment
@@ -745,10 +884,25 @@ mod tests {
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input).unwrap();
         match input.as_str() {
+            "" => {
+                let _ = std::io::stdout().write_all(&vec![b'z'; 1024 * 1024 + 8192]);
+            }
             "hang" => std::thread::sleep(Duration::from_secs(30)),
+            "hangdescendant" => {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--ignored", "--exact", &helper_name(), "--nocapture"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(b"hang").unwrap();
+                std::mem::forget(child);
+                std::thread::sleep(Duration::from_secs(30));
+            }
             "nonzero" => std::process::exit(7),
             "flood" => {
-                let _ = std::io::stdout().write_all(&vec![b'x'; OUTPUT_LIMIT + 8192]);
+                let _ = std::io::stdout().write_all(&vec![b'x'; 1024 * 1024 + 8192]);
             }
             "descendant" => {
                 let mut child = Command::new(std::env::current_exe().unwrap())
@@ -925,10 +1079,58 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(8));
     }
     #[test]
+    fn timeout_stops_the_entire_process_tree() {
+        let started = Instant::now();
+        assert_eq!(
+            run(spec("hangdescendant"), Duration::from_millis(100)),
+            Err(ProcessError::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(8));
+    }
+    #[test]
     fn excessive_output_is_rejected() {
         assert_eq!(
             run(spec("flood"), Duration::from_secs(5)),
             Err(ProcessError::OutputLimit)
+        );
+    }
+
+    #[test]
+    fn scheduler_process_drains_large_output_and_keeps_a_bounded_tail() {
+        let captured = run_scheduler_process(
+            std::env::current_exe().unwrap(),
+            vec![
+                "--ignored".into(),
+                "--exact".into(),
+                helper_name(),
+                "--nocapture".into(),
+            ],
+            std::env::temp_dir(),
+            Duration::from_secs(15),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(captured.exit_code, 0);
+        assert!(captured.output.len() <= 4096);
+        assert!(
+            captured.output.iter().filter(|byte| **byte == b'z').count() > 1024,
+            "tail: {}",
+            String::from_utf8_lossy(&captured.output)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scheduler_process_rejects_batch_wrappers() {
+        assert_eq!(
+            run_scheduler_process(
+                PathBuf::from("agentterm-test.cmd"),
+                Vec::new(),
+                std::env::temp_dir(),
+                Duration::from_secs(1),
+                1024,
+            ),
+            Err(ProcessError::Start)
         );
     }
     #[test]

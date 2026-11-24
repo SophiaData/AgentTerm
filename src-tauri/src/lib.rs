@@ -1,3 +1,4 @@
+mod journal;
 mod project_files;
 mod projects;
 mod schedule_mcp;
@@ -5,6 +6,7 @@ mod scheduled_tasks;
 mod session_history;
 mod sessions;
 mod task_commands;
+mod task_dispatch;
 pub mod task_document;
 pub mod task_ledger;
 mod task_process;
@@ -34,6 +36,7 @@ pub fn run() {
             project_files::preview_project_file,
             project_files::reveal_project_file,
             sessions::start_session,
+            sessions::list_sessions,
             sessions::session_snapshot,
             sessions::write_session_input,
             sessions::resize_session,
@@ -47,6 +50,7 @@ pub fn run() {
             task_commands::cancel_main_task_reservation,
             task_commands::recover_main_task_reservation,
             task_commands::resume_main_task_after_recovery,
+            task_commands::release_completed_task,
             task_commands::workbench_snapshot,
             task_commands::create_workbench_task,
             task_commands::attach_task_plan,

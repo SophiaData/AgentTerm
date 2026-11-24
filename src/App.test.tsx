@@ -112,6 +112,12 @@ describe("AgentTerm application shell", () => {
       `id="pane-${second.info.id}" role="tabpanel" aria-labelledby="tab-${second.info.id}"`,
     );
     expect(html.match(/aria-selected="true"/g)).toHaveLength(1);
+    expect(html.match(/class="workspace-tab-item"/g)).toHaveLength(2);
+    expect(html.match(/class="workspace-tab-close"/g)).toHaveLength(2);
+    expect(html).not.toContain(
+      '<span class="workspace-tab-close" role="button"',
+    );
+    expect(html).toContain('aria-label="打开项目与会话栏"');
     store.showLauncher();
     const launcherHtml = render();
     expect(launcherHtml.match(/role="tabpanel"/g)).toHaveLength(2);

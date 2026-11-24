@@ -367,6 +367,34 @@ describe("task workbench", () => {
     expect(ready).toContain("已确认退出");
     expect(ready).toContain("核实并接回任务");
   });
+  it("offers an explicit completed-task release and launch-uncertain manual exit", () => {
+    const completed = view();
+    completed.ledger.active!.phase = "waitingInput";
+    const completedHtml = renderToStaticMarkup(
+      <TaskCard view={completed} busy={false} preview={null} {...callbacks} />,
+    );
+    expect(completedHtml).toContain("确认完成并释放任务");
+
+    const uncertain = view();
+    uncertain.ledger.active!.phase = "recoveryRequired";
+    uncertain.ledger.active!.recoveryRequired = true;
+    uncertain.document!.events = [start];
+    uncertain.recovery = {
+      attempts: [
+        {
+          attemptId: start.attemptId,
+          stepId: start.stepId,
+          observation: "launchUncertain",
+          safeToResume: false,
+        },
+      ],
+      allExited: false,
+    };
+    const uncertainHtml = renderToStaticMarkup(
+      <TaskCard view={uncertain} busy={false} preview={null} {...callbacks} />,
+    );
+    expect(uncertainHtml).toContain("人工核实并结束任务");
+  });
   it("recovered reservations remain undispatched and can be cancelled by their owner", () => {
     const current = view();
     current.ledger.active!.phase = "recoveredReserved";
