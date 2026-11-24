@@ -23,26 +23,5 @@ export type ScheduledTask = {
   enabled: boolean;
   nextRunAtMs: number;
   runs: ScheduledRun[];
-};
-
-export type ScheduledTaskDraft = {
-  name: string;
-  projectPath: string;
-  toolId: string;
-  model: string;
-  prompt: string;
-  schedule: ScheduleSpec;
-  timeoutMinutes: number;
-  enabled: boolean;
-};
-
-export const EMPTY_SCHEDULE_DRAFT: ScheduledTaskDraft = {
-  name: "",
-  projectPath: "",
-  toolId: "claude",
-  model: "",
-  prompt: "",
-  schedule: { kind: "interval", minutes: 60 },
-  timeoutMinutes: 20,
-  enabled: true,
+  sourceSessionId?: string | null;
 };

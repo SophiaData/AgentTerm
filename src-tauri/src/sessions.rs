@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
 use crate::projects::normalize_project_dir;
+use crate::schedule_mcp::ScheduleMcp;
 use crate::tools::{
     ResolveResult, TOOL_DEFINITIONS, candidate_search_dirs, is_windows_batch, resolve_binary,
     windows_cmd_executable,
@@ -123,6 +124,16 @@ pub struct SpawnedPty {
     pub job: Option<WinJob>,
 }
 
+pub struct SessionLaunch<'a> {
+    pub session_id: &'a str,
+    pub tool_id: &'a str,
+    pub project_path: &'a str,
+    pub rows: u16,
+    pub cols: u16,
+    pub tool_args: Vec<String>,
+    pub schedule_guard: ScheduleMcp,
+}
+
 fn has_utf8_locale(value: Option<&std::ffi::OsStr>) -> bool {
     value.and_then(|item| item.to_str()).is_some_and(|text| {
         let lower = text.to_ascii_lowercase();
@@ -146,7 +157,11 @@ fn windows_console_codepage_utf8() {
 /// Builds the command and environment for `spawn_pty` so command selection
 /// (including Windows `.cmd`/`.bat` wrappers), verbatim path stripping, and
 /// UTF-8 locale setup can be unit-tested without opening a ConPTY host.
-fn build_pty_command(binary: &std::path::Path, cwd: &std::path::Path) -> CommandBuilder {
+fn build_pty_command(
+    binary: &std::path::Path,
+    cwd: &std::path::Path,
+    additional_args: &[String],
+) -> CommandBuilder {
     let clean_binary = strip_windows_verbatim(binary);
     let clean_cwd = strip_windows_verbatim(cwd);
     let mut command = if is_windows_batch(&clean_binary) {
@@ -158,6 +173,9 @@ fn build_pty_command(binary: &std::path::Path, cwd: &std::path::Path) -> Command
     } else {
         CommandBuilder::new(&clean_binary)
     };
+    for argument in additional_args {
+        command.arg(argument);
+    }
     command.cwd(clean_cwd.as_os_str());
     for (key, _) in std::env::vars() {
         if ENV_BLOCKLIST.contains(&key.as_str()) {
@@ -196,6 +214,7 @@ pub fn spawn_pty(
     cwd: &std::path::Path,
     rows: u16,
     cols: u16,
+    additional_args: &[String],
 ) -> Result<SpawnedPty, String> {
     #[cfg(windows)]
     windows_console_codepage_utf8();
@@ -209,7 +228,7 @@ pub fn spawn_pty(
         })
         .map_err(|error| format!("无法创建终端：{error}"))?;
 
-    let command = build_pty_command(binary, cwd);
+    let command = build_pty_command(binary, cwd, additional_args);
 
     let child = pair
         .slave
@@ -677,15 +696,16 @@ impl SessionManager {
         }
     }
 
-    pub fn start(
-        &self,
-        app: AppHandle,
-        session_id: &str,
-        tool_id: &str,
-        project_path: &str,
-        rows: u16,
-        cols: u16,
-    ) -> Result<SessionInfo, String> {
+    pub fn start(&self, app: AppHandle, request: SessionLaunch<'_>) -> Result<SessionInfo, String> {
+        let SessionLaunch {
+            session_id,
+            tool_id,
+            project_path,
+            rows,
+            cols,
+            tool_args,
+            schedule_guard,
+        } = request;
         let tool = TOOL_DEFINITIONS
             .iter()
             .find(|definition| definition.id == tool_id)
@@ -714,7 +734,7 @@ impl SessionManager {
             }
         }
 
-        let spawned = spawn_pty(&binary, &project_dir, rows, cols)?;
+        let spawned = spawn_pty(&binary, &project_dir, rows, cols, &tool_args)?;
         let SpawnedPty {
             master,
             child,
@@ -782,6 +802,7 @@ impl SessionManager {
         let app_output = app.clone();
         let app_exit = app;
         let history_writer = Arc::clone(&self.history);
+        let schedule_guard_exit = schedule_guard;
 
         // Reader thread: streams PTY output to the frontend as UTF-8 text and
         // keeps a replayable copy in the session buffer. The loop itself lives in
@@ -896,6 +917,7 @@ impl SessionManager {
                     reason,
                 },
             );
+            schedule_guard_exit.revoke_session(&exit_id);
         });
 
         Ok(info)
@@ -1095,8 +1117,10 @@ impl SessionManager {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects state/AppHandle beside the IPC args.
 pub fn start_session(
     state: tauri::State<'_, SessionManager>,
+    schedule_mcp: tauri::State<'_, ScheduleMcp>,
     app: AppHandle,
     session_id: String,
     tool_id: String,
@@ -1104,7 +1128,32 @@ pub fn start_session(
     rows: u16,
     cols: u16,
 ) -> Result<SessionInfo, String> {
-    state.start(app, &session_id, &tool_id, &project_path, rows, cols)
+    let bridge = schedule_mcp.issue_session(&session_id, &project_path, &tool_id, None)?;
+    let tool_args = match bridge.command_args(&tool_id) {
+        Ok(args) => args,
+        Err(error) => {
+            schedule_mcp.revoke_session(&session_id);
+            return Err(error);
+        }
+    };
+    match state.start(
+        app,
+        SessionLaunch {
+            session_id: &session_id,
+            tool_id: &tool_id,
+            project_path: &project_path,
+            rows,
+            cols,
+            tool_args,
+            schedule_guard: schedule_mcp.handle(),
+        },
+    ) {
+        Ok(info) => Ok(info),
+        Err(error) => {
+            schedule_mcp.revoke_session(&session_id);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1137,17 +1186,23 @@ pub fn resize_session(
 #[tauri::command]
 pub fn forget_session(
     state: tauri::State<'_, SessionManager>,
+    schedule_mcp: tauri::State<'_, ScheduleMcp>,
     session_id: String,
 ) -> Result<(), String> {
-    state.forget(&session_id)
+    state.forget(&session_id)?;
+    schedule_mcp.revoke_session(&session_id);
+    Ok(())
 }
 
 #[tauri::command]
 pub fn stop_session(
     state: tauri::State<'_, SessionManager>,
+    schedule_mcp: tauri::State<'_, ScheduleMcp>,
     session_id: String,
 ) -> Result<(), String> {
-    state.stop(&session_id)
+    state.stop(&session_id)?;
+    schedule_mcp.revoke_session(&session_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1652,7 +1707,7 @@ mod tests {
         let dir = std::env::temp_dir().join("agentterm-buffer-test");
         std::fs::create_dir_all(&dir).expect("dir should be created");
 
-        let mut pty = spawn_pty(Path::new("/bin/cat"), &dir, 30, 120).unwrap();
+        let mut pty = spawn_pty(Path::new("/bin/cat"), &dir, 30, 120, &[]).unwrap();
         pty.writer.write_all(b"replay-me\r").unwrap();
         pty.writer.flush().unwrap();
 
@@ -1675,8 +1730,8 @@ mod tests {
         std::fs::create_dir_all(&first_dir).expect("dir a should be created");
         std::fs::create_dir_all(&second_dir).expect("dir b should be created");
 
-        let mut first = spawn_pty(Path::new("/bin/cat"), &first_dir, 24, 80).unwrap();
-        let mut second = spawn_pty(Path::new("/bin/cat"), &second_dir, 24, 80).unwrap();
+        let mut first = spawn_pty(Path::new("/bin/cat"), &first_dir, 24, 80, &[]).unwrap();
+        let mut second = spawn_pty(Path::new("/bin/cat"), &second_dir, 24, 80, &[]).unwrap();
 
         first.writer.write_all(b"alpha\r").unwrap();
         first.writer.flush().unwrap();
@@ -1858,7 +1913,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
 
         // A shell that prints a marker then exits immediately.
-        let mut pty = spawn_pty(Path::new("/bin/sh"), &dir, 30, 120).unwrap();
+        let mut pty = spawn_pty(Path::new("/bin/sh"), &dir, 30, 120, &[]).unwrap();
         use std::io::Write;
         pty.writer.write_all(b"echo TAIL-MARKER; exit 0\r").unwrap();
         pty.writer.flush().unwrap();
@@ -1996,7 +2051,7 @@ mod tests {
             });
         }
 
-        manager.stop_all();
+        let _ = manager.stop_all();
 
         let listed = manager.list_history().unwrap();
         assert_eq!(listed.len(), 2);
@@ -2036,17 +2091,22 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn build_pty_command_wraps_windows_cmd_and_strips_verbatim_cwd() {
+    fn build_pty_command_wraps_windows_cmd_and_preserves_tool_args() {
+        let extra = vec![
+            "-c".to_string(),
+            "mcp_servers.agentterm_scheduler.url=\"http://127.0.0.1:1/mcp\"".to_string(),
+        ];
         let cmd = super::build_pty_command(
             Path::new(r"\\?\C:\Users\Administrator\AppData\Roaming\npm\codex.cmd"),
             Path::new(r"\\?\E:\AgentTerm"),
+            &extra,
         );
         let args: Vec<String> = cmd
             .get_argv()
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args.len(), 4);
+        assert_eq!(args.len(), 6);
         assert!(args[0].to_ascii_lowercase().ends_with("cmd.exe"));
         assert_eq!(args[1], "/D");
         assert_eq!(args[2], "/C");
@@ -2054,6 +2114,8 @@ mod tests {
             args[3],
             r"C:\Users\Administrator\AppData\Roaming\npm\codex.cmd"
         );
+        assert_eq!(args[4], extra[0]);
+        assert_eq!(args[5], extra[1]);
         assert_eq!(cmd.get_cwd().unwrap().to_string_lossy(), r"E:\AgentTerm");
         assert_eq!(cmd.get_env("PYTHONUTF8").unwrap(), "1");
         assert_eq!(cmd.get_env("PYTHONIOENCODING").unwrap(), "utf-8");

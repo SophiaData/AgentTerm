@@ -777,11 +777,6 @@ export default function App() {
       ) : null}
       {scheduleOpen ? (
         <ScheduledTasks
-          context={{
-            projectPath:
-              currentSession?.info.projectPath ?? selectedProject?.path ?? "",
-            toolId: currentSession?.info.toolId ?? selectedTool?.id ?? "",
-          }}
           onClose={() => setScheduleOpen(false)}
           onNotice={setTaskNotice}
         />

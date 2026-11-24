@@ -1,5 +1,6 @@
 mod project_files;
 mod projects;
+mod schedule_mcp;
 mod scheduled_tasks;
 mod session_history;
 mod sessions;
@@ -23,6 +24,7 @@ pub fn run() {
         .manage(sessions::SessionManager::default())
         .manage(task_commands::TaskLedgerState::default())
         .manage(scheduled_tasks::Scheduler::default())
+        .manage(schedule_mcp::ScheduleMcp::default())
         .invoke_handler(tauri::generate_handler![
             tools::detect_tools,
             projects::list_projects,
@@ -82,6 +84,9 @@ pub fn run() {
                 .configure(directory.join("agentterm-scheduled-tasks.json"))
                 .map_err(std::io::Error::other)?;
             let scheduler = app.state::<scheduled_tasks::Scheduler>().handle();
+            app.state::<schedule_mcp::ScheduleMcp>()
+                .configure(scheduler.handle(), app.handle().clone())
+                .map_err(std::io::Error::other)?;
             std::thread::spawn(move || {
                 loop {
                     if let Err(error) = scheduler.tick() {

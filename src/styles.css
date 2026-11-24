@@ -2254,10 +2254,14 @@ h2 {
 }
 .schedule-meta,
 .schedule-next,
+.schedule-source,
 .schedule-no-run {
   margin: 0;
   color: #8d98a6;
   font-size: 11px;
+}
+.schedule-source {
+  color: #8cdec2;
 }
 .schedule-meta i {
   margin: 0 6px;
@@ -2269,7 +2273,7 @@ h2 {
   gap: 6px;
 }
 .schedule-actions button,
-.schedule-preview button {
+.schedule-agent-note button {
   padding: 4px 9px;
   border: 1px solid #334252;
   border-radius: 6px;
@@ -2297,43 +2301,32 @@ h2 {
   font-size: 11px;
   white-space: pre-wrap;
 }
-.schedule-composer {
+.schedule-agent-note {
   display: grid;
   flex: none;
-  gap: 8px;
-  padding: 10px 14px 14px;
+  gap: 7px;
+  margin: 0 14px 14px;
+  padding: 12px;
   border-top: 1px solid #293542;
-  background: #111820;
+  border: 1px solid #293542;
+  border-radius: 10px;
+  background: linear-gradient(145deg, #111820, #121b22);
 }
-.schedule-composer textarea {
-  width: 100%;
-  box-sizing: border-box;
-  resize: none;
-  padding: 9px 10px;
-  border: 1px solid #334252;
-  border-radius: 8px;
-  background: #0d1117;
-  color: #e6edf3;
-  font: inherit;
-  font-size: 12px;
-}
-.schedule-composer > .primary-button {
-  justify-self: end;
-}
-.schedule-preview {
-  display: grid;
-  gap: 6px;
-  padding: 10px;
-  border: 1px solid #385246;
-  border-radius: 8px;
-  background: #17241d;
+.schedule-agent-note > span {
+  color: #8cdec2;
   font-size: 11px;
+  letter-spacing: 0.04em;
 }
-.schedule-preview strong {
+.schedule-agent-note strong {
   color: #e6edf3;
   font-size: 13px;
 }
-.schedule-preview > div {
-  display: flex;
-  gap: 6px;
+.schedule-agent-note p {
+  margin: 0;
+  color: #8d98a6;
+  font-size: 11px;
+  line-height: 1.55;
+}
+.schedule-agent-note button {
+  justify-self: end;
 }
