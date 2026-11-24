@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { PRODUCT_NAME } from "./meta";
 import TaskWorkbench from "./TaskWorkbench";
+import ProjectFiles from "./files/ProjectFiles";
+import { displayPath } from "./projects/displayPath";
 import { useProjects } from "./projects/useProjects";
 import SessionWorkspace from "./terminal/SessionWorkspace";
 import {
@@ -36,6 +38,7 @@ export default function App() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [toolId, setToolId] = useState<string | null>(null);
   const [recordsOpen, setRecordsOpen] = useState(false);
+  const [filesOpen, setFilesOpen] = useState(true);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
     projects.projects.find((p) => p.id === projectId) ?? projects.projects[0];
@@ -43,6 +46,9 @@ export default function App() {
     tools.tools.find((t) => t.id === toolId && t.state.kind === "installed") ??
     tools.tools.find((t) => t.state.kind === "installed");
   const currentSession = launcher.session;
+  const fileProject = currentSession
+    ? projects.projects.find((p) => p.path === currentSession.info.projectPath)
+    : selectedProject;
   const projectBusy = projects.loading || projects.busy || launcher.busy;
   const activeSessionIds = new Set(launcher.sessions.map((s) => s.info.id));
   const recentHistory = recentClosedHistory(history.records, activeSessionIds);
@@ -77,7 +83,7 @@ export default function App() {
       className="workspace-session-link"
       aria-current={launcher.activeId === session.info.id ? "true" : undefined}
       onClick={() => selectSession(session)}
-      title={session.info.projectPath}
+      title={displayPath(session.info.projectPath)}
     >
       <span
         className={`session-dot${session.running ? " is-running" : ""}`}
@@ -89,7 +95,9 @@ export default function App() {
   );
 
   return (
-    <main className={`session-workspace${recordsOpen ? " with-records" : ""}`}>
+    <main
+      className={`session-workspace${recordsOpen ? " with-records" : ""}${filesOpen && fileProject ? " with-files" : ""}`}
+    >
       <aside className="workspace-sidebar" aria-label="项目与会话">
         <div className="workspace-brand">
           <span className="workspace-brand-icon" aria-hidden="true">
@@ -136,7 +144,7 @@ export default function App() {
                 aria-current={
                   selectedProject?.id === project.id ? "true" : undefined
                 }
-                title={project.path}
+                title={displayPath(project.path)}
                 onClick={() => {
                   setProjectId(project.id);
                   const recent = launcher.sessions
@@ -221,7 +229,7 @@ export default function App() {
           {selectedProject ? (
             <details className="sidebar-details">
               <summary>项目设置</summary>
-              <p>{selectedProject.path}</p>
+              <p>{displayPath(selectedProject.path)}</p>
               {projects.pendingRemoval ? (
                 <div className="sidebar-removal">
                   <p>
@@ -287,6 +295,19 @@ export default function App() {
             <button
               type="button"
               className="ghost-button"
+              disabled={!fileProject}
+              aria-expanded={filesOpen && !!fileProject}
+              aria-controls="project-files"
+              onClick={() => {
+                setFilesOpen((open) => !open);
+                setRecordsOpen(false);
+              }}
+            >
+              文件
+            </button>
+            <button
+              type="button"
+              className="ghost-button"
               aria-pressed={launcher.paneIds.length === 2}
               disabled={!currentSession || launcher.sessions.length < 2}
               title="并排查看两个已有会话；选择其他会话会替换当前面板"
@@ -303,7 +324,10 @@ export default function App() {
               className="ghost-button"
               aria-expanded={recordsOpen}
               aria-controls="session-records"
-              onClick={() => setRecordsOpen((open) => !open)}
+              onClick={() => {
+                setRecordsOpen((open) => !open);
+                setFilesOpen(false);
+              }}
             >
               {recordsOpen ? "收起任务记录" : "任务记录"}
             </button>
@@ -330,7 +354,7 @@ export default function App() {
                 }
                 className="workspace-tab"
                 key={session.info.id}
-                title={session.info.projectPath}
+                title={displayPath(session.info.projectPath)}
                 onClick={() => selectSession(session)}
                 onKeyDown={(event) => {
                   const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
@@ -489,9 +513,9 @@ export default function App() {
                   </button>
                   <p
                     className="workspace-start-path"
-                    title={selectedProject.path}
+                    title={displayPath(selectedProject.path)}
                   >
-                    {selectedProject.path}
+                    {displayPath(selectedProject.path)}
                   </p>
                 </>
               ) : (
@@ -538,7 +562,7 @@ export default function App() {
                             (item) => item.id === record.toolId,
                           );
                           const reasonTitle = reopenTool
-                            ? record.projectPath
+                            ? displayPath(record.projectPath)
                             : registeredTool
                               ? `${record.toolName}${badgeLabel(registeredTool.state)}`
                               : `未找到 ${record.toolName}`;
@@ -552,7 +576,7 @@ export default function App() {
                                   {record.toolName} ·{" "}
                                   {folderName(record.projectPath)}
                                 </strong>
-                                <span title={record.projectPath}>
+                                <span title={displayPath(record.projectPath)}>
                                   {historyStatusText(record)} ·{" "}
                                   {formatSessionTime(record.startedAtMs)}
                                 </span>
@@ -600,6 +624,13 @@ export default function App() {
           </div>
         ) : null}
       </section>
+      {filesOpen && fileProject ? (
+        <ProjectFiles
+          key={fileProject.id}
+          project={fileProject}
+          onClose={() => setFilesOpen(false)}
+        />
+      ) : null}
       {recordsOpen ? (
         <aside
           className="workspace-records"

@@ -1,3 +1,4 @@
+mod project_files;
 mod projects;
 mod session_history;
 mod sessions;
@@ -24,6 +25,9 @@ pub fn run() {
             projects::list_projects,
             projects::add_project,
             projects::remove_project,
+            project_files::list_project_files,
+            project_files::preview_project_file,
+            project_files::reveal_project_file,
             sessions::start_session,
             sessions::session_snapshot,
             sessions::write_session_input,

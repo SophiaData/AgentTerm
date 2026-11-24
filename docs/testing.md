@@ -1,5 +1,38 @@
 # Testing policy
 
+## 项目文件浏览切片（2026-11-23）
+
+- 用户明确要求解决 CLI 查看文件不方便的问题。本切片增加当前项目文件面板：目录展开/收起、刷新、点击只读预览、关闭预览及打开系统资源管理器。面板跟随当前项目，与任务记录互斥，现有终端保持挂载；窄窗以抽屉展示。
+- 后端只接受已登记项目 ID 与相对路径；覆盖目录穿越/绝对路径/替代数据流拒绝、普通文件检查、链接目录拒绝、中文/BOM 文本读取、1 MiB 预览限制和 1000 项目录限制。新增 Rust 回归尚待本 PR 的 GitHub CI 执行；不把静态检查写成后端运行通过。
+- 本地只运行相关四个前端测试文件，31 passed；包括旧文件迟到回包不覆盖新选择、关闭预览后迟到错误不显示、项目间状态隔离、刷新获得 CLI 更新、读取失败重试，以及文件中的 HTML/script 以纯文本呈现。TypeScript 与改动范围 ESLint、格式检查通过。
+- 原地址修复的 CI `45207152043` 在本次需求追加后主动取消，不计通过。文件浏览与地址修复共用正式 [PR #36](https://github.com/SophiaData/AgentTerm/pull/36)，完整检查、合并、安装包和原生核验结果以该 PR 正文与 Checks 为准。下方 `52a9a59` 是此前已安装版本，不含本次两项界面增量。
+- 本节是提交前验证记录。文件编辑、删除、重命名、自动目录监听、非文本内嵌预览不在本切片内；大文件/非文本文件使用系统资源管理器入口。Agy 真实对话和完整停止恢复仍单列，#12/M4 不因此完成。
+
+## 首页地址前缀修复（2026-11-23）
+
+- 用户反馈首页地址“乱码”。定向回读首页首个项目，实际存储路径为 `\\?\E:\AgentTerm` 且目录存在；`projects.rs::normalize_project_dir` 使用 Windows `canonicalize`，首页原先直接显示该内部长路径前缀。此处是路径呈现问题，未发现这条地址的字符编码损坏。
+- 前端 `displayPath` 仅将明确的 `\\?\盘符:\` 与 `\\?\UNC\服务器\共享` 转为普通地址，在首页地址、项目设置、项目/会话提示与最近会话提示使用。其他路径保持原样；后端、项目 ID、持久化、路径比较与启动参数继续使用原路径，没有迁移或改写项目记录。
+- 本地定向回归先在旧实现得到 2 failed（盘符及 UNC 的首页地址），修复后 `pnpm exec vitest run src/App.test.tsx src/projects/displayPath.test.ts --maxWorkers=1 --no-file-parallelism` 为 20 passed；包含中文和空格、网络共享、普通 Windows/macOS 路径、未知设备路径不误改，以及最近会话提示。仅运行必要的前端回归，完整质量检查和打包继续在 GitHub 串行进行。
+- 本节记录修复提交前的复现和验证。下方 `52a9a59` 安装证据来自修复前的包，不包含本次地址显示修复；本修复 PR 的最新检查、合并与打包结果以其 Checks / 正文为准。Agy 真实对话、完整停止恢复及 #12/M4 仍独立验收。
+
+## Windows 安装与启动核验（2026-11-23）
+
+- 用户明确要求“安装一下吧”，并要求确认无问题的改动提交合并，不长期留在草稿。按本次授权下载构建 `45169830049` 的 `windows-x64-nsis` 附件，实际归档 SHA-256 与 GitHub 返回的 `14c79752a1c291d90a6ca16718fdad1ad1388df1ca20797c0b21208537998bda` 一致；来源为已通过 CI 的 `main` 提交 `52a9a59585a9746327d83127fe29369d70ddcf2b`。
+- 安装器 `AgentTerm_0.2.0-rc.1_x64-setup.exe` 为 2462406 bytes，SHA-256 `35b82d150f21b93005fd75efc6c6ebbf512dd9bd505bf7d477879b1d136c3e1e`。核对 Tauri CLI `2.12.5` 的 NSIS 模板后，以 `/S /UPDATE /D=E:\AgentTerm\app-52a9a59` 安装到新目录；`/UPDATE` 跳过旧版卸载，安装器 PID 31408 退出码为 0。
+- 实际安装 `E:\AgentTerm\app-52a9a59\agentterm.exe` 为 10791424 bytes，SHA-256 `262e03f4fadd4e8a16c963cb35f5303400cb41544560da58747879f6292f99cf`；卸载注册信息的安装位置已指向新目录，版本仍为 `0.2.0-rc.1`，辨别本轮构建须同时核对提交和摘要。
+- 安装前已在 `backups/install-52a9a59-2026-11-23` 备份旧可执行文件、卸载程序、安装信息和快捷方式。旧目录 `E:\AgentTerm\app-a7c59bf` 的两个程序文件安装前后摘要一致；桌面与开始菜单的 `AgentTerm.lnk` 均已指向新 EXE，工作目录为新安装目录。
+- 新版进程 PID 23224，实测可执行路径为新目录，窗口标题 `AgentTerm`、窗口句柄非零、`Responding=True`。该证据仅证明安装和窗口启动，不代表 Agy 会话、中文交互、停止恢复或 #12/M4 完整验收通过；没有创建正式 Release。
+- 本轮直接执行授权的附件下载与 NSIS 安装均成功；没有使用此前被拒绝的临时 MSI 解包方案。下方“尚未下载/安装/启动”属于旧轮记录。唯一下一项仍为在模型可用后，对本次固定包验收 Agy 真实交互及执行→停止→重启核实→换绑接续。
+
+## PR #35 合并与 main 安装包（2026-11-23）
+
+- 用户明确授权“测试通过就合并打包”。PR 最终提交 `7cd670a8f73da2f988b76801410829dfecb14daa` 的 [CI 45165330066](https://github.com/SophiaData/AgentTerm/actions/runs/45165330066) Linux/Windows 两端成功后，[PR #35](https://github.com/SophiaData/AgentTerm/pull/35) 已合入 `main`，合并提交 `52a9a59585a9746327d83127fe29369d70ddcf2b`；合并后的文件内容与已验证 PR 相同。
+- 合并后的 [CI 45167546361](https://github.com/SophiaData/AgentTerm/actions/runs/45167546361) 两端成功：Linux 13 项质量检查通过，后端 169 passed / 2 ignored、TUI 17 passed；Windows 后端 164 passed / 2 ignored，两项 Agy 默认目录及 PATH 优先级回归均通过。全部在 GitHub 串行完成，本地未重复编译。
+- 等 `main` CI 完成后，才启动 [Windows 构建 45169830049](https://github.com/SophiaData/AgentTerm/actions/runs/45169830049)，同一合并提交的 Windows x64 NSIS 安装包构建成功，用时 11 分 41 秒；本次未构建独立 TUI 包。
+- 附件 [windows-x64-nsis](https://github.com/SophiaData/AgentTerm/actions/runs/45169830049)，2462588 bytes，GitHub 附件 SHA-256 `14c79752a1c291d90a6ca16718fdad1ad1388df1ca20797c0b21208537998bda`，回读时未过期，保留至 2027-02-21。此摘要属于 GitHub 附件，不代表解包后的安装器或应用 EXE。
+- 本轮仅完成合并与构建，没有下载、安装或启动新包，没有创建正式 Release；此前下载/临时 MSI 解包的自动审批阻塞未重试或绕过，模型代理本轮未重新探测。Agy 应用内检测、中文交互及真实停止恢复仍待验收，#12/M4 不因此标记完成。下一项为使用此 `main` 包完成原生验收。
+- 以下是各轮历史证据；旧的“草稿/不合并”和旧包链接不代表最新交付状态。本段记录合并及打包时的状态，后续安装结果见上一节；构建状态与下载入口同时记录在 PR #35 正文。
+
 ## Agy 默认安装目录检测补修（2026-11-23）
 
 - 用户要求继续适配 Agy；本机 `Get-Command agy` 未找到入口，但定向检查 `%LOCALAPPDATA%\agy\bin\agy.exe` 后，真实 `--version` 返回 `1.5.15`，`--help` 正常退出。该目录不在当前 PATH 中，原 `candidate_search_dirs` 又仅补查 npm/pnpm 等目录，因此漏检；不能据 PATH 缺失断言 Agy 未安装。

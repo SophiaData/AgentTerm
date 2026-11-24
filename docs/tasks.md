@@ -7,6 +7,14 @@
 
 ## 当前方向与下一项工作（2026-11-23）
 
+**当前增量：项目文件浏览（11 月 23 日）**：按用户追加需求，在 [PR #36](https://github.com/SophiaData/AgentTerm/pull/36) 一并交付项目目录展开、只读文本预览、刷新和系统资源管理器入口，解决 CLI 内查看文件不方便的问题。文件面板跟随项目并可收起，文件与任务记录面板互斥且不销毁终端。相关前端31项测试、类型及代码检查已通过；后端、全量CI、合并与安装验收尚待完成，最新结果以该PR正文/Checks为准。原地址修复CI45207152043已主动取消，不计通过。唯一下一步是完成此增量检查、合并和安装核验，再回到既定Agy/停止恢复验收；#12/M4冻结标准不变。
+
+**首页地址反馈（11 月 23 日）**：用户看到的地址为 `\\?\E:\AgentTerm`，Windows 内部长路径前缀被原样展示。已补显示层格式化：首页地址、项目设置和相关提示展示普通盘符/网络共享地址，实际存储、ID与会话启动路径不变。旧实现2项回归失败，修复后20项定向测试通过；该修复与下方合并/安装记录一并提交非草稿PR，完整CI通过后按已获授权合并并更新测试包。此段为提交前验证记录，最新合并/打包证据见修复PR；#12/M4标准不变，后续唯一功能验收仍为Agy真实交互与停止恢复。
+
+**最新交付：已安装并打开（11 月 23 日）**：运行代码已通过 [PR #35](https://github.com/SophiaData/AgentTerm/pull/35) 合入 `main`（`52a9a59`），[main CI 45167546361](https://github.com/SophiaData/AgentTerm/actions/runs/45167546361) 两端通过，[Windows 包 45169830049](https://github.com/SophiaData/AgentTerm/actions/runs/45169830049) 构建成功。按用户安装授权，校验附件后安装至 `E:\AgentTerm\app-52a9a59`，安装器退出 0；桌面和开始菜单入口均指向新版，旧版文件保留。新版 PID 23224 的窗口 `AgentTerm` 已打开并响应。用户明确要求检查无问题后提交合并，本轮合并/打包/安装证据一并提交正式 PR。下一项为在模型可用后验收该固定包的 Agy 真实交互与停止恢复；#12/M4 和冻结验收标准不变，启动成功不等于完整验收。证据见 [testing](testing.md)。
+
+以下是历史进展；旧的“草稿/不合并/未安装”状态及旧包不覆盖上述最新交付和唯一下一项。
+
 **Agy 适配补查（11 月 23 日）**：真实 Agy `1.5.15` 位于 `%LOCALAPPDATA%\agy\bin\agy.exe`，当前 PATH 未包含该目录；默认目录漏检已修复，保留 PATH 优先。代码 `a7f4887` 的 [CI 45159685193](https://github.com/SophiaData/AgentTerm/actions/runs/45159685193)、串行只读评审和 [Windows 新包 45163296814](https://github.com/SophiaData/AgentTerm/actions/runs/45163296814) 均通过。下一项是验收入口及模型代理可用后，在该新包验证 Agy 检测/终端交互及既有停止恢复；真实对话和受控派发不因 `--version/--help` 成功而标通过。#12 与 M4 状态不变，详见 [testing](testing.md)。
 
 **11 月 23 日续办**：修复 macOS 退出误判、停止竞争后任务卡死，代码 `c322c4a` 已推送 PR #35；单个 DeepSeek 串行静态复审 PASS，[GitHub CI 45149490139](https://github.com/SophiaData/AgentTerm/actions/runs/45149490139) Linux/Windows 均成功，[Windows 包 45151496125](https://github.com/SophiaData/AgentTerm/actions/runs/45151496125) 构建成功。复现、测试数和附件摘要见 [testing](testing.md)。完整测试和打包后续优先 GitHub 串行，本地仅最小复现。模型代理 15721 仍无监听，此前下载/解包自动审批阻塞仍保留；下一项仅为在允许的验收入口及模型代理恢复后，对本次固定新包完成真实执行→停止→重启核实→换绑接续。#12 仍是唯一进行中项，冻结标准不变，PR 不合并、不发布。
