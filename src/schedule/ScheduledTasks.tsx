@@ -7,6 +7,7 @@ type Props = {
   projects: Project[];
   context: { projectPath: string; toolId: string; model?: string | null };
   onClose: () => void;
+  onNotice: (message: string) => void;
 };
 
 function errorText(error: unknown): string {
@@ -20,7 +21,7 @@ function timeText(value: number): string {
     : date.toLocaleString("zh-CN", { hour12: false });
 }
 
-export default function ScheduledTasks({ context, onClose }: Props) {
+export default function ScheduledTasks({ context, onClose, onNotice }: Props) {
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
   const [request, setRequest] = useState("");
   const [busy, setBusy] = useState(false);
@@ -65,6 +66,8 @@ export default function ScheduledTasks({ context, onClose }: Props) {
       const { invoke } = await import("@tauri-apps/api/core");
       await invoke(command, args);
       await load();
+      if (command === "run_scheduled_task_now")
+        onNotice("定时任务已运行，结果已更新");
     } catch (cause) {
       setError(`定时任务操作失败：${errorText(cause)}`);
     } finally {

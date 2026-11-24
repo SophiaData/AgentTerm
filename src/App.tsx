@@ -43,6 +43,7 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth] = useState(204);
   const [sideWidth, setSideWidth] = useState(390);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
+  const [taskNotice, setTaskNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
     projects.projects.find((p) => p.id === projectId) ?? projects.projects[0];
@@ -771,7 +772,16 @@ export default function App() {
             toolId: currentSession?.info.toolId ?? selectedTool?.id ?? "",
           }}
           onClose={() => setScheduleOpen(false)}
+          onNotice={setTaskNotice}
         />
+      ) : null}
+      {taskNotice ? (
+        <div className="workspace-task-notice" role="status">
+          {taskNotice}
+          <button type="button" onClick={() => setTaskNotice(null)}>
+            关闭
+          </button>
+        </div>
       ) : null}
       {recordsOpen ? (
         <aside

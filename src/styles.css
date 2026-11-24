@@ -2218,3 +2218,15 @@ h2 {
     grid-template-columns: 176px minmax(0, 1fr);
   }
 }
+.workspace-task-notice {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 20;
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid #385246;
+  border-radius: 8px;
+  background: #17241d;
+}
