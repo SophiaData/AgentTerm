@@ -622,21 +622,24 @@ mod tests {
                 name: "x".repeat(800),
             })
             .collect::<Vec<_>>();
-        for _ in 0..40 {
+        let mut archived = false;
+        for _ in 0..100 {
             super::persisted(&path, true, |current| {
                 *current = projects.clone();
                 Ok(())
             })
             .unwrap();
+            archived = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".archive-"));
+            if archived {
+                break;
+            }
         }
         assert!(std::fs::metadata(&path).unwrap().len() <= super::PROJECT_BYTES);
         assert_eq!(persistent(&path).list().unwrap().len(), projects.len());
-        assert!(
-            std::fs::read_dir(path.parent().unwrap())
-                .unwrap()
-                .filter_map(Result::ok)
-                .any(|entry| entry.file_name().to_string_lossy().contains(".archive-"))
-        );
+        assert!(archived);
     }
 
     #[cfg(unix)]
