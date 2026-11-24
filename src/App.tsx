@@ -60,6 +60,26 @@ export default function App() {
   const historyReloaded = useRef(false);
   const reloadHistory = history.reload;
   useEffect(() => {
+    const saved = localStorage.getItem("agentterm-layout");
+    if (!saved) return;
+    const layout = JSON.parse(saved) as {
+      sidebarWidth?: number;
+      sideWidth?: number;
+      filesOpen?: boolean;
+      projectId?: string;
+    };
+    if (layout.sidebarWidth) setSidebarWidth(layout.sidebarWidth);
+    if (layout.sideWidth) setSideWidth(layout.sideWidth);
+    if (typeof layout.filesOpen === "boolean") setFilesOpen(layout.filesOpen);
+    if (layout.projectId) setProjectId(layout.projectId);
+  }, []);
+  useEffect(() => {
+    localStorage.setItem(
+      "agentterm-layout",
+      JSON.stringify({ sidebarWidth, sideWidth, filesOpen, projectId }),
+    );
+  }, [sidebarWidth, sideWidth, filesOpen, projectId]);
+  useEffect(() => {
     if (!historyReloaded.current) {
       historyReloaded.current = true;
       return;
@@ -360,11 +380,17 @@ export default function App() {
                     latestVersion: string | null;
                     updateAvailable: boolean;
                     downloadUrl: string | null;
+                    notes: string | null;
                   }>("check_for_update");
                   if (!status.updateAvailable || !status.downloadUrl) {
                     setUpdateMessage(`当前已是 ${status.currentVersion}`);
                     return;
                   }
+                  const accepted = window.confirm(
+                    `发现 ${status.latestVersion}\n\n${status.notes ?? "无更新说明"}\n\n现在安装？`,
+                  );
+                  if (!accepted) return;
+                  setUpdateMessage("正在下载更新…");
                   await invoke("install_update", {
                     downloadUrl: status.downloadUrl,
                   });
@@ -457,6 +483,17 @@ export default function App() {
                   aria-hidden="true"
                 />
                 {session.label}
+                <span
+                  className="workspace-tab-close"
+                  role="button"
+                  aria-label={`关闭 ${session.label}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void launcher.close(session.info.id);
+                  }}
+                >
+                  ×
+                </span>
               </button>
             ))}
             <button
