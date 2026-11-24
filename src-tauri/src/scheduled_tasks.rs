@@ -451,13 +451,7 @@ fn command_for_tool(
     };
     match tool_id {
         "claude" => {
-            args.extend([
-                "--print".into(),
-                "--permission-mode".into(),
-                "acceptEdits".into(),
-                "--permission-prompts".into(),
-                "none".into(),
-            ]);
+            args.push("--print".into());
             if let Some(model) = model {
                 args.extend(["--model".into(), model.into()]);
             }
@@ -467,15 +461,9 @@ fn command_for_tool(
             if let Some(model) = model {
                 args.extend(["--model".into(), model.into()]);
             }
-            args.extend([
-                "--sandbox".into(),
-                "workspace-write".into(),
-                "--skip-git-repo-check".into(),
-            ]);
         }
         "agy" => {
             args.push("--print".into());
-            args.extend(["--mode".into(), "accept-edits".into(), "--sandbox".into()]);
             if let Some(model) = model {
                 args.extend(["--model".into(), model.into()]);
             }
@@ -629,41 +617,32 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn scheduled_commands_edit_only_the_selected_project() {
+    fn scheduled_commands_leave_permissions_to_each_agent() {
         let claude = super::command_for_tool(Path::new("claude"), "claude", None)
             .unwrap()
             .1;
-        assert!(
-            claude
-                .windows(2)
-                .any(|item| item == ["--permission-mode", "acceptEdits"])
-        );
-        assert!(
-            claude
-                .windows(2)
-                .any(|item| item == ["--permission-prompts", "none"])
-        );
-        assert!(!claude.iter().any(|arg| arg.contains("dangerously")));
+        assert!(claude.iter().any(|arg| arg == "--print"));
+        assert!(!claude.iter().any(|arg| {
+            arg.contains("permission") || arg.contains("sandbox") || arg.contains("dangerously")
+        }));
 
         let codex = super::command_for_tool(Path::new("codex"), "codex", None)
             .unwrap()
             .1;
-        assert!(
-            codex
-                .windows(2)
-                .any(|item| item == ["--sandbox", "workspace-write"])
-        );
-        assert!(!codex.iter().any(|arg| arg.contains("dangerously")));
+        assert!(codex.iter().any(|arg| arg == "exec"));
+        assert!(!codex.iter().any(|arg| {
+            arg.contains("sandbox") || arg.contains("skip-git") || arg.contains("dangerously")
+        }));
 
         let agy = super::command_for_tool(Path::new("agy"), "agy", None)
             .unwrap()
             .1;
+        assert!(agy.iter().any(|arg| arg == "--print"));
         assert!(
-            agy.windows(2)
-                .any(|item| item == ["--mode", "accept-edits"])
+            !agy.iter().any(|arg| {
+                arg == "--mode" || arg == "--sandbox" || arg.contains("dangerously")
+            })
         );
-        assert!(agy.iter().any(|arg| arg == "--sandbox"));
-        assert!(!agy.iter().any(|arg| arg.contains("dangerously")));
     }
 
     fn draft(prompt: &str) -> ScheduledTaskDraft {
