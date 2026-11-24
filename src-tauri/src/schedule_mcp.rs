@@ -650,9 +650,14 @@ mod tests {
             }),
         )
         .unwrap();
+        let normalized_project =
+            crate::projects::normalize_project_dir(&context.project_path).unwrap();
         assert!(text.contains("已创建"));
         assert_eq!(task["sourceSessionId"], "session-42");
-        assert_eq!(task["projectPath"], context.project_path);
+        assert_eq!(
+            task["projectPath"],
+            normalized_project.display().to_string()
+        );
         assert_eq!(task["toolId"], "codex");
         assert_eq!(task["model"], "gpt-5");
 
