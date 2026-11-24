@@ -734,13 +734,6 @@ export default function App() {
           </div>
         ) : null}
       </section>
-      {filesOpen && fileProject ? (
-        <ProjectFiles
-          key={fileProject.id}
-          project={fileProject}
-          onClose={() => setFilesOpen(false)}
-        />
-      ) : null}
       {recordsOpen || scheduleOpen || (filesOpen && fileProject) ? (
         <div
           className="workspace-splitter"
@@ -761,6 +754,13 @@ export default function App() {
             window.addEventListener("pointermove", move);
             window.addEventListener("pointerup", stop);
           }}
+        />
+      ) : null}
+      {filesOpen && fileProject ? (
+        <ProjectFiles
+          key={fileProject.id}
+          project={fileProject}
+          onClose={() => setFilesOpen(false)}
         />
       ) : null}
       {scheduleOpen ? (
