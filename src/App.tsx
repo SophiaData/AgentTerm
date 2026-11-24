@@ -40,6 +40,8 @@ export default function App() {
   const [recordsOpen, setRecordsOpen] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(204);
+  const [sideWidth, setSideWidth] = useState(390);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
@@ -99,6 +101,9 @@ export default function App() {
   return (
     <main
       className={`session-workspace${recordsOpen || scheduleOpen ? " with-records" : ""}${filesOpen && fileProject ? " with-files" : ""}`}
+      style={{
+        gridTemplateColumns: `${sidebarWidth}px minmax(0, 1fr)${recordsOpen || scheduleOpen || (filesOpen && fileProject) ? ` ${sideWidth}px` : ""}`,
+      }}
     >
       <aside className="workspace-sidebar" aria-label="项目与会话">
         <div className="workspace-brand">
@@ -279,6 +284,26 @@ export default function App() {
           </p>
         </div>
       </aside>
+      <div
+        className="workspace-splitter"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整项目栏宽度"
+        onPointerDown={(event) => {
+          const startX = event.clientX;
+          const start = sidebarWidth;
+          const move = (next: PointerEvent) =>
+            setSidebarWidth(
+              Math.min(420, Math.max(160, start + next.clientX - startX)),
+            );
+          const stop = () => {
+            window.removeEventListener("pointermove", move);
+            window.removeEventListener("pointerup", stop);
+          };
+          window.addEventListener("pointermove", move);
+          window.addEventListener("pointerup", stop);
+        }}
+      />
 
       <section className="workspace-main" aria-label="Agent 会话工作区">
         <header className="workspace-topbar">
@@ -676,6 +701,28 @@ export default function App() {
           key={fileProject.id}
           project={fileProject}
           onClose={() => setFilesOpen(false)}
+        />
+      ) : null}
+      {recordsOpen || scheduleOpen || (filesOpen && fileProject) ? (
+        <div
+          className="workspace-splitter"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整右侧面板宽度"
+          onPointerDown={(event) => {
+            const startX = event.clientX;
+            const start = sideWidth;
+            const move = (next: PointerEvent) =>
+              setSideWidth(
+                Math.min(720, Math.max(280, start - (next.clientX - startX))),
+              );
+            const stop = () => {
+              window.removeEventListener("pointermove", move);
+              window.removeEventListener("pointerup", stop);
+            };
+            window.addEventListener("pointermove", move);
+            window.addEventListener("pointerup", stop);
+          }}
         />
       ) : null}
       {scheduleOpen ? (

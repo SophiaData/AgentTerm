@@ -1103,13 +1103,17 @@ h2 {
 /* The primary surface is the agent's own terminal session. */
 .session-workspace {
   display: grid;
-  grid-template-columns: 204px minmax(0, 1fr);
   height: 100dvh;
   overflow: hidden;
   background: #0d1117;
 }
-.session-workspace.with-records {
-  grid-template-columns: 204px minmax(0, 1fr) 380px;
+.workspace-splitter {
+  width: 6px;
+  cursor: col-resize;
+  background: #1d2630;
+}
+.workspace-splitter:hover {
+  background: #8cdec2;
 }
 .workspace-sidebar {
   display: flex;
