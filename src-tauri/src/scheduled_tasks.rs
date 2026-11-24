@@ -7,6 +7,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{Local, NaiveTime, TimeZone};
+
 use crate::projects::normalize_project_dir;
 use crate::tools::{
     candidate_search_dirs, is_windows_batch, resolve_binary, windows_cmd_executable,
@@ -24,6 +26,13 @@ const TEXT_LIMIT: usize = 2_000;
 const MODEL_LIMIT: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ScheduleSpec {
+    Interval { minutes: u64 },
+    Daily { hour: u8, minute: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScheduledTask {
     pub id: String,
@@ -33,6 +42,8 @@ pub struct ScheduledTask {
     pub model: Option<String>,
     pub prompt: String,
     pub interval_minutes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSpec>,
     pub timeout_minutes: u64,
     pub enabled: bool,
     pub next_run_at_ms: u64,
@@ -57,7 +68,7 @@ pub struct ScheduledTaskDraft {
     pub tool_id: String,
     pub model: Option<String>,
     pub prompt: String,
-    pub interval_minutes: u64,
+    pub schedule: ScheduleSpec,
     pub timeout_minutes: u64,
     pub enabled: bool,
 }
@@ -147,7 +158,7 @@ impl Scheduler {
             .ok_or_else(|| "定时任务不存在".to_string())?;
         task.enabled = enabled;
         if enabled {
-            task.next_run_at_ms = now_ms().saturating_add(task.interval_minutes * 60_000);
+            task.next_run_at_ms = initial_next_run(&effective_schedule(task), now_ms())?;
         }
         let saved = task.clone();
         persist(&inner)?;
@@ -186,9 +197,11 @@ impl Scheduler {
         inner.running = false;
         load_if_configured(&mut inner)?;
         let saved = if let Some(current) = inner.tasks.iter_mut().find(|item| item.id == id) {
+            let schedule = effective_schedule(current);
             current.runs.insert(0, run);
             current.runs.truncate(RUN_LIMIT);
-            current.next_run_at_ms = now_ms().saturating_add(current.interval_minutes * 60_000);
+            current.schedule = Some(schedule.clone());
+            current.next_run_at_ms = advance_next_run(&schedule, now_ms())?;
             current.clone()
         } else {
             return Err("定时任务已在运行期间删除".into());
@@ -224,9 +237,11 @@ impl Scheduler {
         inner.running = false;
         load_if_configured(&mut inner)?;
         if let Some(current) = inner.tasks.iter_mut().find(|item| item.id == task.id) {
+            let schedule = effective_schedule(current);
             current.runs.insert(0, run);
             current.runs.truncate(RUN_LIMIT);
-            current.next_run_at_ms = now_ms().saturating_add(current.interval_minutes * 60_000);
+            current.schedule = Some(schedule.clone());
+            current.next_run_at_ms = advance_next_run(&schedule, now_ms())?;
             persist(&inner)?;
         }
         Ok(())
@@ -272,9 +287,7 @@ fn normalize_draft(
     if !matches!(draft.tool_id.as_str(), "claude" | "codex" | "agy") {
         return Err("请选择 Claude Code、Codex 或 Agy".into());
     }
-    if !(MIN_INTERVAL_MINUTES..=MAX_INTERVAL_MINUTES).contains(&draft.interval_minutes) {
-        return Err("运行间隔需在 1 分钟到 7 天之间".into());
-    }
+    validate_schedule(&draft.schedule)?;
     if !(MIN_TIMEOUT_MINUTES..=MAX_TIMEOUT_MINUTES).contains(&draft.timeout_minutes) {
         return Err("单次超时需在 1 到 180 分钟之间".into());
     }
@@ -282,11 +295,16 @@ fn normalize_draft(
     let now = now_ms();
     let next = if draft.enabled {
         existing
-            .filter(|task| task.enabled && task.interval_minutes == draft.interval_minutes)
+            .filter(|task| task.enabled && effective_schedule(task) == draft.schedule)
             .map(|task| task.next_run_at_ms)
-            .unwrap_or_else(|| now.saturating_add(draft.interval_minutes * 60_000))
+            .map(Ok)
+            .unwrap_or_else(|| initial_next_run(&draft.schedule, now))?
     } else {
         existing.map(|task| task.next_run_at_ms).unwrap_or(now)
+    };
+    let interval_minutes = match draft.schedule {
+        ScheduleSpec::Interval { minutes } => minutes,
+        ScheduleSpec::Daily { .. } => 1440,
     };
     Ok(ScheduledTask {
         id: existing.map(|task| task.id.clone()).unwrap_or_default(),
@@ -295,12 +313,78 @@ fn normalize_draft(
         tool_id: draft.tool_id,
         model,
         prompt,
-        interval_minutes: draft.interval_minutes,
+        interval_minutes,
+        schedule: Some(draft.schedule),
         timeout_minutes: draft.timeout_minutes,
         enabled: draft.enabled,
         next_run_at_ms: next,
         runs: existing.map(|task| task.runs.clone()).unwrap_or_default(),
     })
+}
+
+fn validate_schedule(schedule: &ScheduleSpec) -> Result<(), String> {
+    match schedule {
+        ScheduleSpec::Interval { minutes }
+            if !(MIN_INTERVAL_MINUTES..=MAX_INTERVAL_MINUTES).contains(minutes) =>
+        {
+            Err("运行间隔需在 1 分钟到 7 天之间".into())
+        }
+        ScheduleSpec::Daily { hour, minute } if *hour > 23 || *minute > 59 => {
+            Err("每天执行时间无效".into())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn effective_schedule(task: &ScheduledTask) -> ScheduleSpec {
+    task.schedule.clone().unwrap_or(ScheduleSpec::Interval {
+        minutes: task
+            .interval_minutes
+            .clamp(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES),
+    })
+}
+
+fn initial_next_run(schedule: &ScheduleSpec, now: u64) -> Result<u64, String> {
+    match schedule {
+        ScheduleSpec::Interval { minutes } => {
+            Ok(now.saturating_add(minutes.saturating_mul(60_000)))
+        }
+        ScheduleSpec::Daily { hour, minute } => next_daily(now, *hour, *minute),
+    }
+}
+
+fn advance_next_run(schedule: &ScheduleSpec, now: u64) -> Result<u64, String> {
+    match schedule {
+        ScheduleSpec::Interval { minutes } => {
+            Ok(now.saturating_add(minutes.saturating_mul(60_000)))
+        }
+        ScheduleSpec::Daily { hour, minute } => next_daily(now, *hour, *minute),
+    }
+}
+
+fn next_daily(now_ms: u64, hour: u8, minute: u8) -> Result<u64, String> {
+    let time = NaiveTime::from_hms_opt(u32::from(hour), u32::from(minute), 0)
+        .ok_or_else(|| "每天执行时间无效".to_string())?;
+    let now = Local
+        .timestamp_millis_opt(now_ms as i64)
+        .single()
+        .ok_or_else(|| "无法读取本地时间".to_string())?;
+    let mut date = now.date_naive();
+    for _ in 0..3 {
+        let candidate = Local
+            .from_local_datetime(&date.and_time(time))
+            .single()
+            .ok_or_else(|| "无法计算下一次执行时间".to_string())?;
+        let candidate_ms = u64::try_from(candidate.timestamp_millis())
+            .map_err(|_| "无法计算下一次执行时间".to_string())?;
+        if candidate_ms > now_ms {
+            return Ok(candidate_ms);
+        }
+        date = date
+            .succ_opt()
+            .ok_or_else(|| "无法计算下一次执行时间".to_string())?;
+    }
+    Err("无法计算下一次执行时间".into())
 }
 
 fn clean_text(value: &str, label: &str, limit: usize) -> Result<String, String> {
@@ -599,7 +683,14 @@ fn validate_tasks(tasks: &[ScheduledTask]) -> Result<(), String> {
     }
     let mut seen = std::collections::HashSet::new();
     for task in tasks {
-        if !seen.insert(&task.id) || task.runs.len() > RUN_LIMIT {
+        if let Some(schedule) = task.schedule.as_ref() {
+            validate_schedule(schedule)?;
+        }
+        if !seen.insert(&task.id)
+            || task.runs.len() > RUN_LIMIT
+            || (task.schedule.is_none()
+                && !(MIN_INTERVAL_MINUTES..=MAX_INTERVAL_MINUTES).contains(&task.interval_minutes))
+        {
             return Err("定时任务记录无效".into());
         }
     }
@@ -612,7 +703,8 @@ fn storage_error(error: std::io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScheduledTaskDraft, Scheduler};
+    use super::{ScheduleSpec, ScheduledTaskDraft, Scheduler};
+    use chrono::{TimeZone, Timelike};
     use std::fs;
     use std::path::Path;
 
@@ -645,6 +737,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn daily_schedule_targets_the_next_local_clock_time() {
+        let next = super::next_daily(super::now_ms(), 9, 30).unwrap();
+        let local = chrono::Local
+            .timestamp_millis_opt(next as i64)
+            .single()
+            .unwrap();
+        assert_eq!(local.hour(), 9);
+        assert_eq!(local.minute(), 30);
+        assert!(next > super::now_ms());
+    }
+
     fn draft(prompt: &str) -> ScheduledTaskDraft {
         ScheduledTaskDraft {
             name: "每日检查".into(),
@@ -652,7 +756,7 @@ mod tests {
             tool_id: "codex".into(),
             model: Some("gpt-5".into()),
             prompt: prompt.into(),
-            interval_minutes: 60,
+            schedule: ScheduleSpec::Interval { minutes: 60 },
             timeout_minutes: 20,
             enabled: true,
         }

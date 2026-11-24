@@ -13,6 +13,7 @@ name = "agentterm"
 version = "0.2.0-rc.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "libc",
  "portable-pty",
  "serde",

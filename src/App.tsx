@@ -777,7 +777,6 @@ export default function App() {
       ) : null}
       {scheduleOpen ? (
         <ScheduledTasks
-          projects={projects.projects}
           context={{
             projectPath:
               currentSession?.info.projectPath ?? selectedProject?.path ?? "",
