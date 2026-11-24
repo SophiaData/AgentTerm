@@ -1,12 +1,22 @@
 import { useMemo, useSyncExternalStore } from "react";
 import type { Project } from "../projects/types";
 import type { ToolStatus } from "../tools/types";
+import {
+  deriveAutoTitleFromPrompt,
+  normalizeManualTitle,
+} from "./sessionNaming";
 import { newSessionId, type SessionInfo } from "./types";
 import { DEFAULT_ROWS, DEFAULT_COLS } from "./defaults";
+
+export type TitleSource = "default" | "auto" | "manual";
+
+export type RenameResult =
+  { ok: true; title: string } | { ok: false; error: string };
 
 export type ActiveSession = {
   info: SessionInfo;
   label: string;
+  titleSource: TitleSource;
   running: boolean;
   exitReason: string | null;
   closeError: string | null;
@@ -41,6 +51,8 @@ export function createSessionStore(invoke: Invoke) {
   };
   let sequence = 0;
   let operation = false;
+  const renameEpochs = new Map<string, number>();
+  const autoNaming = new Set<string>();
   const listeners = new Set<() => void>();
   const update = (patch: Partial<SessionState>) => {
     state = { ...state, ...patch };
@@ -118,7 +130,8 @@ export function createSessionStore(invoke: Invoke) {
       });
       const next: ActiveSession = {
         info,
-        label: `${tool.name} · ${++sequence}`,
+        label: info.title?.trim() || `${tool.name} · ${++sequence}`,
+        titleSource: info.title?.trim() ? "manual" : "default",
         running: true,
         exitReason: null,
         closeError: null,
@@ -140,6 +153,76 @@ export function createSessionStore(invoke: Invoke) {
         s.info.id === id ? { ...s, running: false, exitReason: reason } : s,
       ),
     });
+  };
+
+  const rename = async (
+    id: string,
+    rawTitle: string,
+  ): Promise<RenameResult> => {
+    if (!state.sessions.some((s) => s.info.id === id)) {
+      return { ok: false, error: "会话不存在或已关闭" };
+    }
+    const checked = normalizeManualTitle(rawTitle);
+    if (!checked.ok) return checked;
+    const epoch = (renameEpochs.get(id) ?? 0) + 1;
+    renameEpochs.set(id, epoch);
+    try {
+      const saved = await invoke<string>("rename_session", {
+        sessionId: id,
+        title: checked.title,
+      });
+      if (renameEpochs.get(id) === epoch) {
+        update({
+          sessions: state.sessions.map((s) =>
+            s.info.id === id
+              ? {
+                  ...s,
+                  label: saved,
+                  titleSource: "manual",
+                  info: { ...s.info, title: saved },
+                }
+              : s,
+          ),
+        });
+      }
+      return { ok: true, title: saved };
+    } catch (error) {
+      return { ok: false, error: `无法修改会话名称：${errorMessage(error)}` };
+    }
+  };
+
+  const autoName = async (id: string, promptLine: string): Promise<void> => {
+    const target = state.sessions.find((s) => s.info.id === id);
+    if (!target || target.titleSource !== "default" || autoNaming.has(id)) {
+      return;
+    }
+    const candidate = deriveAutoTitleFromPrompt(promptLine);
+    if (!candidate) return;
+    const epoch = renameEpochs.get(id) ?? 0;
+    autoNaming.add(id);
+    try {
+      const saved = await invoke<string>("rename_session", {
+        sessionId: id,
+        title: candidate,
+      });
+      if ((renameEpochs.get(id) ?? 0) !== epoch) return;
+      update({
+        sessions: state.sessions.map((s) =>
+          s.info.id === id && s.titleSource === "default"
+            ? {
+                ...s,
+                label: saved,
+                titleSource: "auto",
+                info: { ...s.info, title: saved },
+              }
+            : s,
+        ),
+      });
+    } catch {
+      // Best-effort automatic naming must never interrupt terminal input.
+    } finally {
+      autoNaming.delete(id);
+    }
   };
 
   const close = async (id: string) => {
@@ -166,6 +249,8 @@ export function createSessionStore(invoke: Invoke) {
       }
       // Release archived output as well; the native command rejects live PTYs.
       await invoke("forget_session", { sessionId: id });
+      renameEpochs.delete(id);
+      autoNaming.delete(id);
       const index = state.sessions.findIndex((s) => s.info.id === id);
       const remaining = state.sessions.filter((s) => s.info.id !== id);
       const panes = state.paneIds.filter((pane) => pane !== id);
@@ -213,6 +298,8 @@ export function createSessionStore(invoke: Invoke) {
     start,
     close,
     handleExit,
+    rename,
+    autoName,
   };
 }
 
@@ -244,5 +331,7 @@ export function useLauncher() {
     start: store.start,
     close: store.close,
     handleExit: store.handleExit,
+    rename: store.rename,
+    autoName: store.autoName,
   };
 }

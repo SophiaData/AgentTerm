@@ -3,6 +3,7 @@ export type SessionInfo = {
   toolId: string;
   toolName: string;
   projectPath: string;
+  title?: string | null;
 };
 
 export type SessionExit = {
@@ -15,6 +16,7 @@ export type SessionHistoryRecord = {
   toolId: string;
   toolName: string;
   projectPath: string;
+  title?: string | null;
   startedAtMs: number;
   endedAtMs: number | null;
   exitReason: string | null;

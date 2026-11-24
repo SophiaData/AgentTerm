@@ -11,6 +11,7 @@ const sessions: ActiveSession[] = ["a", "b", "c"].map((id) => ({
     projectPath: "E:\\Data",
   },
   label: `CLI ${id}`,
+  titleSource: "default",
   running: true,
   exitReason: null,
   closeError: null,
@@ -27,6 +28,8 @@ function render(paneIds: string[], activeId: string | null) {
       onFocus={vi.fn()}
       onClose={vi.fn()}
       onExit={vi.fn()}
+      onRename={vi.fn(async (title) => ({ ok: true as const, title }))}
+      onPromptLine={vi.fn()}
     />,
   );
 }
@@ -48,6 +51,7 @@ describe("terminal split presentation", () => {
     expect(html).toContain('aria-label="调整终端分屏"');
     expect(html).toContain('aria-valuenow="50"');
     expect(html).toContain('aria-orientation="vertical"');
+    expect(html).toContain('aria-label="重命名会话"');
   });
 
   it("single view removes the divider but retains the other mounted terminals", () => {

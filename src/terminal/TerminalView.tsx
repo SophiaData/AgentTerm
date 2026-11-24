@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPromptLineTracker } from "./sessionNaming";
 import { connectSession, type ConnectionPhase } from "./sessionTransport";
 import type { SessionInfo } from "./types";
 
@@ -10,6 +11,7 @@ type Props = {
   running: boolean;
   busy: boolean;
   onExit: (id: string, reason: string) => void;
+  onPromptLine?: (id: string, line: string) => void;
 };
 
 export default function TerminalView({
@@ -20,10 +22,25 @@ export default function TerminalView({
   running,
   busy,
   onExit,
+  onPromptLine,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const current = useRef({ visible, focused, running, busy, onExit });
-  current.current = { visible, focused, running, busy, onExit };
+  const current = useRef({
+    visible,
+    focused,
+    running,
+    busy,
+    onExit,
+    onPromptLine,
+  });
+  current.current = {
+    visible,
+    focused,
+    running,
+    busy,
+    onExit,
+    onPromptLine,
+  };
   const controls = useRef<{
     focus: () => void;
     scroll: () => void;
@@ -167,13 +184,18 @@ export default function TerminalView({
         },
       );
       cleanups.push(transport.dispose);
+      const tracker = createPromptLineTracker();
       const data = terminal.onData((text) => {
         if (
           current.current.visible &&
           current.current.running &&
           !current.current.busy
-        )
+        ) {
           transport.send(text);
+          for (const line of tracker.feed(text)) {
+            current.current.onPromptLine?.(session.id, line);
+          }
+        }
       });
       cleanups.push(() => data.dispose());
       frames.push(

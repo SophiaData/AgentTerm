@@ -1488,6 +1488,31 @@ h2 {
   font-size: 12px;
   font-weight: 500;
 }
+.session-rename-trigger {
+  padding: 2px 7px;
+  font-size: 11px;
+}
+.session-rename-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 340px;
+}
+.session-rename-input {
+  min-width: 120px;
+  max-width: 210px;
+  padding: 3px 8px;
+  border: 1px solid var(--color-border-strong, #3b4656);
+  border-radius: 6px;
+  background: var(--color-background, #0d1117);
+  color: var(--color-text, #e6edf3);
+  font-size: 12px;
+}
+.session-rename-input:focus {
+  outline: 1px solid var(--color-accent, #8cdec2);
+  border-color: var(--color-accent, #8cdec2);
+}
 .workspace-terminal-stage .session-context {
   font-size: 10px;
 }

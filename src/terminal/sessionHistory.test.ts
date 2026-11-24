@@ -3,7 +3,9 @@ import type { ToolStatus } from "../tools/types";
 import {
   folderName,
   formatSessionTime,
+  historyDisplayTitle,
   historyStatusText,
+  historySubtitleText,
   installedToolForRecord,
   projectFromRecord,
   recentClosedHistory,
@@ -97,5 +99,12 @@ describe("session history helpers", () => {
   it("handles invalid timestamps without throwing", () => {
     expect(formatSessionTime(Number.NaN)).toBe("时间未知");
     expect(formatSessionTime(1_763_650_000_000)).not.toBe("时间未知");
+  });
+
+  it("displays custom session titles while keeping tool and folder context", () => {
+    expect(historyDisplayTitle(makeRecord())).toBe("Claude Code · AgentTerm");
+    const named = makeRecord({ title: "修复订单指标" });
+    expect(historyDisplayTitle(named)).toBe("修复订单指标");
+    expect(historySubtitleText(named)).toContain("Claude Code · AgentTerm");
   });
 });

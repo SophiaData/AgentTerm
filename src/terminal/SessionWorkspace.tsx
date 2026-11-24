@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import SessionPanel from "./SessionPanel";
-import type { ActiveSession } from "./useLauncher";
+import type { ActiveSession, RenameResult } from "./useLauncher";
 
 type Props = {
   sessions: ActiveSession[];
@@ -11,6 +11,8 @@ type Props = {
   onFocus: (id: string) => void;
   onClose: (id: string) => void;
   onExit: (id: string, reason: string) => void;
+  onRename: (id: string, title: string) => Promise<RenameResult>;
+  onPromptLine: (id: string, line: string) => void;
 };
 
 export function clampSplitRatio(value: number): number {
@@ -27,6 +29,8 @@ export default function SessionWorkspace({
   onFocus,
   onClose,
   onExit,
+  onRename,
+  onPromptLine,
 }: Props) {
   const host = useRef<HTMLDivElement | null>(null);
   const [ratio, setRatio] = useState(50);
@@ -110,6 +114,8 @@ export default function SessionWorkspace({
               closeError={session.closeError}
               onClose={() => onClose(session.info.id)}
               onExit={onExit}
+              onRename={(title) => onRename(session.info.id, title)}
+              onPromptLine={onPromptLine}
             />
           </div>
         );
