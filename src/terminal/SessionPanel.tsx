@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { displayPath } from "../projects/displayPath";
 import TerminalView from "./TerminalView";
 import { SESSION_TITLE_MAX_CHARS, normalizeManualTitle } from "./sessionNaming";
@@ -41,6 +41,7 @@ export default function SessionPanel({
   const [draftTitle, setDraftTitle] = useState(label);
   const [savingTitle, setSavingTitle] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
+  const canceling = useRef(false);
 
   const beginRename = () => {
     setDraftTitle(label);
@@ -49,6 +50,7 @@ export default function SessionPanel({
   };
 
   const cancelRename = () => {
+    canceling.current = true;
     setEditingTitle(false);
     setRenameError(null);
   };
@@ -97,50 +99,33 @@ export default function SessionPanel({
                 maxLength={SESSION_TITLE_MAX_CHARS}
                 disabled={savingTitle}
                 autoFocus
+                onFocus={(event) => event.currentTarget.select()}
                 onChange={(event) => setDraftTitle(event.target.value)}
+                onBlur={() => {
+                  if (canceling.current) {
+                    canceling.current = false;
+                    return;
+                  }
+                  void submitRename();
+                }}
                 onKeyDown={(event) => {
                   if (event.key === "Escape") {
                     event.preventDefault();
                     cancelRename();
+                    event.currentTarget.blur();
                   }
                 }}
               />
-              <button
-                type="submit"
-                className="ghost-button"
-                disabled={savingTitle}
-              >
-                {savingTitle ? "保存中…" : "保存"}
-              </button>
-              <button
-                type="button"
-                className="ghost-button"
-                disabled={savingTitle}
-                onClick={cancelRename}
-              >
-                取消
-              </button>
             </form>
           ) : (
-            <>
-              <span
-                className="session-title"
-                title={`${label}（${sessionTitle(session)}）· 双击改名`}
-                onDoubleClick={beginRename}
-              >
-                {label}
-              </span>
-              <button
-                type="button"
-                className="ghost-button session-rename-trigger"
-                aria-label="重命名会话"
-                title="修改会话名称"
-                disabled={busy}
-                onClick={beginRename}
-              >
-                改名
-              </button>
-            </>
+            <button
+              type="button"
+              className="session-title"
+              title={`${sessionTitle(session)} · 点击修改名称`}
+              onClick={beginRename}
+            >
+              {label}
+            </button>
           )}
           <span className={`badge ${running ? "badge-installed" : ""}`}>
             {running
