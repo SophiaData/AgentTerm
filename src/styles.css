@@ -1786,9 +1786,6 @@ h2 {
   display: none;
 }
 @media (max-width: 1100px) {
-  .session-workspace.with-records {
-    grid-template-columns: 204px minmax(0, 1fr);
-  }
   .workspace-records {
     position: fixed;
     right: 0;
@@ -1800,10 +1797,6 @@ h2 {
   }
 }
 @media (max-width: 650px) {
-  .session-workspace,
-  .session-workspace.with-records {
-    grid-template-columns: 160px minmax(0, 1fr);
-  }
   .workspace-sidebar {
     padding: 14px 6px 10px;
   }
@@ -2185,12 +2178,6 @@ h2 {
   outline-offset: 2px;
 }
 
-@media (max-width: 720px) {
-  .session-workspace,
-  .session-workspace.with-records {
-    grid-template-columns: 176px minmax(0, 1fr);
-  }
-}
 .workspace-task-notice {
   position: fixed;
   right: 24px;
