@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::projects::normalize_project_dir;
-use crate::tools::{candidate_search_dirs, is_windows_batch, resolve_binary, windows_cmd_executable};
+use crate::tools::{
+    candidate_search_dirs, is_windows_batch, resolve_binary, windows_cmd_executable,
+};
 
 const STORE_BYTES: u64 = 1024 * 1024;
 const TASK_LIMIT: usize = 50;
@@ -74,7 +76,9 @@ struct SchedulerInner {
 
 impl Scheduler {
     pub fn handle(&self) -> Scheduler {
-        Scheduler { state: Arc::clone(&self.state) }
+        Scheduler {
+            state: Arc::clone(&self.state),
+        }
     }
 
     pub fn configure(&self, path: PathBuf) -> Result<(), String> {
@@ -256,7 +260,12 @@ fn normalize_draft(
 ) -> Result<ScheduledTask, String> {
     let name = clean_text(&draft.name, "任务名称", 80)?;
     let prompt = clean_text(&draft.prompt, "任务指令", TEXT_LIMIT)?;
-    let model = match draft.model.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    let model = match draft
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         Some(value) => Some(clean_token(value, "模型名称", MODEL_LIMIT)?),
         None => None,
     };
@@ -382,7 +391,10 @@ fn run_process(task: &ScheduledTask) -> Result<(i32, String), String> {
             Ok(None) if started.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("任务超时（{} 分钟），已停止本次运行", task.timeout_minutes));
+                return Err(format!(
+                    "任务超时（{} 分钟），已停止本次运行",
+                    task.timeout_minutes
+                ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(error) => {
@@ -439,7 +451,11 @@ fn command_for_tool(
     };
     match tool_id {
         "claude" => {
-            args.extend(["--print".into(), "--permission-prompts".into(), "none".into()]);
+            args.extend([
+                "--print".into(),
+                "--permission-prompts".into(),
+                "none".into(),
+            ]);
             if let Some(model) = model {
                 args.extend(["--model".into(), model.into()]);
             }
@@ -449,7 +465,11 @@ fn command_for_tool(
             if let Some(model) = model {
                 args.extend(["--model".into(), model.into()]);
             }
-            args.extend(["--sandbox".into(), "workspace-write".into(), "--skip-git-repo-check".into()]);
+            args.extend([
+                "--sandbox".into(),
+                "workspace-write".into(),
+                "--skip-git-repo-check".into(),
+            ]);
         }
         "agy" => {
             args.push("--print".into());
@@ -577,7 +597,8 @@ fn lock_store(path: &Path) -> Result<StoreLock, String> {
 }
 
 fn hash(revision: u64, tasks: &[ScheduledTask]) -> Result<String, String> {
-    let bytes = serde_json::to_vec(&(revision, tasks)).map_err(|_| "定时任务无法校验".to_string())?;
+    let bytes =
+        serde_json::to_vec(&(revision, tasks)).map_err(|_| "定时任务无法校验".to_string())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -600,7 +621,7 @@ fn storage_error(error: std::io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Scheduler, ScheduledTaskDraft};
+    use super::{ScheduledTaskDraft, Scheduler};
     use std::fs;
 
     fn draft(prompt: &str) -> ScheduledTaskDraft {
@@ -653,7 +674,9 @@ mod tests {
 }
 
 #[tauri::command]
-pub fn list_scheduled_tasks(state: tauri::State<'_, Scheduler>) -> Result<Vec<ScheduledTask>, String> {
+pub fn list_scheduled_tasks(
+    state: tauri::State<'_, Scheduler>,
+) -> Result<Vec<ScheduledTask>, String> {
     state.list()
 }
 
