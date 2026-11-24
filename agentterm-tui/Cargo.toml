@@ -1,6 +1,6 @@
 [package]
 name = "agentterm-tui"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 description = "A tiny terminal manager for AI command-line tools"
 edition = "2024"
 rust-version = "1.90"
