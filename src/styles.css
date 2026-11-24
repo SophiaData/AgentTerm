@@ -1720,6 +1720,35 @@ h2 {
   font-size: 11px;
   line-height: 1.7;
 }
+.schedule-panel {
+  min-height: 0;
+  overflow: auto;
+  padding-bottom: 20px;
+}
+.schedule-form,
+.schedule-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+.schedule-form input,
+.schedule-form select,
+.schedule-form textarea,
+.schedule-card button,
+.schedule-card pre {
+  width: 100%;
+  box-sizing: border-box;
+}
+.schedule-form textarea,
+.schedule-card pre {
+  min-height: 90px;
+  white-space: pre-wrap;
+}
+.schedule-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
 .workspace-records .workbench {
   padding: 12px 0 20px;
 }
