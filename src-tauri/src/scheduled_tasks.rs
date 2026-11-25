@@ -699,7 +699,7 @@ fn read_existing(path: &Path) -> Result<(u64, Vec<ScheduledTask>), String> {
             serde_json::from_str(line).map_err(|_| "定时任务存储校验失败".to_string())?;
         if record.schema != 1
             || !journal::revision_follows(revision, record.revision)
-            || record.sha256 != hash(record.revision, &record.tasks)?
+            || !digest_matches(&record)?
         {
             return Err("定时任务存储校验失败".into());
         }
@@ -718,6 +718,62 @@ fn lock_store(path: &Path) -> Result<journal::JournalLock, String> {
 fn hash(revision: u64, tasks: &[ScheduledTask]) -> Result<String, String> {
     let bytes =
         serde_json::to_vec(&(revision, tasks)).map_err(|_| "定时任务无法校验".to_string())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+// 0.2.0-rc.8 always serialized approval_pending, so records it wrote hash
+// differently from the current canonical form. Accept both without rewriting
+// history: new writes stay canonical, old lines keep validating.
+fn digest_matches(record: &StoreRecord) -> Result<bool, String> {
+    if record.sha256 == hash(record.revision, &record.tasks)? {
+        return Ok(true);
+    }
+    Ok(record.sha256 == hash_with_approval_field(record.revision, &record.tasks)?)
+}
+
+fn hash_with_approval_field(revision: u64, tasks: &[ScheduledTask]) -> Result<String, String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ApprovalFieldTask<'a> {
+        id: &'a str,
+        name: &'a str,
+        project_path: &'a str,
+        tool_id: &'a str,
+        model: Option<&'a str>,
+        prompt: &'a str,
+        interval_minutes: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        schedule: Option<&'a ScheduleSpec>,
+        timeout_minutes: u64,
+        enabled: bool,
+        approval_pending: bool,
+        next_run_at_ms: u64,
+        runs: &'a [ScheduledRun],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_session_id: Option<&'a str>,
+    }
+
+    let stored: Vec<ApprovalFieldTask> = tasks
+        .iter()
+        .map(|task| ApprovalFieldTask {
+            id: &task.id,
+            name: &task.name,
+            project_path: &task.project_path,
+            tool_id: &task.tool_id,
+            model: task.model.as_deref(),
+            prompt: &task.prompt,
+            interval_minutes: task.interval_minutes,
+            schedule: task.schedule.as_ref(),
+            timeout_minutes: task.timeout_minutes,
+            enabled: task.enabled,
+            approval_pending: task.approval_pending,
+            next_run_at_ms: task.next_run_at_ms,
+            runs: &task.runs,
+            source_session_id: task.source_session_id.as_deref(),
+        })
+        .collect();
+    let bytes =
+        serde_json::to_vec(&(revision, &stored)).map_err(|_| "定时任务无法校验".to_string())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -906,6 +962,75 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "legacy-task");
         assert!(!tasks[0].approval_pending);
+        let _ = fs::remove_file(path);
+    }
+
+    #[derive(Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ApprovalFieldTask {
+        id: String,
+        name: String,
+        project_path: String,
+        tool_id: String,
+        model: Option<String>,
+        prompt: String,
+        interval_minutes: u64,
+        timeout_minutes: u64,
+        enabled: bool,
+        approval_pending: bool,
+        next_run_at_ms: u64,
+        runs: Vec<serde_json::Value>,
+    }
+
+    #[test]
+    fn rc8_record_with_serialized_approval_field_remains_readable() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-rc8-schedule-{}-{}.json",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let task = ApprovalFieldTask {
+            id: "rc8-task".into(),
+            name: "rc8 任务".into(),
+            project_path: "E:\\AgentTerm".into(),
+            tool_id: "claude".into(),
+            model: None,
+            prompt: "检查项目状态".into(),
+            interval_minutes: 60,
+            timeout_minutes: 20,
+            enabled: false,
+            approval_pending: false,
+            next_run_at_ms: 1,
+            runs: Vec::new(),
+        };
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(1_u64, vec![task.clone()])).unwrap())
+        );
+        let task_json = serde_json::to_string(&task).unwrap();
+        let record =
+            format!(r#"{{"schema":1,"revision":1,"tasks":[{task_json}],"sha256":"{digest}"}}"#);
+        fs::write(&path, format!("{record}\n")).unwrap();
+
+        let scheduler = Scheduler::default();
+        scheduler.configure(path.clone()).unwrap();
+        let tasks = scheduler.list().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "rc8-task");
+
+        let updated = scheduler
+            .update(
+                "rc8-task",
+                ScheduledTaskDraft {
+                    enabled: true,
+                    ..draft("检查项目状态")
+                },
+            )
+            .unwrap();
+        assert!(updated.enabled);
+        let reloaded = Scheduler::default();
+        reloaded.configure(path.clone()).unwrap();
+        assert!(reloaded.list().unwrap()[0].enabled);
         let _ = fs::remove_file(path);
     }
 
