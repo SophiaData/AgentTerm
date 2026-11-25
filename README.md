@@ -46,7 +46,7 @@ AgentTerm 不读取或复制 CLI 账号凭据。Claude Code、Codex、Agy
 
 ## 本地开发
 
-需要 Node.js 22.13+、pnpm、Rust 1.90+、Python 3，以及对应平台的 Tauri
+需要 Node.js 22.22.2+、pnpm、Rust 1.90+、Python 3，以及对应平台的 Tauri
 系统依赖。
 
 ```bash
