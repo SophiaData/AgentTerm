@@ -1,6 +1,6 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -43,24 +43,18 @@ pub fn check_latest() -> Result<UpdateStatus, String> {
     select_update(&releases, CURRENT_VERSION)
 }
 
-pub fn download_and_launch(url: &str) -> Result<(), String> {
+/// Validate, download and write the installer, but do not start it. Launching
+/// is deferred until this process has exited, otherwise the installer would
+/// have to kill the running application to replace its executable.
+pub fn prepare_installer(url: &str) -> Result<PathBuf, String> {
     if !trusted_release_url(url) {
         return Err("更新地址不在 AgentTerm 官方发布页".into());
     }
     let releases: Vec<Release> = serde_json::from_slice(&http_get(RELEASE_API)?)
         .map_err(|error| format!("无法重新校验更新信息：{error}"))?;
-    let status = select_update(&releases, CURRENT_VERSION)?;
-    if !status.update_available || status.download_url.as_deref() != Some(url) {
-        return Err("更新地址不是当前允许安装的最新版本".into());
-    }
-    let digest = releases
-        .iter()
-        .flat_map(|release| &release.assets)
-        .find(|asset| asset.browser_download_url == url)
-        .and_then(|asset| asset.digest.as_deref())
-        .ok_or_else(|| "更新包缺少 GitHub SHA-256 digest，已拒绝安装".to_string())?;
+    let digest = installer_digest(&releases, CURRENT_VERSION, url)?;
     let bytes = http_get(url)?;
-    verify_digest(&bytes, digest)?;
+    verify_digest(&bytes, &digest)?;
     let extension = if cfg!(target_os = "macos") {
         "dmg"
     } else {
@@ -68,8 +62,22 @@ pub fn download_and_launch(url: &str) -> Result<(), String> {
     };
     let path = unique_update_path(extension);
     write_new(&path, &bytes)?;
-    launch_installer(&path)?;
-    Ok(())
+    Ok(path)
+}
+
+/// The digest GitHub publishes for `url`, but only when `url` is the update
+/// this build is currently allowed to install.
+fn installer_digest(releases: &[Release], current: &str, url: &str) -> Result<String, String> {
+    let status = select_update(releases, current)?;
+    if !status.update_available || status.download_url.as_deref() != Some(url) {
+        return Err("更新地址不是当前允许安装的最新版本".into());
+    }
+    releases
+        .iter()
+        .flat_map(|release| &release.assets)
+        .find(|asset| asset.browser_download_url == url)
+        .and_then(|asset| asset.digest.clone())
+        .ok_or_else(|| "更新包缺少 GitHub SHA-256 digest，已拒绝安装".to_string())
 }
 
 fn select_update(releases: &[Release], current: &str) -> Result<UpdateStatus, String> {
@@ -174,14 +182,71 @@ fn trusted_release_url(url: &str) -> bool {
         && (url.ends_with("-windows-x64-setup.exe") || url.ends_with("-macos-arm64.dmg"))
 }
 
-fn launch_installer(path: &PathBuf) -> Result<(), String> {
-    if cfg!(target_os = "macos") {
-        Command::new("open").arg(path).spawn()
-    } else {
-        Command::new(path).spawn()
-    }
-    .map(|_| ())
-    .map_err(|error| format!("无法打开安装包：{error}"))
+/// Start a detached helper that waits for this process to exit and only then
+/// runs the installer. If shutdown is blocked the helper gives up, so an
+/// installer never races a still-running application.
+#[cfg(windows)]
+fn spawn_installer_after_exit(installer: &PathBuf, pid: u32) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    let script =
+        std::env::temp_dir().join(format!("agentterm-install-{pid}-{}.ps1", unique_nonce()));
+    let body = "param([int]$TargetPid,[string]$Installer)\n\
+$deadline = (Get-Date).AddSeconds(120)\n\
+while ((Get-Date) -lt $deadline) {\n\
+  if (-not (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)) { break }\n\
+  Start-Sleep -Milliseconds 200\n\
+}\n\
+if (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue) { exit 1 }\n\
+Start-Process -FilePath $Installer\n\
+exit 0\n";
+    fs::write(&script, body).map_err(|error| format!("无法准备安装脚本：{error}"))?;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+        ])
+        .arg(&script)
+        .arg("-TargetPid")
+        .arg(pid.to_string())
+        .arg("-Installer")
+        .arg(installer)
+        .creation_flags(0x0800_0000);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法启动安装助手：{error}"))
+}
+
+#[cfg(not(windows))]
+fn spawn_installer_after_exit(installer: &PathBuf, pid: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script =
+        std::env::temp_dir().join(format!("agentterm-install-{pid}-{}.sh", unique_nonce()));
+    let body = "#!/bin/sh\n\
+for _ in $(seq 1 600); do\n\
+  kill -0 \"$1\" 2>/dev/null || break\n\
+  sleep 0.2\n\
+done\n\
+kill -0 \"$1\" 2>/dev/null && exit 1\n\
+open \"$2\"\n";
+    fs::write(&script, body).map_err(|error| format!("无法准备安装脚本：{error}"))?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("无法保护安装脚本：{error}"))?;
+    Command::new("/bin/sh")
+        .arg(&script)
+        .arg(pid.to_string())
+        .arg(installer)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法启动安装助手：{error}"))
 }
 
 fn write_new(path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
@@ -196,14 +261,18 @@ fn write_new(path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn unique_update_path(extension: &str) -> PathBuf {
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
+    let seed = unique_nonce();
     std::env::temp_dir().join(format!(
         "AgentTerm-update-{}-{seed}.{extension}",
         std::process::id()
     ))
+}
+
+fn unique_nonce() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default()
 }
 
 fn verify_digest(bytes: &[u8], expected: &str) -> Result<(), String> {
@@ -281,10 +350,16 @@ pub async fn check_for_update() -> Result<UpdateStatus, String> {
 }
 
 #[tauri::command]
-pub async fn install_update(download_url: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || download_and_launch(&download_url))
+pub async fn install_update(app: tauri::AppHandle, download_url: String) -> Result<(), String> {
+    let installer = tauri::async_runtime::spawn_blocking(move || prepare_installer(&download_url))
         .await
-        .map_err(|error| format!("更新安装线程异常：{error}"))?
+        .map_err(|error| format!("更新安装线程异常：{error}"))??;
+    spawn_installer_after_exit(&installer, std::process::id())?;
+    // The detached helper waits for this process to disappear before launching
+    // the installer, so a blocked shutdown simply makes the helper give up
+    // instead of replacing files under a running application.
+    app.exit(0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -389,5 +464,23 @@ mod tests {
         assert!(status.update_available);
         assert_eq!(status.latest_version.as_deref(), Some("0.2.0-rc.6"));
         assert_eq!(status.channel, "pre-release");
+    }
+
+    #[test]
+    fn installer_digest_requires_the_currently_offered_update_url() {
+        let releases = vec![release("0.2.0-rc.10", true)];
+        let url = releases[0].assets[0].browser_download_url.clone();
+        let digest = super::installer_digest(&releases, "0.2.0-rc.9", &url).unwrap();
+        assert!(digest.starts_with("sha256:"));
+        // Same version is not an update, so nothing may be installed.
+        assert!(super::installer_digest(&releases, "0.2.0-rc.10", &url).is_err());
+        // A different asset of the same release is never accepted.
+        let other =
+            "https://github.com/SophiaData/AgentTerm/releases/download/v0.2.0-rc.10/other.exe";
+        assert!(super::installer_digest(&releases, "0.2.0-rc.9", other).is_err());
+        // An older release is not the offered update either.
+        let older = vec![release("0.2.0-rc.8", true)];
+        let older_url = older[0].assets[0].browser_download_url.clone();
+        assert!(super::installer_digest(&older, "0.2.0-rc.9", &older_url).is_err());
     }
 }

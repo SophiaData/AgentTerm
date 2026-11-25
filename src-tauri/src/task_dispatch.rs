@@ -245,25 +245,6 @@ impl TaskLedgerState {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::DispatchRuntime;
-
-    #[test]
-    fn dispatch_lock_recovers_after_poison() {
-        let runtime = DispatchRuntime::default();
-        let active = runtime.active.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = active.lock().expect("lock active dispatch");
-            panic!("poison active dispatch lock");
-        })
-        .join();
-
-        assert!(runtime.active.is_poisoned());
-        assert!(runtime.lock_active().is_none());
-    }
-}
-
 fn controlled_cli(tool_id: &str) -> Result<Cli, String> {
     match tool_id {
         "claude" => Ok(Cli::Claude),
@@ -314,4 +295,23 @@ pub(crate) fn validate_controlled_dispatch(
         return Err("当前 CLI 会话不是任务记录已关联的会话".into());
     }
     controlled_cli(&info.tool_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DispatchRuntime;
+
+    #[test]
+    fn dispatch_lock_recovers_after_poison() {
+        let runtime = DispatchRuntime::default();
+        let active = runtime.active.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = active.lock().expect("lock active dispatch");
+            panic!("poison active dispatch lock");
+        })
+        .join();
+
+        assert!(runtime.active.is_poisoned());
+        assert!(runtime.lock_active().is_none());
+    }
 }

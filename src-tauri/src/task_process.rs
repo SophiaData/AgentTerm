@@ -100,12 +100,26 @@ pub(crate) fn run(spec: ProcessSpec, timeout: Duration) -> Result<Vec<u8>, Proce
 /// Run a scheduled Agent CLI without a shell, drain stdout/stderr concurrently,
 /// and retain a bounded tail. Unlike the relay path, a non-zero exit is a
 /// completed run whose code and output are returned to the scheduler.
+#[cfg(test)]
 pub(crate) fn run_scheduler_process(
     binary: PathBuf,
     args: Vec<String>,
     cwd: PathBuf,
     timeout: Duration,
     output_limit: usize,
+) -> Result<CapturedProcessOutput, ProcessError> {
+    run_scheduler_process_with_cancel(binary, args, cwd, timeout, output_limit, &|| false)
+}
+
+/// Same as [`run_scheduler_process`], but aborts the whole process tree as soon
+/// as `cancelled` reports true (user asked to stop, or the app is exiting).
+pub(crate) fn run_scheduler_process_with_cancel(
+    binary: PathBuf,
+    args: Vec<String>,
+    cwd: PathBuf,
+    timeout: Duration,
+    output_limit: usize,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<CapturedProcessOutput, ProcessError> {
     if timeout.is_zero() || output_limit == 0 {
         return Err(ProcessError::Start);
@@ -160,6 +174,14 @@ pub(crate) fn run_scheduler_process(
                 let _ = scope.stop(&mut child);
                 return Err(ProcessError::StopUnconfirmed);
             }
+            Ok(None) if cancelled() => {
+                let stopped = scope.stop(&mut child);
+                return Err(if stopped {
+                    ProcessError::StopRequested
+                } else {
+                    ProcessError::StopUnconfirmed
+                });
+            }
             Ok(None) if started.elapsed() >= timeout => {
                 let stopped = scope.stop(&mut child);
                 return Err(if stopped {
@@ -193,7 +215,10 @@ pub(crate) fn run_scheduler_process(
         output.extend_from_slice(&stderr);
     }
     if had_descendants {
-        return Err(ProcessError::Descendants);
+        // A CLI that leaves a helper process behind has still finished its own
+        // work. Report the real exit code (so a successful run is not shown as
+        // a failure) and record that the leftover tree was cleaned up.
+        output.extend_from_slice("\n[已清理退出后残留的子进程]".as_bytes());
     }
     Ok(CapturedProcessOutput {
         exit_code: status.code().unwrap_or(-1),

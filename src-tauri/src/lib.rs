@@ -71,6 +71,8 @@ pub fn run() {
             scheduled_tasks::set_scheduled_task_enabled,
             scheduled_tasks::remove_scheduled_task,
             scheduled_tasks::run_scheduled_task_now,
+            scheduled_tasks::scheduled_task_running,
+            scheduled_tasks::cancel_scheduled_task,
             updates::check_for_update,
             updates::install_update
         ])
@@ -132,6 +134,17 @@ pub fn run() {
                 if let Err(error) = app
                     .state::<task_commands::TaskLedgerState>()
                     .stop_controlled_dispatches(std::time::Duration::from_secs(5))
+                {
+                    api.prevent_exit();
+                    tray::report_shutdown_error(app, &error);
+                    return;
+                }
+                // Cancel a running scheduled task and wait for its result to be
+                // persisted, so exiting never orphans the CLI or silently drops
+                // the run record.
+                if let Err(error) = app
+                    .state::<scheduled_tasks::Scheduler>()
+                    .shutdown(std::time::Duration::from_secs(10))
                 {
                     api.prevent_exit();
                     tray::report_shutdown_error(app, &error);

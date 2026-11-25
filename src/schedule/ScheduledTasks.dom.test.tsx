@@ -40,8 +40,10 @@ describe("ScheduledTasks interactions", () => {
   it("requires explicit enable for an Agent-created task", async () => {
     invoke
       .mockResolvedValueOnce([task])
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValueOnce([]);
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(null);
     const user = userEvent.setup();
     render(<ScheduledTasks onClose={vi.fn()} onNotice={vi.fn()} />);
 
@@ -60,8 +62,10 @@ describe("ScheduledTasks interactions", () => {
       .mockResolvedValueOnce([
         { ...task, enabled: true, approvalPending: false },
       ])
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValueOnce([]);
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(null);
     const user = userEvent.setup();
     render(<ScheduledTasks onClose={vi.fn()} onNotice={vi.fn()} />);
 
@@ -83,6 +87,7 @@ describe("ScheduledTasks interactions", () => {
       .mockResolvedValueOnce([
         { ...task, enabled: true, approvalPending: false },
       ])
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error("disk busy"));
     const user = userEvent.setup();
@@ -93,5 +98,24 @@ describe("ScheduledTasks interactions", () => {
       await screen.findByText(/操作已成功，但无法刷新任务列表/),
     ).toBeTruthy();
     expect(screen.queryByText(/定时任务操作失败/)).toBeNull();
+  });
+
+  it("offers a stop action while a run is in flight", async () => {
+    invoke
+      .mockResolvedValueOnce([
+        { ...task, enabled: true, approvalPending: false },
+      ])
+      .mockResolvedValueOnce("task-1")
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(null);
+    const user = userEvent.setup();
+    render(<ScheduledTasks onClose={vi.fn()} onNotice={vi.fn()} />);
+
+    expect(await screen.findByText("正在运行…")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "停止运行" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("cancel_scheduled_task", {}),
+    );
   });
 });
