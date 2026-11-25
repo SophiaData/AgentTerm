@@ -1,6 +1,6 @@
 [package]
 name = "agentterm"
-version = "0.2.0-rc.12"
+version = "0.2.0-rc.13"
 description = "A focused desktop manager for AI command-line tools"
 edition = "2024"
 rust-version = "1.90"

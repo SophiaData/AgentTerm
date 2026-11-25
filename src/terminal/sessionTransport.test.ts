@@ -38,14 +38,30 @@ function fixture() {
   const output = vi.fn();
   const phase = vi.fn();
   const exit = vi.fn();
+  const problem = vi.fn();
   const connect = () => {
-    const connection = connectSession("one", bridge, { output, phase, exit });
+    const connection = connectSession("one", bridge, {
+      output,
+      phase,
+      exit,
+      problem,
+    });
     cleanup.push(connection.dispose);
     return connection;
   };
   const emit = (event: string, payload: unknown) =>
     listeners.get(`session-${event}-one`)?.({ payload });
-  return { invoke, bridge, output, phase, exit, connect, emit, removed };
+  return {
+    invoke,
+    bridge,
+    output,
+    phase,
+    exit,
+    problem,
+    connect,
+    emit,
+    removed,
+  };
 }
 
 const cleanup: (() => void)[] = [];
@@ -196,16 +212,70 @@ describe("existing terminal connection", () => {
     expect(f.output).not.toHaveBeenCalled();
   });
 
-  it("bounds input without sending oversized paste content", async () => {
+  it("delivers a large paste in bounded chunks instead of disconnecting", async () => {
     const f = fixture();
     const c = f.connect();
     await c.ready;
-    c.send("中".repeat(30_000));
-    expect(f.phase).toHaveBeenLastCalledWith(
-      "error",
-      expect.stringContaining("输入积压"),
+    // 90 KB of Chinese text: a single paste larger than the old 64 KB cap.
+    const paste = "中".repeat(30_000);
+    c.send(paste);
+    await vi.waitFor(() =>
+      expect(f.invoke.mock.calls.length).toBeGreaterThan(5),
     );
-    expect(f.invoke).toHaveBeenCalledOnce();
+    const chunks = f.invoke.mock.calls
+      .slice(1)
+      .map(([, args]) => args.data as string);
+    expect(chunks.join("")).toBe(paste);
+    expect(chunks.every((chunk) => chunk.length > 0)).toBe(true);
+    // Every chunk stays under the 16 KB IPC limit, so no single write can hog
+    // the write path.
+    expect(
+      chunks.every(
+        (chunk) => new TextEncoder().encode(chunk).byteLength <= 16 * 1024,
+      ),
+    ).toBe(true);
+    expect(f.phase).not.toHaveBeenLastCalledWith("error", expect.anything());
+    expect(f.problem).not.toHaveBeenCalled();
+  });
+
+  it("refuses only the overflowing input and keeps the connection", async () => {
+    const f = fixture();
+    const c = f.connect();
+    await c.ready;
+    const stuck = deferred<unknown>();
+    f.invoke.mockImplementationOnce(() => stuck.promise as Promise<never>);
+    // Queue more than the 1 MiB backlog while the first write never settles.
+    c.send("x".repeat(600 * 1024));
+    c.send("y".repeat(600 * 1024));
+    expect(f.problem).toHaveBeenLastCalledWith(expect.stringContaining("积压"));
+    // The connection is not torn down and nothing after the refusal is queued.
+    expect(f.phase).toHaveBeenLastCalledWith("ready", null);
+    stuck.resolve(null);
+    await vi.waitFor(() =>
+      expect(
+        f.invoke.mock.calls
+          .slice(1)
+          .map(([, args]) => args.data as string)
+          .join(""),
+      ).toBe("x".repeat(600 * 1024)),
+    );
+    expect(f.phase).not.toHaveBeenLastCalledWith("error", expect.anything());
+  });
+
+  it("treats a backend backlog refusal as recoverable", async () => {
+    const f = fixture();
+    const c = f.connect();
+    await c.ready;
+    f.invoke.mockRejectedValueOnce(
+      "终端输入积压过多，请等待当前输入写入后再试",
+    );
+    c.send("abc");
+    await vi.waitFor(() =>
+      expect(f.problem).toHaveBeenLastCalledWith(
+        expect.stringContaining("积压"),
+      ),
+    );
+    expect(f.phase).not.toHaveBeenLastCalledWith("error", expect.anything());
   });
 
   it("times out a stalled connection and discards its late response", async () => {

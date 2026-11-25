@@ -1,5 +1,20 @@
 # Testing policy
 
+## v0.2.0-rc.13 终端写入与大段粘贴（2026-11-25）
+
+修复 issue #87、#88，两条均为 P1。
+
+| issue | 根因                                                                                                                                                      | 修复                                                                                                                                            | 回归                                                                                                                                                                                  |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #87   | `SessionManager::write` 在持有全局 `sessions` Mutex 时对 PTY 做无超时 `write_all` + `flush`；CLI 不消费 stdin 时无限阻塞，拖住 snapshot/stop/start 与退出 | writer 移入每会话专用写线程（有界积压 + 5 s 超时 + 失败即标记关闭），全局锁只用于克隆写通道                                                     | `a_blocked_write_never_holds_the_session_table`：写入卡住时 snapshot/list_live/stop 均在 500 ms 内返回                                                                                |
+| #88   | 前端把「单条大输入」当成「积压」，`inputBytes + bytes > 64 KiB` 直接 `fail()` 断连并丢弃粘贴内容                                                          | 输入按 UTF-8 码点边界切成 16 KiB 分块；上限改为 1 MiB 真实积压；超限只拒绝该次输入并经 `problem` 提示，连接保持可用；后端积压拒绝也按可恢复处理 | `delivers a large paste in bounded chunks instead of disconnecting`、`refuses only the overflowing input and keeps the connection`、`treats a backend backlog refusal as recoverable` |
+
+本机结果：Rust 225 passed / 2 ignored，前端 145 passed（19 文件），`cargo clippy
+--all-targets -- -D warnings`、TypeScript、ESLint 与 Prettier 通过。
+
+边界：真机未构造"CLI 卡死不读 stdin"的现场，阻塞路径由 `GatedWriter` 模拟覆盖；
+大段粘贴的行为由传输层单测覆盖，未在 GUI 中真实粘贴验证。
+
 ## v0.2.0-rc.12 复查补漏（2026-11-25）
 
 用户追问"自查的问题用不用修"后重新核对，refine 结论：

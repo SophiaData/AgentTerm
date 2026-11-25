@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use crate::session_history::{SessionHistory, SessionRecord, normalize_session_title, now_ms};
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
@@ -94,6 +96,102 @@ const MAX_BUFFER_CHARS: usize = 512 * 1024;
 /// end stays open (e.g. a descendant holds it) — see #12.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Maximum time an input write may take before the caller gets an actionable
+/// error. Writes run on the session's own thread, so this only bounds the
+/// caller — it never holds the global session table (#87).
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bytes allowed in flight for one session before new input is refused. This is
+/// backlog, not a per-paste limit: a large paste is chunked by the frontend.
+const WRITE_BACKLOG_LIMIT: usize = 1024 * 1024;
+
+struct WriteRequest {
+    data: Vec<u8>,
+    reply: mpsc::Sender<Result<(), String>>,
+}
+
+/// Owns the PTY write end on a dedicated thread so a blocked write (CLI not
+/// consuming stdin) can never stall the session table (#87).
+#[derive(Clone)]
+struct SessionWriter {
+    sender: mpsc::Sender<WriteRequest>,
+    queued: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+}
+
+impl SessionWriter {
+    fn spawn(mut writer: Box<dyn std::io::Write + Send>) -> Self {
+        let (sender, receiver) = mpsc::channel::<WriteRequest>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let counter = Arc::clone(&queued);
+        let dead = Arc::clone(&closed);
+        std::thread::spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                let outcome = writer
+                    .write_all(&request.data)
+                    .and_then(|()| writer.flush())
+                    .map_err(|error| format!("无法写入终端：{error}"));
+                counter.fetch_sub(request.data.len(), Ordering::SeqCst);
+                let failed = outcome.is_err();
+                let _ = request.reply.send(outcome);
+                if failed {
+                    // Fail the queued work immediately instead of leaving those
+                    // callers to sit out the full timeout.
+                    dead.store(true, Ordering::SeqCst);
+                    while let Ok(pending) = receiver.try_recv() {
+                        counter.fetch_sub(pending.data.len(), Ordering::SeqCst);
+                        let _ = pending
+                            .reply
+                            .send(Err("终端写入失败，会话可能已结束".into()));
+                    }
+                    break;
+                }
+            }
+            dead.store(true, Ordering::SeqCst);
+        });
+        Self {
+            sender,
+            queued,
+            closed,
+        }
+    }
+
+    fn send(&self, data: &[u8]) -> Result<(), String> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("会话已结束".into());
+        }
+        if self
+            .queued
+            .load(Ordering::SeqCst)
+            .saturating_add(data.len())
+            > WRITE_BACKLOG_LIMIT
+        {
+            return Err("终端输入积压过多，请等待当前输入写入后再试".into());
+        }
+        let (reply, answer) = mpsc::channel();
+        self.queued.fetch_add(data.len(), Ordering::SeqCst);
+        if self
+            .sender
+            .send(WriteRequest {
+                data: data.to_vec(),
+                reply,
+            })
+            .is_err()
+        {
+            self.queued.fetch_sub(data.len(), Ordering::SeqCst);
+            return Err("会话已结束".into());
+        }
+        match answer.recv_timeout(WRITE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => Err("终端写入超时，请稍后重试或结束该会话".into()),
+        }
+    }
+}
+
 struct PtySession {
     info: SessionInfo,
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -105,7 +203,7 @@ struct PtySession {
     #[cfg(windows)]
     job: Option<WinJob>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    writer: Box<dyn std::io::Write + Send>,
+    writer: SessionWriter,
     /// Everything the PTY has emitted so far (with its monotonic offset). The
     /// frontend replays this when a terminal view mounts, so output produced
     /// before the listener attached (e.g. Claude Code's first screen) is not
@@ -770,7 +868,7 @@ impl SessionManager {
             #[cfg(windows)]
             job,
             child,
-            writer,
+            writer: SessionWriter::spawn(writer),
             buffer: Arc::new(Mutex::new(OutputBuffer::default())),
         };
         let buffer = Arc::clone(&session.buffer);
@@ -986,15 +1084,18 @@ impl SessionManager {
     }
 
     pub fn write(&self, session_id: &str, data: &str) -> Result<(), String> {
-        let mut sessions = self.lock()?;
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| "会话不存在或已结束".to_string())?;
-        session
-            .writer
-            .write_all(data.as_bytes())
-            .and_then(|()| session.writer.flush())
-            .map_err(|error| format!("无法写入终端：{error}"))
+        // Clone the write channel under the lock, then write with the lock
+        // released. A stuck CLI can no longer block every other session
+        // operation or the shutdown path (#87).
+        let writer = {
+            let sessions = self.lock()?;
+            sessions
+                .get(session_id)
+                .ok_or_else(|| "会话不存在或已结束".to_string())?
+                .writer
+                .clone()
+        };
+        writer.send(data.as_bytes())
     }
 
     pub fn resize(&self, session_id: &str, rows: u16, cols: u16) -> Result<(), String> {
@@ -1260,7 +1361,6 @@ mod tests {
     #[cfg(windows)]
     use std::path::Path;
     use std::path::PathBuf;
-    #[cfg(unix)]
     use std::time::Duration;
 
     use super::SessionManager;
@@ -1389,6 +1489,15 @@ mod tests {
     }
 
     fn insert_fake_session(manager: &SessionManager, id: &str, kill_fails: bool) {
+        insert_fake_session_with_writer(manager, id, kill_fails, Box::new(std::io::sink()));
+    }
+
+    fn insert_fake_session_with_writer(
+        manager: &SessionManager,
+        id: &str,
+        kill_fails: bool,
+        writer: Box<dyn std::io::Write + Send>,
+    ) {
         let mut map = manager.sessions.lock().unwrap();
         map.insert(
             id.to_string(),
@@ -1410,10 +1519,85 @@ mod tests {
                     kill_fails,
                     kill_calls: 0,
                 }),
-                writer: Box::new(std::io::sink()),
+                writer: super::SessionWriter::spawn(writer),
                 buffer: std::sync::Arc::new(super::Mutex::new(super::OutputBuffer::default())),
             },
         );
+    }
+
+    /// Writer that blocks until released, standing in for a CLI that stopped
+    /// consuming stdin (#87).
+    struct GatedWriter {
+        entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::io::Write for GatedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            use std::sync::atomic::Ordering;
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_blocked_write_never_holds_the_session_table() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        let manager = SessionManager::default();
+        let entered = std::sync::Arc::new(AtomicBool::new(false));
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        insert_fake_session_with_writer(
+            &manager,
+            "s-stuck",
+            false,
+            Box::new(GatedWriter {
+                entered: std::sync::Arc::clone(&entered),
+                release: std::sync::Arc::clone(&release),
+            }),
+        );
+
+        let writer_manager = manager.clone();
+        let write = std::thread::spawn(move || writer_manager.write("s-stuck", "pasted text"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "write never reached the PTY"
+        );
+
+        // While the PTY write is stuck, reads, stops and the exit path must all
+        // still be reachable — that was impossible when the write held the lock.
+        let started = Instant::now();
+        assert!(manager.snapshot("s-stuck").unwrap().running);
+        assert!(manager.list_live().unwrap().len() == 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "read paths waited on the blocked write"
+        );
+
+        let started = Instant::now();
+        manager.stop("s-stuck").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "stop waited on the blocked write"
+        );
+
+        // New input is refused immediately once the session is gone.
+        assert!(manager.write("s-stuck", "later").is_err());
+
+        release.store(true, Ordering::SeqCst);
+        write.join().unwrap().ok();
     }
 
     #[test]

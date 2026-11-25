@@ -191,6 +191,11 @@ export default function TerminalView({
           exit: (id, reason) => {
             if (!disposed) current.current.onExit(id, reason);
           },
+          problem: (message) => {
+            // Non-fatal: the connection stays ready; only that input was
+            // refused or dropped.
+            if (!disposed) setProblem(message);
+          },
         },
       );
       cleanups.push(transport.dispose);
