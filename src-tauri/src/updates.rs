@@ -1,6 +1,6 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -182,6 +182,20 @@ fn trusted_release_url(url: &str) -> bool {
         && (url.ends_with("-windows-x64-setup.exe") || url.ends_with("-macos-arm64.dmg"))
 }
 
+/// Body that waits for the launching process to disappear, then runs the
+/// installer. Inline via `-Command`, and the pid/path arrive through environment
+/// variables so no quoting can break it. Nothing is written to disk.
+#[cfg(windows)]
+const INSTALLER_WATCH_SCRIPT: &str = "\
+$pidToWait=[int]$env:AGENTTERM_INSTALL_PID\n\
+$deadline=(Get-Date).AddSeconds(120)\n\
+while((Get-Date) -lt $deadline){\n\
+  if(-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)){break}\n\
+  Start-Sleep -Milliseconds 200\n\
+}\n\
+if(Get-Process -Id $pidToWait -ErrorAction SilentlyContinue){exit 1}\n\
+Start-Process -FilePath $env:AGENTTERM_INSTALL_PATH\n";
+
 /// Start a detached helper that waits for this process to exit and only then
 /// runs the installer. If shutdown is blocked the helper gives up, so an
 /// installer never races a still-running application.
@@ -189,36 +203,28 @@ fn trusted_release_url(url: &str) -> bool {
 fn spawn_installer_after_exit(installer: &PathBuf, pid: u32) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
-    let script =
-        std::env::temp_dir().join(format!("agentterm-install-{pid}-{}.ps1", unique_nonce()));
-    let body = "param([int]$TargetPid,[string]$Installer)\n\
-$deadline = (Get-Date).AddSeconds(120)\n\
-while ((Get-Date) -lt $deadline) {\n\
-  if (-not (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)) { break }\n\
-  Start-Sleep -Milliseconds 200\n\
-}\n\
-if (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue) { exit 1 }\n\
-Start-Process -FilePath $Installer\n\
-exit 0\n";
-    fs::write(&script, body).map_err(|error| format!("无法准备安装脚本：{error}"))?;
-    let mut command = Command::new("powershell.exe");
-    command
+    let powershell = std::env::var_os("SystemRoot")
+        .map(|root| {
+            PathBuf::from(root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.is_file())
+        .ok_or_else(|| "找不到系统 PowerShell，已拒绝自动安装".to_string())?;
+    Command::new(powershell)
         .args([
             "-NoProfile",
             "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
             "-WindowStyle",
             "Hidden",
-            "-File",
+            "-Command",
         ])
-        .arg(&script)
-        .arg("-TargetPid")
-        .arg(pid.to_string())
-        .arg("-Installer")
-        .arg(installer)
-        .creation_flags(0x0800_0000);
-    command
+        .arg(INSTALLER_WATCH_SCRIPT)
+        .env("AGENTTERM_INSTALL_PID", pid.to_string())
+        .env("AGENTTERM_INSTALL_PATH", installer)
+        .creation_flags(0x0800_0000)
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("无法启动安装助手：{error}"))
@@ -226,22 +232,13 @@ exit 0\n";
 
 #[cfg(not(windows))]
 fn spawn_installer_after_exit(installer: &PathBuf, pid: u32) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let script =
-        std::env::temp_dir().join(format!("agentterm-install-{pid}-{}.sh", unique_nonce()));
-    let body = "#!/bin/sh\n\
-for _ in $(seq 1 600); do\n\
-  kill -0 \"$1\" 2>/dev/null || break\n\
-  sleep 0.2\n\
-done\n\
-kill -0 \"$1\" 2>/dev/null && exit 1\n\
-open \"$2\"\n";
-    fs::write(&script, body).map_err(|error| format!("无法准备安装脚本：{error}"))?;
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("无法保护安装脚本：{error}"))?;
+    // Inline script via `sh -c`; no temp file and nothing left behind.
+    let script = "for _ in $(seq 1 600); do kill -0 \"$1\" 2>/dev/null || break; \
+sleep 0.2; done; kill -0 \"$1\" 2>/dev/null && exit 1; open \"$2\"";
     Command::new("/bin/sh")
-        .arg(&script)
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
         .arg(pid.to_string())
         .arg(installer)
         .spawn()

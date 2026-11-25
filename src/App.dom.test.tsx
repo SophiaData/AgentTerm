@@ -123,13 +123,13 @@ describe("App interactions", () => {
   it("shows the authoritative update result", async () => {
     mockLauncher();
     invoke.mockResolvedValueOnce({
-      currentVersion: "0.2.0-rc.10",
-      latestVersion: "0.2.0-rc.10",
+      currentVersion: "0.2.0-rc.11",
+      latestVersion: "0.2.0-rc.11",
       updateAvailable: false,
       downloadUrl: null,
       notes: null,
       channel: "prerelease",
-      message: "当前已是 0.2.0-rc.10",
+      message: "当前已是 0.2.0-rc.11",
     });
     const user = userEvent.setup();
     render(<App />);
@@ -137,6 +137,6 @@ describe("App interactions", () => {
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("check_for_update"),
     );
-    expect(await screen.findByText("当前已是 0.2.0-rc.10")).toBeTruthy();
+    expect(await screen.findByText("当前已是 0.2.0-rc.11")).toBeTruthy();
   });
 });

@@ -812,20 +812,26 @@ fn read_existing(path: &Path) -> Result<(u64, Vec<ScheduledTask>), String> {
     let mut torn_tail = !complete;
     for (index, line) in lines.iter().take(line_count).enumerate() {
         let is_last = index + 1 == line_count;
-        let record = serde_json::from_str::<StoreRecord>(line)
-            .ok()
-            .filter(|record| {
-                record.schema == 1
-                    && journal::revision_follows(revision, record.revision)
-                    && digest_matches(record).unwrap_or(false)
-            });
-        let Some(record) = record else {
-            if is_last {
-                torn_tail = true;
-                break;
+        // Only an unparseable final line counts as a torn write. A line that
+        // parses but fails schema/revision/digest is tampering or corruption,
+        // and must fail closed instead of silently rolling back to the previous
+        // revision (which could resurrect a deleted task).
+        let record: StoreRecord = match serde_json::from_str(line) {
+            Ok(record) => record,
+            Err(_) => {
+                if is_last {
+                    torn_tail = true;
+                    break;
+                }
+                return Err("定时任务存储校验失败".into());
             }
-            return Err("定时任务存储校验失败".into());
         };
+        if record.schema != 1
+            || !journal::revision_follows(revision, record.revision)
+            || !digest_matches(&record)?
+        {
+            return Err("定时任务存储校验失败".into());
+        }
         validate_tasks(&record.tasks)?;
         revision = Some(record.revision);
         tasks = record.tasks;
@@ -1372,6 +1378,37 @@ mod tests {
         assert!(repaired.ends_with(b"\n"));
         assert_eq!(std::str::from_utf8(&repaired).unwrap().lines().count(), 1);
         assert_eq!(super::read_store(&path).unwrap()[0].id, "task-torn");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_valid_but_unverifiable_last_record_still_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-schedule-tamper-{}-{}.json",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let mut task = super::normalize_draft(draft("有效指令"), None).unwrap();
+        task.id = "task-keep".into();
+        super::write_store(&path, std::slice::from_ref(&task)).unwrap();
+        // A complete, parseable record whose digest does not match is tampering,
+        // not a torn write: rolling back would resurrect earlier state.
+        let tampered = concat!(
+            r#"{"schema":1,"revision":2,"tasks":[],"sha256":""#,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(tampered.as_bytes()).unwrap();
+        file.write_all(b"\"}\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let before = fs::read(&path).unwrap();
+
+        let scheduler = Scheduler::default();
+        scheduler.configure(path.clone()).unwrap();
+        assert!(scheduler.list().is_err());
+        // The original bytes are untouched, so nothing was silently dropped.
+        assert_eq!(fs::read(&path).unwrap(), before);
         let _ = fs::remove_file(path);
     }
 
