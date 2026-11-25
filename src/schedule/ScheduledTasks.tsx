@@ -43,14 +43,19 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [runningId, setRunningId] = useState<string | null>(null);
   const loadVersion = useRef(0);
 
   const load = useCallback(async () => {
     const { invoke } = await import("@tauri-apps/api/core");
     const version = ++loadVersion.current;
-    const next = await invoke<ScheduledTask[]>("list_scheduled_tasks");
+    const [next, running] = await Promise.all([
+      invoke<ScheduledTask[]>("list_scheduled_tasks"),
+      invoke<string | null>("scheduled_task_running"),
+    ]);
     if (version !== loadVersion.current) return;
     setTasks(next);
+    setRunningId(running);
     setError(null);
     setLoading(false);
   }, []);
@@ -68,7 +73,9 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
     const refresh = () => {
       void load().catch((cause) => setError(errorText(cause)));
     };
-    const timer = window.setInterval(refresh, 5_000);
+    // Poll faster while a run is in flight so the panel shows progress and the
+    // stop action promptly.
+    const timer = window.setInterval(refresh, runningId ? 1_500 : 5_000);
     void import("@tauri-apps/api/event")
       .then(({ listen }) =>
         listen("scheduled-tasks-changed", () => {
@@ -87,7 +94,7 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
       window.clearInterval(timer);
       unlisten?.();
     };
-  }, [load]);
+  }, [load, runningId]);
 
   const act = async (command: string, args: Record<string, unknown>) => {
     setBusy(true);
@@ -96,7 +103,8 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
       const { invoke } = await import("@tauri-apps/api/core");
       await invoke(command, args);
       if (command === "run_scheduled_task_now")
-        onNotice("定时任务已运行，结果已更新");
+        onNotice("定时任务已开始运行，可在面板中查看或停止");
+      if (command === "cancel_scheduled_task") onNotice("已请求停止定时任务");
     } catch (cause) {
       setError(`定时任务操作失败：${errorText(cause)}`);
       setBusy(false);
@@ -168,9 +176,13 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
                   {task.model ? ` · ${task.model}` : ""}
                 </p>
                 <p className="schedule-next">
-                  {task.enabled
-                    ? `下次 ${timeText(task.nextRunAtMs)}`
-                    : "不会自动运行"}
+                  {runningId === task.id
+                    ? "正在运行…"
+                    : task.enabled
+                      ? `下次 ${timeText(task.nextRunAtMs)}`
+                      : task.approvalPending
+                        ? "确认启用后按计划运行"
+                        : `启用后 ${timeText(task.nextRunAtMs)}`}
                 </p>
                 {task.sourceSessionId ? (
                   <p className="schedule-source">Agent 会话创建</p>
@@ -196,15 +208,27 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
                         ? "暂停"
                         : "启用"}
                   </button>
-                  <button
-                    type="button"
-                    disabled={busy || task.approvalPending}
-                    onClick={() =>
-                      void act("run_scheduled_task_now", { id: task.id })
-                    }
-                  >
-                    立即运行
-                  </button>
+                  {runningId === task.id ? (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void act("cancel_scheduled_task", {})}
+                    >
+                      停止运行
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={
+                        busy || task.approvalPending || runningId !== null
+                      }
+                      onClick={() =>
+                        void act("run_scheduled_task_now", { id: task.id })
+                      }
+                    >
+                      立即运行
+                    </button>
+                  )}
                   {deletingId === task.id ? (
                     <>
                       <button

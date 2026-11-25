@@ -19,3 +19,10 @@ coverage/
 .DS_Store
 *.log
 backups/
+
+# Generated per-platform Tauri permission schemas
+src-tauri/gen/schemas/windows-schema.json
+src-tauri/gen/schemas/linux-schema.json
+
+# Native CLI fixtures compiled by the Rust test suite
+agentterm-native-fixture-*

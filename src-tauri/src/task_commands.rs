@@ -1340,7 +1340,7 @@ mod tests {
                 id: "session-controlled".into(),
                 tool_id: "claude".into(),
                 tool_name: "Claude Code".into(),
-                project_path: project_path,
+                project_path,
                 title: None,
             },
         )

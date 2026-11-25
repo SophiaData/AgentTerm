@@ -12,6 +12,13 @@ const JOURNAL_LIMIT: u64 = 8 * 1024 * 1024;
 const FILE_LIMIT: u64 = 1024 * 1024;
 const RECORD_LIMIT: usize = 512 * 1024;
 
+/// Text artifacts a task may reference. Everything here is validated as UTF-8
+/// and bounded by `FILE_LIMIT`; binary formats stay out of scope.
+const TEXT_ARTIFACT_EXTENSIONS: &[&str] = &[
+    "sql", "md", "txt", "json", "csv", "tsv", "log", "yml", "yaml", "xml", "html", "htm", "toml",
+    "ini", "conf", "sh", "ps1", "py", "js", "ts", "tsx", "rs",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Step {
@@ -733,13 +740,17 @@ fn artifact_bytes(plan: &TaskPlan, relative: &str) -> Result<(PathBuf, Vec<u8>),
     if !path.starts_with(&root) {
         return Err("文件真实路径超出产物目录".into());
     }
-    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    if !matches!(extension, "sql" | "md" | "txt" | "json")
+    let extension = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !TEXT_ARTIFACT_EXTENSIONS.contains(&extension.as_str())
         || path
             .file_name()
             .is_some_and(|s| s.to_string_lossy().starts_with('.'))
     {
-        return Err("仅支持普通 SQL、Markdown、TXT 或 JSON 产物".into());
+        return Err("仅支持普通文本产物（SQL、Markdown、CSV、JSON、日志与常见源码）".into());
     }
     let file = File::open(&path).map_err(io_error)?;
     if !file.metadata().map_err(io_error)?.is_file()
@@ -1021,6 +1032,22 @@ mod tests {
         fs::write(&path, vec![b'x'; FILE_LIMIT as usize + 1]).unwrap();
         assert!(store.reference(&name, "big").is_err());
         assert_eq!(store.snapshot().unwrap().revision, 1);
+    }
+
+    #[test]
+    fn csv_and_source_artifacts_are_accepted() {
+        let (store, plan) = fixture();
+        store.create(plan.clone()).unwrap();
+        for (name, body) in [
+            ("report.csv", "a,b\n1,2\n"),
+            ("query.SQL", "select 1;\n"),
+            ("notes.md", "# 说明\n"),
+        ] {
+            let path = Path::new(&plan.output_dir).join(name);
+            fs::write(&path, body).unwrap();
+            store.reference(name, name).unwrap();
+        }
+        assert_eq!(store.snapshot().unwrap().artifacts.len(), 3);
     }
     #[cfg(unix)]
     #[test]

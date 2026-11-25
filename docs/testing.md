@@ -1,5 +1,28 @@
 # Testing policy
 
+## v0.2.0-rc.10 缺陷收口（2026-11-25）
+
+上一轮全面审核列出的问题，本轮逐项修复并补回归：
+
+| 问题                           | 修复                                                                                                       | 回归                                                                                              |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| 更新安装与运行中的应用争抢文件 | `prepare_installer` 只下载校验；启动“等待本进程退出”的助手后再优雅退出                                     | `installer_digest_requires_the_currently_offered_update_url`                                      |
+| 立即运行不可取消、面板锁死     | 运行改到后台线程，新增 `scheduled_task_running` / `cancel_scheduled_task`，面板 1.5 s 轮询并提供“停止运行” | `cancelling_reports_and_clears_the_running_task`、`offers a stop action while a run is in flight` |
+| 退出时定时任务无收尾           | `Scheduler::shutdown` 取消并等待结果落盘，失败则阻止退出                                                   | `shutdown_returns_immediately_when_idle_and_times_out_while_busy`                                 |
+| 创建后回报“计划时间”为现在     | 暂停草稿也计算真实下次时间，界面显示“启用后 …”                                                             | `a_paused_draft_reports_the_slot_it_would_run_at`                                                 |
+| 断电残行导致永久校验失败       | 只丢弃尾部残行，归档原件后重建单条记录                                                                     | `a_torn_tail_is_dropped_and_the_store_repairs_itself`                                             |
+| 崩溃后 Agy 配置残留            | 启动时清理旧的 `agentterm_scheduler` 条目                                                                  | 复用既有 Agy 合并/移除回归                                                                        |
+| 认证限流可锁死其他会话         | 限流按 `ip + 令牌指纹` 计数                                                                                | `a_token_guess_lockout_does_not_block_another_session`                                            |
+| 正常退出但留子进程被记失败     | 返回真实退出码并注明已清理子树                                                                             | 既有 `surviving_descendant_blocks_handoff` 仍覆盖中继路径                                         |
+| 产物扩展名过窄                 | 扩到 CSV/TSV/日志/YAML/HTML/源码等文本格式                                                                 | `csv_and_source_artifacts_are_accepted`                                                           |
+
+其他：`cargo clippy --all-targets -- -D warnings` 清零（含测试模块位置与冗余字段）；
+构建生成的 `windows-schema.json` 加入 `.gitignore`；`docs/tasks.md` 的“通道选择”
+改为与实现一致的“按当前版本自动选择”。
+
+本机结果：Rust 222 passed / 2 ignored，前端 143 passed，Clippy 与格式检查通过。
+代码签名仍是正式版阻断项，单独记录在 [发布签名](release-signing.md)。
+
 ## v0.2.0-rc.9 旧任务存储兼容与覆盖安装（2026-11-25）
 
 - rc.8 实机打开定时任务面板时发现旧记录“存储校验失败”。原因是新增

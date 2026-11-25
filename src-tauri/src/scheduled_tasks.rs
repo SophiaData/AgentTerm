@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local, LocalResult, NaiveTime, TimeZone};
 
@@ -10,6 +11,9 @@ use crate::journal;
 use crate::projects::normalize_project_dir;
 use crate::task_process::{self, ProcessError};
 use crate::tools::{candidate_search_dirs, resolve_binary};
+
+/// Optional id handed back to the UI (kept as an alias for readability).
+type Optional<T> = Option<T>;
 
 const STORE_BYTES: u64 = 1024 * 1024;
 const TASK_LIMIT: usize = 50;
@@ -88,6 +92,9 @@ struct SchedulerInner {
     path: Option<PathBuf>,
     tasks: Vec<ScheduledTask>,
     running: bool,
+    /// Empty when idle; otherwise the task id currently executing.
+    running_task: String,
+    cancel: Arc<AtomicBool>,
 }
 
 impl Scheduler {
@@ -197,33 +204,40 @@ impl Scheduler {
                 .cloned()
                 .ok_or_else(|| "定时任务不存在".to_string())?;
             inner.running = true;
+            inner.running_task = task.id.clone();
+            inner.cancel = Arc::new(AtomicBool::new(false));
             task
         };
-        let run = execute_task(&task);
-        let mut inner = self.lock()?;
-        inner.running = false;
-        load_if_configured(&mut inner)?;
-        let saved = if let Some(current) = inner.tasks.iter_mut().find(|item| item.id == id) {
-            let schedule = effective_schedule(current);
-            current.runs.insert(0, run);
-            current.runs.truncate(RUN_LIMIT);
-            current.schedule = Some(schedule.clone());
-            current.next_run_at_ms = advance_next_run(&schedule, now_ms())?;
-            current.clone()
-        } else {
-            return Err("定时任务已在运行期间删除".into());
-        };
-        persist(&inner)?;
-        Ok(saved)
+        // Execute on a worker thread so the panel stays responsive and the run
+        // can be cancelled. A manual run never advances the schedule, so
+        // pressing "run now" shortly before the next slot does not swallow it.
+        let scheduler = self.handle();
+        let scheduled = task.clone();
+        let spawn = std::thread::Builder::new()
+            .name("agentterm-scheduled-run".into())
+            .spawn(move || {
+                let cancel = scheduler.cancel_flag();
+                let run = execute_task_with_cancel(&scheduled, &cancel);
+                scheduler.complete_run(&scheduled.id, run, false);
+            });
+        if let Err(error) = spawn {
+            self.complete_run(
+                &task.id,
+                failed_run(&format!("无法启动定时任务：{error}")),
+                false,
+            );
+            return Err(format!("无法启动定时任务：{error}"));
+        }
+        Ok(task)
     }
 
     pub fn tick(&self) -> Result<(), String> {
-        self.tick_with(execute_task)
+        self.tick_with(execute_task_with_cancel)
     }
 
     fn tick_with(
         &self,
-        execute: impl FnOnce(&ScheduledTask) -> ScheduledRun,
+        execute: impl FnOnce(&ScheduledTask, &AtomicBool) -> ScheduledRun,
     ) -> Result<(), String> {
         let due = {
             let mut inner = self.lock()?;
@@ -256,19 +270,96 @@ impl Scheduler {
             let task_to_run = task.clone();
             persist(&inner)?;
             inner.running = true;
+            inner.running_task = task_to_run.id.clone();
+            inner.cancel = Arc::new(AtomicBool::new(false));
             task_to_run
         };
         let task = due;
-        let run = execute(&task);
-        let mut inner = self.lock()?;
-        inner.running = false;
-        load_if_configured(&mut inner)?;
-        if let Some(current) = inner.tasks.iter_mut().find(|item| item.id == task.id) {
-            current.runs.insert(0, run);
-            current.runs.truncate(RUN_LIMIT);
-            persist(&inner)?;
-        }
+        let cancel = self.cancel_flag();
+        // A scheduled run has already advanced its slot, so a cancelled or
+        // failed run is recorded but not retried in place.
+        let run = execute(&task, &cancel);
+        self.complete_run(&task.id, run, true);
         Ok(())
+    }
+
+    fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.state
+            .lock()
+            .map(|inner| Arc::clone(&inner.cancel))
+            .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Persist the finished run and clear the running marker, even when the
+    /// underlying call failed. Never leaves the scheduler stuck as "running".
+    fn complete_run(&self, task_id: &str, run: ScheduledRun, normalize_schedule: bool) {
+        let Ok(mut inner) = self.state.lock() else {
+            return;
+        };
+        inner.running = false;
+        inner.running_task.clear();
+        if let Err(error) = load_if_configured(&mut inner) {
+            eprintln!("AgentTerm could not reload scheduled tasks after a run: {error}");
+            return;
+        }
+        let Some(current) = inner.tasks.iter_mut().find(|item| item.id == task_id) else {
+            return;
+        };
+        if normalize_schedule {
+            current.schedule = Some(effective_schedule(current));
+        }
+        current.runs.insert(0, run);
+        current.runs.truncate(RUN_LIMIT);
+        if let Err(error) = persist(&inner) {
+            eprintln!("AgentTerm could not persist a scheduled run result: {error}");
+        }
+    }
+
+    /// Id of the task currently executing, or `None` when idle.
+    pub fn running_task(&self) -> Result<Optional<String>, String> {
+        let mut inner = self.lock()?;
+        load_if_configured(&mut inner)?;
+        if inner.running && !inner.running_task.is_empty() {
+            Ok(Some(inner.running_task.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Ask the running task (scheduled or manual) to stop its process tree.
+    /// Returns whether something was running.
+    pub fn cancel_run(&self) -> Result<bool, String> {
+        let inner = self.lock()?;
+        if !inner.running {
+            return Ok(false);
+        }
+        inner.cancel.store(true, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    /// Cancel any in-flight run and wait for its result to be persisted, so a
+    /// graceful exit never leaves a run unrecorded or a child process orphaned.
+    pub fn shutdown(&self, timeout: Duration) -> Result<(), String> {
+        {
+            let inner = self.lock()?;
+            if !inner.running {
+                return Ok(());
+            }
+            inner.cancel.store(true, Ordering::SeqCst);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let inner = self.lock()?;
+                if !inner.running {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("定时任务仍在运行，请稍后重试退出".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, SchedulerInner>, String> {
@@ -329,15 +420,14 @@ fn normalize_draft(
     }
     let project = normalize_project_dir(&draft.project_path)?;
     let now = now_ms();
-    let next = if draft.enabled {
-        existing
-            .filter(|task| task.enabled && effective_schedule(task) == draft.schedule)
-            .map(|task| task.next_run_at_ms)
-            .map(Ok)
-            .unwrap_or_else(|| initial_next_run(&draft.schedule, now))?
-    } else {
-        existing.map(|task| task.next_run_at_ms).unwrap_or(now)
-    };
+    // Keep an existing slot only when the schedule itself is unchanged, so a
+    // paused task still reports the time it will run at once enabled instead of
+    // "now". A changed schedule always gets a freshly computed slot.
+    let next = existing
+        .filter(|task| effective_schedule(task) == draft.schedule)
+        .map(|task| task.next_run_at_ms)
+        .map(Ok)
+        .unwrap_or_else(|| initial_next_run(&draft.schedule, now))?;
     let interval_minutes = match draft.schedule {
         ScheduleSpec::Interval { minutes } => minutes,
         ScheduleSpec::Daily { .. } => 1440,
@@ -485,9 +575,9 @@ fn unique_id(tasks: &[ScheduledTask]) -> String {
     }
 }
 
-fn execute_task(task: &ScheduledTask) -> ScheduledRun {
+fn execute_task_with_cancel(task: &ScheduledTask, cancel: &AtomicBool) -> ScheduledRun {
     let started = now_ms();
-    let result = run_process(task);
+    let result = run_process(task, cancel);
     let finished = now_ms();
     match result {
         Ok((code, output)) => ScheduledRun {
@@ -507,15 +597,33 @@ fn execute_task(task: &ScheduledTask) -> ScheduledRun {
     }
 }
 
-fn run_process(task: &ScheduledTask) -> Result<(i32, String), String> {
+fn failed_run(message: &str) -> ScheduledRun {
+    let now = now_ms();
+    ScheduledRun {
+        started_at_ms: now,
+        finished_at_ms: now,
+        status: "失败".into(),
+        exit_code: None,
+        output: message.to_string(),
+    }
+}
+
+fn run_process(task: &ScheduledTask, cancel: &AtomicBool) -> Result<(i32, String), String> {
     let binary = resolve_tool(&task.tool_id)?;
     let cwd = normalize_project_dir(&task.project_path)?;
     let (program, mut args) = command_for_tool(&binary, &task.tool_id, task.model.as_deref())?;
     args.push(task.prompt.clone());
     let timeout = Duration::from_secs(task.timeout_minutes.saturating_mul(60));
-    let captured =
-        task_process::run_scheduler_process(program, args, cwd, timeout, OUTPUT_LIMIT * 4)
-            .map_err(|error| process_error_text(error, task.timeout_minutes))?;
+    let cancelled = || cancel.load(Ordering::SeqCst);
+    let captured = task_process::run_scheduler_process_with_cancel(
+        program,
+        args,
+        cwd,
+        timeout,
+        OUTPUT_LIMIT * 4,
+        &cancelled,
+    )
+    .map_err(|error| process_error_text(error, task.timeout_minutes))?;
     Ok((
         captured.exit_code,
         trim_output(&String::from_utf8_lossy(&captured.output)),
@@ -688,26 +796,61 @@ fn read_existing(path: &Path) -> Result<(u64, Vec<ScheduledTask>), String> {
     if bytes.is_empty() {
         return Ok((0, Vec::new()));
     }
-    if !bytes.ends_with(b"\n") {
-        return Err("定时任务存储校验失败".into());
-    }
     let text = std::str::from_utf8(&bytes).map_err(|_| "定时任务存储不是有效文本".to_string())?;
+    // A crash mid-append can leave a torn final line (or no trailing newline).
+    // Only the tail may be dropped; anything damaged in the middle still fails
+    // closed, and the original file is archived before any repair is written.
+    let complete = bytes.ends_with(b"\n");
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line_count = if complete {
+        lines.len().saturating_sub(1)
+    } else {
+        lines.len()
+    };
     let mut revision = None;
     let mut tasks = Vec::new();
-    for line in text.split_terminator('\n') {
-        let record: StoreRecord =
-            serde_json::from_str(line).map_err(|_| "定时任务存储校验失败".to_string())?;
-        if record.schema != 1
-            || !journal::revision_follows(revision, record.revision)
-            || !digest_matches(&record)?
-        {
+    let mut torn_tail = !complete;
+    for (index, line) in lines.iter().take(line_count).enumerate() {
+        let is_last = index + 1 == line_count;
+        let record = serde_json::from_str::<StoreRecord>(line)
+            .ok()
+            .filter(|record| {
+                record.schema == 1
+                    && journal::revision_follows(revision, record.revision)
+                    && digest_matches(record).unwrap_or(false)
+            });
+        let Some(record) = record else {
+            if is_last {
+                torn_tail = true;
+                break;
+            }
             return Err("定时任务存储校验失败".into());
-        }
+        };
         validate_tasks(&record.tasks)?;
         revision = Some(record.revision);
         tasks = record.tasks;
     }
+    if torn_tail && let Err(error) = repair_store(path, revision, &tasks) {
+        eprintln!("AgentTerm could not repair the scheduled task journal: {error}");
+    }
     Ok((revision.unwrap_or_default(), tasks))
+}
+
+/// Rewrite the journal as a single canonical record after dropping a torn tail.
+/// The caller already holds the store lock; the damaged file is archived by
+/// `replace_and_archive` instead of being deleted.
+fn repair_store(path: &Path, revision: Option<u64>, tasks: &[ScheduledTask]) -> Result<(), String> {
+    let revision = revision.unwrap_or_default().max(1);
+    let record = StoreRecord {
+        schema: 1,
+        revision,
+        sha256: hash(revision, tasks)?,
+        tasks: tasks.to_vec(),
+    };
+    let mut line = serde_json::to_vec(&record).map_err(|_| "定时任务无法保存".to_string())?;
+    line.push(b'\n');
+    journal::replace_and_archive(path, &line).map_err(storage_error)?;
+    Ok(())
 }
 
 fn lock_store(path: &Path) -> Result<journal::JournalLock, String> {
@@ -808,6 +951,7 @@ mod tests {
     use serde::Serialize;
     use sha2::{Digest, Sha256};
     use std::fs;
+    use std::io::Write;
     use std::path::Path;
 
     #[test]
@@ -1085,7 +1229,7 @@ mod tests {
         scheduler.configure(path.clone()).unwrap();
         let mut calls = 0;
         scheduler
-            .tick_with(|selected| {
+            .tick_with(|selected, _cancel| {
                 let persisted = super::read_store(&path).unwrap();
                 assert!(persisted[0].next_run_at_ms > super::now_ms());
                 calls += 1;
@@ -1100,7 +1244,7 @@ mod tests {
             })
             .unwrap();
         scheduler
-            .tick_with(|_| panic!("advanced task must not run twice"))
+            .tick_with(|_, _| panic!("advanced task must not run twice"))
             .unwrap();
         let saved = scheduler.list().unwrap().remove(0);
         assert_eq!(calls, 1);
@@ -1118,7 +1262,7 @@ mod tests {
         let scheduler = Scheduler::default();
         scheduler.lock().unwrap().tasks.push(task.clone());
         scheduler
-            .tick_with(|_| panic!("pending approval must not execute"))
+            .tick_with(|_, _| panic!("pending approval must not execute"))
             .unwrap();
         let enabled = scheduler.set_enabled(&task.id, true).unwrap();
         assert!(enabled.enabled);
@@ -1201,6 +1345,119 @@ mod tests {
                 < super::TASK_LIMIT * super::RUN_LIMIT
         );
     }
+
+    #[test]
+    fn a_torn_tail_is_dropped_and_the_store_repairs_itself() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-schedule-torn-{}-{}.json",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let mut task = super::normalize_draft(draft("有效指令"), None).unwrap();
+        task.id = "task-torn".into();
+        super::write_store(&path, std::slice::from_ref(&task)).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"schema":1,"revision":2,"tasks":[{"id":"#)
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let scheduler = Scheduler::default();
+        scheduler.configure(path.clone()).unwrap();
+        let tasks = scheduler.list().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "task-torn");
+
+        let repaired = fs::read(&path).unwrap();
+        assert!(repaired.ends_with(b"\n"));
+        assert_eq!(std::str::from_utf8(&repaired).unwrap().lines().count(), 1);
+        assert_eq!(super::read_store(&path).unwrap()[0].id, "task-torn");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancelling_reports_and_clears_the_running_task() {
+        let scheduler = Scheduler::default();
+        {
+            let mut inner = scheduler.lock().unwrap();
+            inner.running = true;
+            inner.running_task = "task-running".into();
+        }
+        assert_eq!(
+            scheduler.running_task().unwrap().as_deref(),
+            Some("task-running")
+        );
+        assert!(scheduler.cancel_run().unwrap());
+        assert!(
+            scheduler
+                .cancel_flag()
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+
+        scheduler.complete_run(
+            "task-running",
+            super::ScheduledRun {
+                started_at_ms: 1,
+                finished_at_ms: 2,
+                status: "任务已被停止".into(),
+                exit_code: None,
+                output: String::new(),
+            },
+            false,
+        );
+        assert!(scheduler.running_task().unwrap().is_none());
+        assert!(!scheduler.cancel_run().unwrap());
+    }
+
+    #[test]
+    fn shutdown_returns_immediately_when_idle_and_times_out_while_busy() {
+        let scheduler = Scheduler::default();
+        assert!(
+            scheduler
+                .shutdown(std::time::Duration::from_millis(20))
+                .is_ok()
+        );
+        scheduler.lock().unwrap().running = true;
+        assert!(
+            scheduler
+                .shutdown(std::time::Duration::from_millis(30))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_paused_draft_reports_the_slot_it_would_run_at() {
+        let scheduler = Scheduler::default();
+        let mut draft = draft("有效指令");
+        draft.enabled = false;
+        let saved = scheduler
+            .save(ScheduledTaskDraft {
+                name: draft.name.clone(),
+                project_path: draft.project_path.clone(),
+                tool_id: draft.tool_id.clone(),
+                model: draft.model.clone(),
+                prompt: draft.prompt.clone(),
+                schedule: draft.schedule.clone(),
+                timeout_minutes: draft.timeout_minutes,
+                enabled: false,
+                approval_pending: false,
+                source_session_id: None,
+            })
+            .unwrap();
+        assert!(!saved.enabled);
+        assert!(saved.next_run_at_ms > super::now_ms());
+
+        let updated = scheduler
+            .update(
+                &saved.id,
+                ScheduledTaskDraft {
+                    enabled: true,
+                    ..draft
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.next_run_at_ms, saved.next_run_at_ms);
+    }
 }
 
 #[tauri::command(async)]
@@ -1224,13 +1481,24 @@ pub fn remove_scheduled_task(state: tauri::State<'_, Scheduler>, id: String) -> 
     state.remove(&id)
 }
 
-#[tauri::command]
-pub async fn run_scheduled_task_now(
+/// Starts the run and returns immediately; the panel polls for progress and
+/// offers "停止运行" while the task is executing.
+#[tauri::command(async)]
+pub fn run_scheduled_task_now(
     state: tauri::State<'_, Scheduler>,
     id: String,
 ) -> Result<ScheduledTask, String> {
-    let scheduler = state.handle();
-    tauri::async_runtime::spawn_blocking(move || scheduler.run_now(&id))
-        .await
-        .map_err(|error| format!("定时任务执行线程异常：{error}"))?
+    state.run_now(&id)
+}
+
+#[tauri::command(async)]
+pub fn scheduled_task_running(
+    state: tauri::State<'_, Scheduler>,
+) -> Result<Optional<String>, String> {
+    state.running_task()
+}
+
+#[tauri::command(async)]
+pub fn cancel_scheduled_task(state: tauri::State<'_, Scheduler>) -> Result<bool, String> {
+    state.cancel_run()
 }

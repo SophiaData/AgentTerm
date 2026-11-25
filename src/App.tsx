@@ -516,7 +516,9 @@ export default function App() {
                   await invoke("install_update", {
                     downloadUrl: status.downloadUrl,
                   });
-                  setUpdateMessage(`已开始安装 ${status.latestVersion}`);
+                  setUpdateMessage(
+                    `更新已下载，正在退出并安装 ${status.latestVersion}`,
+                  );
                 })().catch((error: unknown) =>
                   setUpdateMessage(
                     error instanceof Error ? error.message : String(error),

@@ -93,7 +93,9 @@ struct McpState {
     tokens: HashMap<String, String>,
     active_connections: usize,
     recent_calls: HashMap<String, Instant>,
-    auth_failures: HashMap<IpAddr, (u8, Instant)>,
+    /// Keyed by `ip|token-fingerprint`: a local process guessing tokens can no
+    /// longer lock every other Agent session out of the loopback endpoint.
+    auth_failures: HashMap<String, (u8, Instant)>,
 }
 
 impl ScheduleMcp {
@@ -116,6 +118,12 @@ impl ScheduleMcp {
             state.scheduler = Some(scheduler);
             state.app = Some(app);
             state.port = port;
+        }
+        // A previous run may have exited or crashed before removing the Agy
+        // entry; clear it now so Agy never points at a dead endpoint. The
+        // single-instance guard means no live session owns it at this point.
+        if let Err(error) = remove_agy_mcp_config() {
+            eprintln!("AgentTerm could not clear a stale Agy scheduling MCP entry: {error}");
         }
         let shared = Arc::clone(&self.state);
         std::thread::Builder::new()
@@ -244,10 +252,6 @@ impl ScheduleMcp {
 
 fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<McpState>>) {
     let remote = stream.peer_addr().ok().map(|address| address.ip());
-    if remote.is_some_and(|address| auth_limited(&state, address)) {
-        let _ = write_response(&mut stream, 429, "Too many authentication failures");
-        return;
-    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
     let request = match read_request(&mut stream) {
@@ -275,17 +279,20 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<McpState>>) {
         let _ = write_response(&mut stream, 403, "Invalid scheduling MCP origin");
         return;
     }
+    let fingerprint = token_fingerprint(request.authorization.as_deref());
+    if remote.is_some_and(|address| auth_limited(&state, address, &fingerprint)) {
+        let _ = write_response(&mut stream, 429, "Too many authentication failures");
+        return;
+    }
     let Some(token) = authenticated_token(request.authorization.as_deref(), &state) else {
         if let Some(address) = remote {
-            record_auth_failure(&state, address);
+            record_auth_failure(&state, address, &fingerprint);
         }
         let _ = write_response(&mut stream, 404, "Unknown AgentTerm scheduling endpoint");
         return;
     };
-    if let Some(address) = remote
-        && let Ok(mut state) = state.lock()
-    {
-        state.auth_failures.remove(&address);
+    if let Some(address) = remote {
+        clear_auth_failure(&state, address, &fingerprint);
     }
     let payload: Value = match serde_json::from_slice(&request.body) {
         Ok(payload) => payload,
@@ -361,28 +368,55 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn auth_limited(state: &Arc<Mutex<McpState>>, address: IpAddr) -> bool {
+fn auth_key(address: IpAddr, fingerprint: &str) -> String {
+    format!("{address}|{fingerprint}")
+}
+
+/// A short, non-reversible label for the presented bearer value. Only the
+/// fingerprint of a *failed* attempt is retained, so a hostile local process
+/// cannot lock out sessions that use a different (valid) token.
+fn token_fingerprint(authorization: Option<&str>) -> String {
+    let Some(token) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
+        return "anonymous".into();
+    };
+    let digest = Sha256::digest(token.as_bytes());
+    format!("{:x}", digest)[..16].to_string()
+}
+
+fn auth_limited(state: &Arc<Mutex<McpState>>, address: IpAddr, fingerprint: &str) -> bool {
     let Ok(state) = state.lock() else {
         return true;
     };
     state
         .auth_failures
-        .get(&address)
+        .get(&auth_key(address, fingerprint))
         .is_some_and(|(attempts, since)| {
             *attempts >= 20 && since.elapsed() < Duration::from_secs(60)
         })
 }
 
-fn record_auth_failure(state: &Arc<Mutex<McpState>>, address: IpAddr) {
+fn record_auth_failure(state: &Arc<Mutex<McpState>>, address: IpAddr, fingerprint: &str) {
     let Ok(mut state) = state.lock() else {
         return;
     };
     let now = Instant::now();
-    let entry = state.auth_failures.entry(address).or_insert((0, now));
+    state
+        .auth_failures
+        .retain(|_, (_, since)| now.duration_since(*since) < Duration::from_secs(60));
+    let entry = state
+        .auth_failures
+        .entry(auth_key(address, fingerprint))
+        .or_insert((0, now));
     if now.duration_since(entry.1) >= Duration::from_secs(60) {
         *entry = (1, now);
     } else {
         entry.0 = entry.0.saturating_add(1);
+    }
+}
+
+fn clear_auth_failure(state: &Arc<Mutex<McpState>>, address: IpAddr, fingerprint: &str) {
+    if let Ok(mut state) = state.lock() {
+        state.auth_failures.remove(&auth_key(address, fingerprint));
     }
 }
 
@@ -928,14 +962,14 @@ mod tests {
         let claude = bridge.command_args("claude").unwrap();
         assert_eq!(claude[0], "--mcp-config");
         assert!(claude[1].contains("\"type\":\"http\""));
-        assert!(claude[1].contains(&bridge.endpoint()));
+        assert!(claude[1].contains(bridge.endpoint()));
         assert!(claude[1].contains("${AGENTTERM_SCHEDULE_TOKEN}"));
         assert!(!claude[1].contains(&bridge.token));
 
         let codex = bridge.command_args("codex").unwrap();
         assert_eq!(codex[0], "-c");
         assert!(codex[1].contains("mcp_servers.agentterm_scheduler.url="));
-        assert!(codex[1].contains(&bridge.endpoint()));
+        assert!(codex[1].contains(bridge.endpoint()));
         assert!(codex[3].contains("bearer_token_env_var"));
         assert!(!codex.iter().any(|arg| arg.contains(&bridge.token)));
         assert_eq!(
@@ -1108,9 +1142,23 @@ mod tests {
         assert!(super::authenticated_token(Some("Bearer wrong"), &shared).is_none());
 
         let address = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let failed = super::token_fingerprint(Some("Bearer wrong"));
         for _ in 0..20 {
-            super::record_auth_failure(&shared, address);
+            super::record_auth_failure(&shared, address, &failed);
         }
-        assert!(super::auth_limited(&shared, address));
+        assert!(super::auth_limited(&shared, address, &failed));
+    }
+
+    #[test]
+    fn a_token_guess_lockout_does_not_block_another_session() {
+        let shared = Arc::new(Mutex::new(McpState::default()));
+        let address = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let attacker = super::token_fingerprint(Some(&format!("Bearer {}", "a".repeat(64))));
+        let legitimate = super::token_fingerprint(Some(&format!("Bearer {}", "b".repeat(64))));
+        for _ in 0..25 {
+            super::record_auth_failure(&shared, address, &attacker);
+        }
+        assert!(super::auth_limited(&shared, address, &attacker));
+        assert!(!super::auth_limited(&shared, address, &legitimate));
     }
 }
