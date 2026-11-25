@@ -23,6 +23,25 @@
 本机结果：Rust 222 passed / 2 ignored，前端 143 passed，Clippy 与格式检查通过。
 代码签名仍是正式版阻断项，单独记录在 [发布签名](release-signing.md)。
 
+### rc.10 打包与实机验收
+
+- PR #84 CI run `45567875983` 三端 pass；合并 `main@ff96b2a`；打包 run `45568571445`
+  四项成功（Windows/macOS 桌面与 TUI）。
+- 发布 [v0.2.0-rc.10](https://github.com/SophiaData/AgentTerm/releases/tag/v0.2.0-rc.10)
+  Pre-release，标注未签名。资产：setup 2,824,677 bytes / `1377df9d…`、
+  desktop 12,764,672 bytes / `f107cc20…`、tui 481,792 bytes / `e72e97b4…`、
+  tgz 4,081,468 bytes / `a6fef32c…`；GitHub 回读摘要一致。
+- 覆盖安装 `/S /UPDATE /D=E:\AgentTerm\app-ff96b2a` 退出 0，注册版本 0.2.0-rc.10，
+  安装后 EXE `69feb072…`；`/UPDATE` 仍不重写快捷方式，已手动指向新目录。
+- 实机确认（证据 `E:\AgentTerm\runtime\rc10-acceptance`）：
+  - 启动正常，面板任务卡显示“启用后 11/26 15:36”（暂停）与“确认启用后按计划运行”（待确认）。
+  - 日志尾部残行：写入 2 条有效记录 + 半条残行后启动，任务正常读出，文件被重建为单条
+    记录（674 bytes），损坏原件归档为 `.archive-*`（793 bytes）。
+  - 检查更新显示“当前已是 0.2.0-rc.10”。
+  - 删除确认按钮可正常展开/取消，未误删任务。
+- 边界：本轮未在实机点“立即运行”（会真实启动 CLI），该路径由
+  `cancelling_reports_and_clears_the_running_task` 与 DOM 停止按钮回归覆盖。
+
 ## v0.2.0-rc.9 旧任务存储兼容与覆盖安装（2026-11-25）
 
 - rc.8 实机打开定时任务面板时发现旧记录“存储校验失败”。原因是新增
