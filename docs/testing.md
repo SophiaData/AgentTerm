@@ -1,6 +1,35 @@
 # Testing policy
 
-## rc.14 输入异常修复验证（2026-11-25，候选）
+## rc.14 发布、安装与验收（2026-11-25）
+
+固定应用代码 `286cc0a913cbef3a060bed6e07312d497e3eb0b8`，PR #90 / #91 / #92 已合入。
+[测试版 Release](https://github.com/SophiaData/AgentTerm/releases/tag/v0.2.0-rc.14)
+的 tag 指向该提交，8 个附件的 GitHub SHA-256 与本地文件逐项一致；正式签名边界不变。
+
+- 最终 PR 质量门 `45604820281`、合并质量门 `45605537210`：Windows/Linux/macOS 均通过
+  14 项检查，前端 21 文件 / 168 tests；Rust 分别 230 / 234 / 233 passed、各 3 ignored
+  （子进程测试入口）；TUI Windows 15、Linux/macOS 17 passed。
+- 构建 `45605548338`：Windows x64 NSIS、macOS arm64 DMG、双端 TUI 与 Windows npm 包通过。
+  旧候选构建 `45599308430` 取消、`45604056496` 失败，均不作为交付证据。
+- Windows 正常退出旧 rc.13 及其 CLI 后，以 `/S /UPDATE /D=E:\AgentTerm\app-3bd6552`
+  覆盖安装，安装器退出 0；版本 `0.2.0-rc.14`，桌面和开始菜单快捷方式仍指向同一目录。
+  安装器 SHA-256 `2e7770a438e119118ef534e71f368c31faccd1e7793fc8768ddb7b3fb58f527c`。
+  安装后 EXE SHA-256 `c5aa880f8abb33e0b1f24606e93bb70ff16c6cf3214e5309b98e0c4b87385ad7`；
+  与独立 EXE 逐字节比较，仅 Tauri bundle marker 的 `UNK` → `NSS` 三字节不同，符合 NSIS 包装。
+- 新版“检查更新”实际显示“当前已是 0.2.0-rc.14”。定时任务面板正常打开，当前有效记录 0 条；
+  安装前后真实文件摘要均为 `692c596fc6093e10dc75e42039d3746ab4136870c0dc2a455100833168a399bb`。
+  rc.7/rc.8 记录读取、更新和重载由本次三端回归验证，没有往真实文件注入测试记录或启动旧任务。
+- 原生验收已在真实 ConPTY 中启动只处理合成文本的本地程序，没有调用模型。当前 Windows
+  前台为 `LockApp`，`OpenClipboard` 返回 Win32 error 5，粘贴按钮正确显示失败提示；
+  系统剪贴板往返与物理快捷键尚未通过，不能用单元测试代替。未读取用户剪贴板。
+  测试程序已退出，应用按普通 PATH 重启，仅保留一个 AgentTerm；待解锁补验。
+- 主代理串行自检：代码、权限、异步失效与失败路径、变异回归、固定提交 CI、发布摘要和安装
+  证据已核对；不称独立审核或 cc PASS。未发现本轮检查范围内的新增代码阻塞；剩余实机验收未完成。
+
+证据位于 `E:\AgentTerm\runtime\rc14-acceptance`；安装包与校验清单位于
+`E:\AgentTerm\runtime\rc14-package-286cc0a\release`，备份在项目 `backups/rc14-*`。
+
+## rc.14 输入异常修复过程（2026-11-25）
 
 追加复制粘贴修复：旧版没有自定义 xterm 键盘处理，默认 Ctrl+C/V 发送控制字符；
 新增官方文本剪贴板接入和按钮。单元回归覆盖快捷键、中断语义、空选区、重复按键、
