@@ -29,6 +29,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(projects::ProjectStore::default())
         .manage(sessions::SessionManager::default())
         .manage(task_commands::TaskLedgerState::default())
