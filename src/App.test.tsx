@@ -47,6 +47,9 @@ describe("AgentTerm application shell", () => {
     expect(html).toContain("Agent 会话工作区");
     expect(html).toContain("从一个项目开始");
     expect(html).toContain("任务记录");
+    expect(html).toContain('class="ghost-button workspace-icon-action"');
+    expect(html).toContain('aria-label="定时任务"');
+    expect(html).toContain('title="查看或管理 Agent 创建的定时任务"');
     expect(html).toContain("工具状态");
     expect(html).toContain("重新检测 CLI 工具");
     expect(html).not.toContain("启用任务记录");

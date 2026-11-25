@@ -444,16 +444,44 @@ export default function App() {
             {updateMessage ? <span role="status">{updateMessage}</span> : null}
             <button
               type="button"
-              className="ghost-button"
+              className="ghost-button workspace-icon-action"
               aria-expanded={scheduleOpen}
               aria-controls="scheduled-tasks"
+              aria-label={scheduleOpen ? "收起定时任务" : "定时任务"}
+              title={
+                scheduleOpen
+                  ? "收起定时任务面板"
+                  : "查看或管理 Agent 创建的定时任务"
+              }
               onClick={() => {
                 setScheduleOpen((open) => !open);
                 setRecordsOpen(false);
                 setFilesOpen(false);
               }}
             >
-              {scheduleOpen ? "收起定时任务" : "定时任务"}
+              <svg
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                aria-hidden="true"
+              >
+                <circle
+                  cx="12"
+                  cy="12"
+                  r="8.25"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                />
+                <path
+                  d="M12 7.5v5l3.25 2"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
             </button>
             <button
               type="button"

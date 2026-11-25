@@ -1362,6 +1362,18 @@ h2 {
   padding: 4px 8px;
   font-size: 11px;
 }
+.workspace-topbar-actions .workspace-icon-action {
+  display: grid;
+  width: 30px;
+  min-width: 30px;
+  place-items: center;
+  padding: 4px;
+}
+.workspace-topbar-actions .workspace-icon-action[aria-expanded="true"] {
+  border-color: #4d765f;
+  background: rgb(34 197 94 / 14%);
+  color: #7ddf9b;
+}
 .workspace-panes {
   display: grid;
   flex: 1;
