@@ -712,9 +712,8 @@ fn validate_transition(before: &Snapshot, after: &Snapshot) -> Result<(), Ledger
             before.generation == after.generation
                 && old.task_id == new.task_id
                 && old.project_id == new.project_id
-                && ((new.phase == Phase::RecoveredReserved && old.owner_id != new.owner_id)
-                    || (old.phase == Phase::RecoveryRequired
-                        && new.phase == Phase::RecoveredReserved)
+                && (((old.phase == Phase::RecoveryRequired || old.owner_id != new.owner_id)
+                    && new.phase == Phase::RecoveredReserved)
                     || (old.owner_id == new.owner_id
                         && old.phase != Phase::RecoveryRequired
                         && !new.phase.is_reserved()))
