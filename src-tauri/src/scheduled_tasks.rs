@@ -12,9 +12,6 @@ use crate::projects::normalize_project_dir;
 use crate::task_process::{self, ProcessError};
 use crate::tools::{candidate_search_dirs, resolve_binary};
 
-/// Optional id handed back to the UI (kept as an alias for readability).
-type Optional<T> = Option<T>;
-
 const STORE_BYTES: u64 = 1024 * 1024;
 const TASK_LIMIT: usize = 50;
 const RUN_LIMIT: usize = 10;
@@ -203,6 +200,12 @@ impl Scheduler {
                 .find(|task| task.id == id)
                 .cloned()
                 .ok_or_else(|| "定时任务不存在".to_string())?;
+            // "Agent 创建的任务必须由用户确认" is a product invariant, so the
+            // backend enforces it too: a disabled-by-default draft can never be
+            // run through IPC just because a caller skipped the panel button.
+            if task.approval_pending {
+                return Err("任务尚未确认启用，请先在面板中确认".into());
+            }
             inner.running = true;
             inner.running_task = task.id.clone();
             inner.cancel = Arc::new(AtomicBool::new(false));
@@ -316,7 +319,7 @@ impl Scheduler {
     }
 
     /// Id of the task currently executing, or `None` when idle.
-    pub fn running_task(&self) -> Result<Optional<String>, String> {
+    pub fn running_task(&self) -> Result<core::option::Option<String>, String> {
         let mut inner = self.lock()?;
         load_if_configured(&mut inner)?;
         if inner.running && !inner.running_task.is_empty() {
@@ -1221,6 +1224,22 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_task_cannot_be_run_through_ipc() {
+        let mut task = super::normalize_draft(draft("有效指令"), None).unwrap();
+        task.id = "task-pending-run".into();
+        task.enabled = false;
+        task.approval_pending = true;
+        let scheduler = Scheduler::default();
+        scheduler.lock().unwrap().tasks.push(task);
+
+        let error = scheduler.run_now("task-pending-run").unwrap_err();
+        assert!(error.contains("尚未确认启用"), "{error}");
+        // The refusal must not leave the scheduler stuck as running.
+        assert!(!scheduler.lock().unwrap().running);
+        assert!(scheduler.running_task().unwrap().is_none());
+    }
+
+    #[test]
     fn tick_runs_one_due_task_and_advances_its_next_schedule() {
         let path = std::env::temp_dir().join(format!(
             "agentterm-schedule-tick-{}-{}.json",
@@ -1531,7 +1550,7 @@ pub fn run_scheduled_task_now(
 #[tauri::command(async)]
 pub fn scheduled_task_running(
     state: tauri::State<'_, Scheduler>,
-) -> Result<Optional<String>, String> {
+) -> Result<core::option::Option<String>, String> {
     state.running_task()
 }
 
