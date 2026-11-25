@@ -1,11 +1,39 @@
 # Testing policy
 
-## v0.2.0-rc.9 旧任务存储兼容（2026-11-25）
+## v0.2.0-rc.9 旧任务存储兼容与覆盖安装（2026-11-25）
 
 - rc.8 实机打开定时任务面板时发现旧记录“存储校验失败”。原因是新增
   `approvalPending` 字段在反序列化后以默认值参与历史记录哈希，改变旧数据校验输入。
-- 修复为在值为 `false` 时跳过该字段序列化，并新增 rc.7 无字段记录的可读性回归。
-- rc.9 需要重新执行三端质量门、Windows 打包、覆盖安装与定时任务面板实机验收。
+- 第一轮修复为值为 `false` 时跳过该字段序列化，并新增 rc.7 无字段记录回归；代码审查
+  发现该写法会让 rc.8 自己写出的记录（始终带 `approvalPending:false`）校验失败，
+  哈希比对实测 `e11fa2e3…`（rc.8 写入）与 `ea2fdd1b…`（rc.9 重算）不一致。
+- 最终修复在读取时同时接受当前规范哈希与 rc.8 历史哈希，写入仍保持规范格式；PR #83，
+  新增 rc.8 记录读取、更新后重新加载的两段回归。本机 `cargo test --lib scheduled_tasks`
+  15 passed / 0 failed，`cargo fmt -- --check` 通过。
+- 质量门：PR #83 run `45562842621` 三端 pass；合并 `main@11e74b5`。Windows 打包
+  run `45563408130` 成功，TUI 沿用 run `45561377466`（该 crate 未改动）。
+- 发布 [v0.2.0-rc.9](https://github.com/SophiaData/AgentTerm/releases/tag/v0.2.0-rc.9)
+  Pre-release，标签指向 `11e74b5`。资产摘要：
+  `AgentTerm-0.2.0-rc.9-windows-x64-setup.exe` 2,826,878 bytes /
+  `d92b2365e8cb6f1f603709561416a80280183963464701c20dfa96afd8851370`；
+  `agentterm-0.2.0-rc.9-windows-x64.exe` 12,744,192 bytes /
+  `e1808f4c3a5f670159b4876a4633bc52df64d653e5fea95b8b10943a3313b278`；
+  `…-tui.exe` 481,792 bytes / `23e55a9f…`；`.tgz` 4,076,598 bytes / `5fb687d8…`。
+  GitHub 回读 digest 与本地一致。
+- 覆盖安装：安装器 `/S /UPDATE /D=E:\AgentTerm\app-11e74b5` 退出 0，注册版本
+  `0.2.0-rc.9`，安装后 EXE 12,744,192 bytes / `9547223f…`；与 npm 包内 `vendor`
+  副本仅 3 字节差异（偏移 9,638,136 起）。`/UPDATE` 不重写快捷方式，桌面与开始菜单
+  已手动指向新目录。
+- 实机验证（证据 `E:\AgentTerm\runtime\rc9-acceptance`）：
+  - 真实旧存储 `%LOCALAPPDATA%\agentterm-scheduled-tasks.json`（8,877 bytes、4 个修订）
+    正常读取，面板无错误，文件哈希 `692c596f…` 保持不变；该存储最终修订已删除任务，
+    所以面板为空是真实状态。
+  - rc.7 及更早格式夹具（无 `approvalPending`）显示任务卡与“1 小时 · Claude Code”。
+  - rc.8 格式夹具（含 `approvalPending:false`）同样显示任务卡与“停用”状态。
+  - 单实例：第二个进程退出 0，常驻进程仍为 1 个。
+  - 检查更新：顶栏显示“当前已是 0.2.0-rc.9”。
+- 边界：未验证到点后的真实 AI 执行；macOS 真机、签名和公证仍未验。测试夹具与原始
+  存储备份在 `backups/rc9-legacy-store-2026-11-25`，验收结束后已还原真实存储。
 
 ## issues #71–#80 与 v0.2.0-rc.8（2026-11-25）
 
