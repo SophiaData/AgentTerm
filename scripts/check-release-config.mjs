@@ -2,6 +2,30 @@ import { readFileSync } from "node:fs";
 
 const read = (path) => readFileSync(path, "utf8");
 const packageVersion = JSON.parse(read("package.json")).version;
+const dependencies = JSON.parse(read("package.json")).dependencies;
+const rustPackages = new Map(
+  Array.from(
+    read("src-tauri/Cargo.lock").matchAll(
+      /\[\[package\]\]\r?\nname = "([^"]+)"\r?\nversion = "([^"]+)"/g,
+    ),
+    (match) => [match[1], match[2]],
+  ),
+);
+for (const [name, version] of Object.entries(dependencies)) {
+  if (!name.startsWith("@tauri-apps/plugin-")) continue;
+  const crate = name.replace("@tauri-apps/", "tauri-");
+  const rustVersion = rustPackages.get(crate);
+  if (
+    !rustVersion ||
+    version.split(".").slice(0, 2).join(".") !==
+      rustVersion.split(".").slice(0, 2).join(".")
+  ) {
+    console.error(
+      `Tauri plugin version drift: ${name} ${version}, ${crate} ${rustVersion}`,
+    );
+    process.exit(1);
+  }
+}
 const versions = [
   packageVersion,
   JSON.parse(read("src-tauri/tauri.conf.json")).version,
