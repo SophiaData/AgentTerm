@@ -76,6 +76,7 @@ pub struct SessionSnapshot {
     /// compared directly against it.
     pub offset: u64,
     pub running: bool,
+    pub input_blocked: bool,
 }
 
 /// What the reader thread holds: the replayable scrollback plus a monotonic
@@ -104,10 +105,45 @@ const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes allowed in flight for one session before new input is refused. This is
 /// backlog, not a per-paste limit: a large paste is chunked by the frontend.
 const WRITE_BACKLOG_LIMIT: usize = 1024 * 1024;
+const WRITE_CHUNK_BYTES: usize = 4096;
+const INPUT_BLOCKED: &str = "输入送达状态未确认，该会话已暂停输入。重连仅恢复显示，请检查输出并结束该会话后重新打开；请勿直接重试原输入。";
+
+struct WriteReservation {
+    bytes: usize,
+    queued: Arc<AtomicUsize>,
+}
+
+impl WriteReservation {
+    fn acquire(queued: &Arc<AtomicUsize>, bytes: usize) -> Result<Self, String> {
+        let mut current = queued.load(Ordering::SeqCst);
+        loop {
+            let next = current
+                .checked_add(bytes)
+                .filter(|next| *next <= WRITE_BACKLOG_LIMIT)
+                .ok_or_else(|| "终端输入积压过多，请等待当前输入写入后再试".to_string())?;
+            match queued.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        Ok(Self {
+            bytes,
+            queued: Arc::clone(queued),
+        })
+    }
+}
+
+impl Drop for WriteReservation {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
 
 struct WriteRequest {
     data: Vec<u8>,
     reply: mpsc::Sender<Result<(), String>>,
+    deadline: std::time::Instant,
+    _reservation: WriteReservation,
 }
 
 /// Owns the PTY write end on a dedicated thread so a blocked write (CLI not
@@ -124,31 +160,29 @@ impl SessionWriter {
         let (sender, receiver) = mpsc::channel::<WriteRequest>();
         let queued = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
-        let counter = Arc::clone(&queued);
         let dead = Arc::clone(&closed);
         std::thread::spawn(move || {
             while let Ok(request) = receiver.recv() {
-                let outcome = writer
-                    .write_all(&request.data)
-                    .and_then(|()| writer.flush())
-                    .map_err(|error| format!("无法写入终端：{error}"));
-                counter.fetch_sub(request.data.len(), Ordering::SeqCst);
+                let outcome = Self::write_request(&mut *writer, &request, &dead);
                 let failed = outcome.is_err();
-                let _ = request.reply.send(outcome);
                 if failed {
-                    // Fail the queued work immediately instead of leaving those
-                    // callers to sit out the full timeout.
                     dead.store(true, Ordering::SeqCst);
-                    while let Ok(pending) = receiver.try_recv() {
-                        counter.fetch_sub(pending.data.len(), Ordering::SeqCst);
-                        let _ = pending
-                            .reply
-                            .send(Err("终端写入失败，会话可能已结束".into()));
-                    }
+                }
+                let WriteRequest {
+                    reply,
+                    _reservation: reservation,
+                    data,
+                    ..
+                } = request;
+                drop(data);
+                drop(reservation);
+                let _ = reply.send(outcome);
+                if failed {
                     break;
                 }
             }
             dead.store(true, Ordering::SeqCst);
+            drop(receiver);
         });
         Self {
             sender,
@@ -157,37 +191,87 @@ impl SessionWriter {
         }
     }
 
+    fn write_request(
+        writer: &mut dyn std::io::Write,
+        request: &WriteRequest,
+        closed: &AtomicBool,
+    ) -> Result<(), String> {
+        let check = || {
+            if closed.load(Ordering::SeqCst) || std::time::Instant::now() >= request.deadline {
+                Err(INPUT_BLOCKED.to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let mut offset = 0;
+        while offset < request.data.len() {
+            check()?;
+            let end = (offset + WRITE_CHUNK_BYTES).min(request.data.len());
+            match writer.write(&request.data[offset..end]) {
+                Ok(0) => return Err(format!("终端写入未完成。{INPUT_BLOCKED}")),
+                Ok(written) => offset += written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(format!("无法写入终端：{error}。{INPUT_BLOCKED}")),
+            }
+        }
+        check()?;
+        writer
+            .flush()
+            .map_err(|error| format!("无法写入终端：{error}。{INPUT_BLOCKED}"))?;
+        check()
+    }
+
+    fn block(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
     fn send(&self, data: &[u8]) -> Result<(), String> {
+        self.send_with_timeout(data, WRITE_TIMEOUT)
+    }
+
+    fn send_with_timeout(&self, data: &[u8], timeout: std::time::Duration) -> Result<(), String> {
         if data.is_empty() {
             return Ok(());
         }
         if self.closed.load(Ordering::SeqCst) {
-            return Err("会话已结束".into());
+            return Err(INPUT_BLOCKED.into());
         }
-        if self
-            .queued
-            .load(Ordering::SeqCst)
-            .saturating_add(data.len())
-            > WRITE_BACKLOG_LIMIT
-        {
-            return Err("终端输入积压过多，请等待当前输入写入后再试".into());
-        }
+        let reservation = WriteReservation::acquire(&self.queued, data.len())?;
         let (reply, answer) = mpsc::channel();
-        self.queued.fetch_add(data.len(), Ordering::SeqCst);
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(INPUT_BLOCKED.into());
+        }
+        let deadline = std::time::Instant::now() + timeout;
         if self
             .sender
             .send(WriteRequest {
                 data: data.to_vec(),
                 reply,
+                deadline,
+                _reservation: reservation,
             })
             .is_err()
         {
-            self.queued.fetch_sub(data.len(), Ordering::SeqCst);
-            return Err("会话已结束".into());
+            self.block();
+            return Err(INPUT_BLOCKED.into());
         }
-        match answer.recv_timeout(WRITE_TIMEOUT) {
-            Ok(result) => result,
-            Err(_) => Err("终端写入超时，请稍后重试或结束该会话".into()),
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(INPUT_BLOCKED.into());
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                self.block();
+                return Err(format!("终端写入超时。{INPUT_BLOCKED}"));
+            }
+            match answer.recv_timeout(remaining.min(std::time::Duration::from_millis(50))) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.block();
+                    return Err(INPUT_BLOCKED.into());
+                }
+            }
         }
     }
 }
@@ -1043,6 +1127,7 @@ impl SessionManager {
                     data,
                     offset,
                     running: true,
+                    input_blocked: session.writer.closed.load(Ordering::SeqCst),
                 });
             }
         }
@@ -1056,6 +1141,7 @@ impl SessionManager {
                 data: data.clone(),
                 offset: *offset,
                 running: false,
+                input_blocked: true,
             }),
             None => Err("会话不存在或已结束".to_string()),
         }
@@ -1096,6 +1182,15 @@ impl SessionManager {
                 .clone()
         };
         writer.send(data.as_bytes())
+    }
+
+    pub fn block_input(&self, session_id: &str) -> Result<(), String> {
+        let sessions = self.lock()?;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| "会话不存在或已结束".to_string())?;
+        session.writer.block();
+        Ok(())
     }
 
     pub fn resize(&self, session_id: &str, rows: u16, cols: u16) -> Result<(), String> {
@@ -1177,6 +1272,7 @@ impl SessionManager {
             if let Some(job) = session.job.as_ref() {
                 job.terminate();
             }
+            session.writer.block();
         }
 
         // Kill succeeded (or the process was already gone): now release it.
@@ -1304,6 +1400,14 @@ pub async fn write_session_input(
     tauri::async_runtime::spawn_blocking(move || manager.write(&session_id, &data))
         .await
         .map_err(|error| format!("终端输入线程异常：{error}"))?
+}
+
+#[tauri::command(async)]
+pub fn block_session_input(
+    state: tauri::State<'_, SessionManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state.block_input(&session_id)
 }
 
 #[tauri::command(async)]
@@ -1598,6 +1702,203 @@ mod tests {
 
         release.store(true, Ordering::SeqCst);
         write.join().unwrap().ok();
+    }
+
+    struct RecordedGatedWriter {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        observed: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        dropped: std::sync::mpsc::Sender<()>,
+    }
+
+    impl std::io::Write for RecordedGatedWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.entered.send(()).unwrap();
+            self.release
+                .recv_timeout(Duration::from_secs(3))
+                .map_err(|_| std::io::Error::other("fixture was not released"))?;
+            self.observed.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for RecordedGatedWriter {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(());
+        }
+    }
+
+    #[test]
+    fn timeout_blocks_reconnect_and_cancels_queued_and_remaining_input() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Instant;
+
+        let manager = SessionManager::default();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let (entered, entry) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let (dropped, exited) = mpsc::channel();
+        insert_fake_session_with_writer(
+            &manager,
+            "timeout",
+            false,
+            Box::new(RecordedGatedWriter {
+                entered,
+                release: gate,
+                observed: Arc::clone(&observed),
+                dropped,
+            }),
+        );
+        let writer = manager.sessions.lock().unwrap()["timeout"].writer.clone();
+        let first_writer = writer.clone();
+        let first = std::thread::spawn(move || {
+            first_writer.send_with_timeout(
+                &vec![b'a'; super::WRITE_CHUNK_BYTES * 2],
+                Duration::from_millis(250),
+            )
+        });
+        entry.recv_timeout(Duration::from_secs(1)).unwrap();
+        let queued_writer = writer.clone();
+        let queued = std::thread::spawn(move || queued_writer.send(b"queued"));
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while writer.queued.load(Ordering::SeqCst) < super::WRITE_CHUNK_BYTES * 2 + 6
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(first.join().unwrap().is_err());
+        assert!(queued.join().unwrap().is_err());
+        assert!(manager.snapshot("timeout").unwrap().input_blocked);
+        assert!(manager.snapshot("timeout").unwrap().running);
+        assert!(manager.write("timeout", "must not write").is_err());
+        assert!(observed.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        exited.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![b'a'; super::WRITE_CHUNK_BYTES]
+        );
+        assert_eq!(writer.queued.load(Ordering::SeqCst), 0);
+        manager.stop("timeout").unwrap();
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_the_input_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, mpsc};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(17));
+        let release = Arc::new(Barrier::new(17));
+        let (results, replies) = mpsc::channel();
+        let mut callers = Vec::new();
+        for _caller in 0..16 {
+            let counter = Arc::clone(&counter);
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let results = results.clone();
+            callers.push(std::thread::spawn(move || {
+                start.wait();
+                let reservation = super::WriteReservation::acquire(&counter, 768 * 1024);
+                results.send(reservation.is_ok()).unwrap();
+                release.wait();
+                drop(reservation);
+            }));
+        }
+        start.wait();
+        let accepted = (0..16)
+            .filter(|_| replies.recv_timeout(Duration::from_secs(2)).unwrap())
+            .count();
+        let peak = counter.load(Ordering::SeqCst);
+        release.wait();
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert_eq!(accepted, 1);
+        assert_eq!(peak, 768 * 1024);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn closed_receiver_releases_the_reserved_input_budget() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let writer = super::SessionWriter {
+            sender,
+            queued: Arc::new(AtomicUsize::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(writer.send(b"undelivered").is_err());
+        assert!(writer.closed.load(Ordering::SeqCst));
+        assert_eq!(writer.queued.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture invoked by native input tests"]
+    fn non_reading_input_fixture() {
+        std::thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn native_pipe_timeout_blocks_new_input_and_releases_after_child_exit() {
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "sessions::tests::non_reading_input_fixture",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn().unwrap();
+        let writer = super::SessionWriter::spawn(Box::new(child.stdin.take().unwrap()));
+        let result = writer.send_with_timeout(
+            &vec![b'x'; super::WRITE_BACKLOG_LIMIT],
+            Duration::from_millis(200),
+        );
+        let subsequent = writer.send(b"must not be queued");
+        let _ = child.kill();
+        child.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while writer.queued.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(result.is_err());
+        assert!(subsequent.is_err());
+        assert!(writer.closed.load(Ordering::SeqCst));
+        assert_eq!(writer.queued.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn blocking_partial_input_preserves_output_but_refuses_further_writes() {
+        let manager = SessionManager::default();
+        insert_fake_session(&manager, "partial", false);
+        manager.write("partial", "prefix").unwrap();
+        manager.block_input("partial").unwrap();
+        let snapshot = manager.snapshot("partial").unwrap();
+        assert!(snapshot.running);
+        assert!(snapshot.input_blocked);
+        assert!(manager.write("partial", "\r").is_err());
+        assert!(manager.list_live().is_ok());
+        manager.stop_all().unwrap();
     }
 
     #[test]

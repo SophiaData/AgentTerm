@@ -46,6 +46,7 @@ pub fn run() {
             sessions::list_sessions,
             sessions::session_snapshot,
             sessions::write_session_input,
+            sessions::block_session_input,
             sessions::resize_session,
             sessions::stop_session,
             sessions::forget_session,

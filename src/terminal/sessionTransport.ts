@@ -1,7 +1,12 @@
 import { advance } from "./offsetStitch";
 
 type Chunk = { data: string; endOffset: number };
-type Snapshot = { data: string; offset: number; running: boolean };
+type Snapshot = {
+  data: string;
+  offset: number;
+  running: boolean;
+  inputBlocked?: boolean;
+};
 type Exit = { id: string; reason: string };
 export type ConnectionPhase = "connecting" | "ready" | "exited" | "error";
 
@@ -68,8 +73,9 @@ export function connectSession(
   let pendingBytes = 0;
   let inputBytes = 0;
   let writing = false;
+  let inputBlocked = false;
   const pending: Chunk[] = [];
-  const input: { data: string; bytes: number }[] = [];
+  const input: { data: string; bytes: number; batch: { sent: boolean } }[] = [];
   const subscriptions: (() => void)[] = [];
 
   const dispose = () => {
@@ -84,6 +90,13 @@ export function connectSession(
   const fail = (message: string) => {
     if (!active) return;
     dispose();
+    callbacks.phase("error", message);
+  };
+  const blockInput = (message: string) => {
+    if (!active || ended) return;
+    inputBlocked = true;
+    input.length = 0;
+    inputBytes = 0;
     callbacks.phase("error", message);
   };
   const reportExit = (exit: Exit) => {
@@ -156,6 +169,10 @@ export function connectSession(
       pendingBytes = 0;
       if (pendingExit || !snapshot.running) {
         reportExit(pendingExit ?? { id, reason: "进程已结束" });
+      } else if (snapshot.inputBlocked) {
+        blockInput(
+          "该会话输入已暂停，重连仅恢复显示。请检查输出并结束当前会话后重新打开；请勿直接重试原输入。",
+        );
       } else {
         callbacks.phase("ready", null);
       }
@@ -169,20 +186,22 @@ export function connectSession(
   const drain = async () => {
     if (writing) return;
     writing = true;
+    let batch: { sent: boolean } | undefined;
     try {
-      while (active && !ended && input.length) {
+      while (active && !ended && !inputBlocked && input.length) {
         const next = input.shift()!;
+        batch = next.batch;
         await bridge.invoke("write_session_input", {
           sessionId: id,
           data: next.data,
         });
+        batch.sent = true;
         inputBytes = Math.max(0, inputBytes - next.bytes);
       }
     } catch (error) {
+      if (!active || ended) return;
       const message = errorText(error);
-      if (message.includes("积压")) {
-        // The backend refused before writing anything, so nothing was
-        // delivered in part: drop the queue, keep the connection usable.
+      if (message.startsWith("终端输入积压过多") && !batch?.sent) {
         input.length = 0;
         inputBytes = 0;
         callbacks.problem(
@@ -190,15 +209,22 @@ export function connectSession(
         );
         return;
       }
-      fail(
-        "输入未确认送达，已暂停后续输入。请重新连接后检查终端；刚才的内容不会自动重发。",
+      blockInput(
+        "输入可能仅送达一部分，已暂停该会话输入。重连只恢复显示，请检查输出并结束会话后重新打开；内容不会自动重发。",
       );
+      try {
+        await bridge.invoke("block_session_input", { sessionId: id });
+      } catch {
+        blockInput(
+          "无法确认输入通道已暂停，请结束当前会话；不要继续输入或重试原内容。",
+        );
+      }
     } finally {
       writing = false;
     }
   };
   const send = (data: string) => {
-    if (!active || !initialized || ended || !data) return;
+    if (!active || !initialized || ended || inputBlocked || !data) return;
     const bytes = encoder.encode(data).byteLength;
     if (inputBytes + bytes > MAX_PENDING_INPUT) {
       // Refuse only this input. Earlier input is unaffected and the session
@@ -209,10 +235,11 @@ export function connectSession(
       );
       return;
     }
+    const batch = { sent: false };
     for (const piece of splitInput(data, INPUT_CHUNK_BYTES)) {
       const pieceBytes = encoder.encode(piece).byteLength;
       inputBytes += pieceBytes;
-      input.push({ data: piece, bytes: pieceBytes });
+      input.push({ data: piece, bytes: pieceBytes, batch });
     }
     void drain();
   };
