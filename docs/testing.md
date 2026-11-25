@@ -15,6 +15,22 @@
 边界：真机未构造"CLI 卡死不读 stdin"的现场，阻塞路径由 `GatedWriter` 模拟覆盖；
 大段粘贴的行为由传输层单测覆盖，未在 GUI 中真实粘贴验证。
 
+### rc.13 发布与实机复核
+
+- PR #89 CI run `45588093298` 三端 pass；合并 `main@3bd6552`；打包 run `45588853733`
+  四项成功。
+- 发布 [v0.2.0-rc.13](https://github.com/SophiaData/AgentTerm/releases/tag/v0.2.0-rc.13)
+  Pre-release（未签名）。资产：setup 2,834,020 bytes / `87c842f9…`、desktop
+  12,774,912 bytes / `e6bd462e…`、tui 481,792 bytes / `473ea887…`、tgz 4,089,049 bytes /
+  `c93384db…`；GitHub 回读摘要一致。
+- 覆盖安装 `/S /UPDATE /D=E:\AgentTerm\app-3bd6552` 退出 0，注册与文件版本均为
+  0.2.0-rc.13，安装后 EXE `18af6d30…`；检查更新显示“当前已是 0.2.0-rc.13”
+  （证据 `E:\AgentTerm\runtime\rc13-acceptance`）。
+- 两处真机缺口（已在 issue 关闭说明中标注）：未构造卡死不读 stdin 的 CLI，未在 GUI 中
+  真实粘贴大段文本；对应行为由 `a_blocked_write_never_holds_the_session_table` 与
+  三条传输层回归覆盖。
+- #87、#88 已关闭并附修复说明；open issue 归零。
+
 ## v0.2.0-rc.12 复查补漏（2026-11-25）
 
 用户追问"自查的问题用不用修"后重新核对，refine 结论：
