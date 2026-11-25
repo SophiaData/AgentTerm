@@ -53,6 +53,7 @@ export function createSessionStore(invoke: Invoke) {
   let sequence = 0;
   let operation = false;
   let reconciling = false;
+  let mutationEpoch = 0;
   const renameEpochs = new Map<string, number>();
   const autoNaming = new Set<string>();
   const listeners = new Set<() => void>();
@@ -120,6 +121,7 @@ export function createSessionStore(invoke: Invoke) {
   const start = async (project: Project, tool: ToolStatus) => {
     if (operation) return;
     operation = true;
+    mutationEpoch += 1;
     update({ starting: true, startError: null });
     const id = newSessionId();
     try {
@@ -196,8 +198,13 @@ export function createSessionStore(invoke: Invoke) {
   const reconcile = async (): Promise<boolean> => {
     if (operation || reconciling) return false;
     reconciling = true;
+    const startedAtEpoch = mutationEpoch;
     try {
       const live = await invoke<SessionInfo[]>("list_sessions", {});
+      // A start or close that completed while this read was in flight is newer
+      // than the backend snapshot. Discard the stale reconciliation instead of
+      // resurrecting a closed tab or marking a newly started PTY as ended.
+      if (mutationEpoch !== startedAtEpoch) return false;
       const liveById = new Map(live.map((info) => [info.id, info]));
       const known = new Set(state.sessions.map((session) => session.info.id));
       const sessions = state.sessions.map((session) => {
@@ -338,6 +345,7 @@ export function createSessionStore(invoke: Invoke) {
     const previous = state.sessions.find((s) => s.info.id === id);
     if (!previous || operation) return;
     operation = true;
+    mutationEpoch += 1;
     update({
       closingId: id,
       sessions: state.sessions.map((s) =>

@@ -173,6 +173,7 @@ impl Ledger {
         // The stable guard exists before the data file. Readers cannot enter
         // the create_new -> header-write window, even on first initialization.
         let _guard = self.operation_guard(true)?;
+        journal::recover_interrupted(&self.path)?;
         match OpenOptions::new()
             .read(true)
             .write(true)
@@ -477,6 +478,7 @@ impl Ledger {
         &self,
         operation: impl FnOnce(&mut File) -> Result<T, LedgerError>,
     ) -> Result<T, LedgerError> {
+        journal::recover_interrupted(&self.path)?;
         validate_file_path(&self.path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         lock(&file)?;
@@ -1471,5 +1473,34 @@ mod tests {
                 .filter_map(Result::ok)
                 .any(|entry| entry.file_name().to_string_lossy().contains(".archive-"))
         );
+    }
+
+    #[test]
+    fn interrupted_compaction_never_reopens_the_ledger_as_empty() {
+        let path = fresh_path();
+        let ledger = Ledger::at(&path).unwrap();
+        ledger.initialize().unwrap();
+        let claimed = ledger.claim("task-1", "project", "owner").unwrap();
+        let candidate = crate::journal::companion(&path, ".compact-test.tmp");
+        let archive = crate::journal::companion(&path, ".archive-test");
+        let marker = crate::journal::companion(&path, ".compacting");
+        fs::copy(&path, &candidate).unwrap();
+        fs::copy(&path, &archive).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &marker,
+            format!(
+                "{}\n{}\n",
+                candidate.file_name().unwrap().to_string_lossy(),
+                archive.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let recovered = Ledger::at(&path).unwrap().initialize().unwrap();
+
+        assert_eq!(recovered, claimed);
+        assert_eq!(recovered.active.unwrap().task_id, "task-1");
+        assert!(!marker.exists());
     }
 }

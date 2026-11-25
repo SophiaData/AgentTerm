@@ -31,5 +31,12 @@ export function sessionTitle(session: SessionInfo): string {
 }
 
 export function newSessionId(): string {
-  return `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const crypto = globalThis.crypto;
+  if (typeof crypto?.randomUUID === "function") {
+    return `session-${crypto.randomUUID()}`;
+  }
+  if (!crypto) throw new Error("安全随机数不可用");
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return `session-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }

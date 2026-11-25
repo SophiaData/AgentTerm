@@ -11,10 +11,12 @@ function Directory({
   path,
   state,
   store,
+  searchActive,
 }: {
   path: string;
   state: FileBrowserState;
   store: FileBrowserStore;
+  searchActive: boolean;
 }) {
   const directory = state.directories[path];
   if (!directory) return <p className="file-message">正在读取目录…</p>;
@@ -76,14 +78,21 @@ function Directory({
             {entry.kind === "directory" &&
             state.expanded.includes(entry.path) ? (
               <div className="file-subdirectory">
-                <Directory path={entry.path} state={state} store={store} />
+                <Directory
+                  path={entry.path}
+                  state={state}
+                  store={store}
+                  searchActive={searchActive}
+                />
               </div>
             ) : null}
           </li>
         ))}
       </ul>
       {!directory.loading && !directory.error && !directory.entries.length ? (
-        <p className="file-message">空目录</p>
+        <p className="file-message">
+          {searchActive ? "已加载范围无匹配" : "空目录"}
+        </p>
       ) : null}
       {directory.truncated ? (
         <p className="file-message">
@@ -106,6 +115,22 @@ export function ProjectFilesView({
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const matchingPaths = new Set(
+    Object.values(state.directories)
+      .flatMap((directory) => directory.entries)
+      .filter((entry) =>
+        entry.name.toLocaleLowerCase().includes(normalizedQuery),
+      )
+      .map((entry) => entry.path),
+  );
+  const visiblePaths = new Set(matchingPaths);
+  for (const path of matchingPaths) {
+    const parts = path.split("/");
+    for (let index = 1; index < parts.length; index += 1) {
+      visiblePaths.add(parts.slice(0, index).join("/"));
+    }
+  }
   const filtered = {
     ...state,
     directories: Object.fromEntries(
@@ -113,9 +138,12 @@ export function ProjectFilesView({
         path,
         {
           ...directory,
-          entries: directory.entries.filter((entry) =>
-            entry.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
-          ),
+          entries:
+            normalizedQuery.length === 0
+              ? directory.entries
+              : directory.entries.filter((entry) =>
+                  visiblePaths.has(entry.path),
+                ),
         },
       ]),
     ),
@@ -170,8 +198,18 @@ export function ProjectFilesView({
         </p>
       ) : null}
       <nav className="file-tree" aria-label="项目目录">
-        <Directory path="" state={filtered} store={store} />
+        <Directory
+          path=""
+          state={filtered}
+          store={store}
+          searchActive={normalizedQuery.length > 0}
+        />
       </nav>
+      {normalizedQuery ? (
+        <p className="file-message" role="status">
+          搜索仅覆盖已加载目录；展开更多目录可获得更多匹配。
+        </p>
+      ) : null}
       <section className="file-preview" aria-label="文件预览">
         {state.selectedPath === null ? (
           <p className="file-preview-empty">点击文件查看内容</p>

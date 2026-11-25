@@ -21,6 +21,13 @@ pub const PRODUCT_NAME: &str = "AgentTerm";
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(projects::ProjectStore::default())
         .manage(sessions::SessionManager::default())
@@ -61,8 +68,6 @@ pub fn run() {
             task_commands::request_stop_controlled_task,
             task_commands::preview_task_artifact,
             scheduled_tasks::list_scheduled_tasks,
-            scheduled_tasks::save_scheduled_task,
-            scheduled_tasks::update_scheduled_task,
             scheduled_tasks::set_scheduled_task_enabled,
             scheduled_tasks::remove_scheduled_task,
             scheduled_tasks::run_scheduled_task_now,
@@ -119,13 +124,20 @@ pub fn run() {
         .expect("AgentTerm should build")
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                match app.state::<sessions::SessionManager>().stop_all() {
-                    Ok(()) => app.state::<schedule_mcp::ScheduleMcp>().cleanup(),
-                    Err(error) => {
-                        api.prevent_exit();
-                        tray::report_shutdown_error(app, &error);
-                    }
+                if let Err(error) = app.state::<sessions::SessionManager>().stop_all() {
+                    api.prevent_exit();
+                    tray::report_shutdown_error(app, &error);
+                    return;
                 }
+                if let Err(error) = app
+                    .state::<task_commands::TaskLedgerState>()
+                    .stop_controlled_dispatches(std::time::Duration::from_secs(5))
+                {
+                    api.prevent_exit();
+                    tray::report_shutdown_error(app, &error);
+                    return;
+                }
+                app.state::<schedule_mcp::ScheduleMcp>().cleanup();
             }
         });
 }

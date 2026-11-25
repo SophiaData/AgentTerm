@@ -28,6 +28,14 @@ impl Default for DispatchRuntime {
     }
 }
 
+impl DispatchRuntime {
+    fn lock_active(&self) -> std::sync::MutexGuard<'_, Option<ActiveDispatch>> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 struct DispatchLease {
     active: Arc<Mutex<Option<ActiveDispatch>>>,
     token: u128,
@@ -37,19 +45,41 @@ struct DispatchLease {
 
 impl Drop for DispatchLease {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.active.lock()
-            && active.as_ref().is_some_and(|item| {
-                item.token == self.token
-                    && item.task_id == self.task_id
-                    && item.generation == self.generation
-            })
-        {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.as_ref().is_some_and(|item| {
+            item.token == self.token
+                && item.task_id == self.task_id
+                && item.generation == self.generation
+        }) {
             *active = None;
         }
     }
 }
 
 impl TaskLedgerState {
+    pub(crate) fn stop_controlled_dispatches(&self, timeout: Duration) -> Result<(), String> {
+        let control = self
+            .runtime
+            .lock_active()
+            .as_ref()
+            .map(|dispatch| dispatch.control.clone());
+        let Some(control) = control else {
+            return Ok(());
+        };
+        control.request_stop();
+        let started = std::time::Instant::now();
+        while started.elapsed() < timeout {
+            if self.runtime.lock_active().is_none() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Err("无法确认受控派发进程树已经停止，应用继续保持运行".into())
+    }
+
     pub(crate) fn prepare_controlled_dispatch(
         &self,
         sessions: &crate::sessions::SessionManager,
@@ -58,13 +88,7 @@ impl TaskLedgerState {
         revision: u64,
         session_id: &str,
     ) -> Result<(Ticket, RelayPlan, DocumentStore), String> {
-        if self
-            .runtime
-            .active
-            .lock()
-            .map_err(|_| "受控派发状态不可用".to_string())?
-            .is_some()
-        {
+        if self.runtime.lock_active().is_some() {
             return Err("已有受控派发正在运行，请先核对当前状态".into());
         }
         let (snapshot, store) = self.current_store(task_id, generation, revision, true)?;
@@ -107,11 +131,7 @@ impl TaskLedgerState {
             .unwrap_or_default()
             .as_nanos();
         {
-            let mut active = self
-                .runtime
-                .active
-                .lock()
-                .map_err(|_| "受控派发状态不可用".to_string())?;
+            let mut active = self.runtime.lock_active();
             if active.is_some() {
                 return Err("已有受控派发正在运行，请先核对当前状态".into());
             }
@@ -139,13 +159,12 @@ impl TaskLedgerState {
                 );
             })
             .map_err(|_| {
-                if let Ok(mut active) = self.runtime.active.lock()
-                    && active.as_ref().is_some_and(|dispatch| {
-                        dispatch.token == token
-                            && dispatch.task_id == task_id
-                            && dispatch.generation == generation
-                    })
-                {
+                let mut active = self.runtime.lock_active();
+                if active.as_ref().is_some_and(|dispatch| {
+                    dispatch.token == token
+                        && dispatch.task_id == task_id
+                        && dispatch.generation == generation
+                }) {
                     *active = None;
                 }
                 "无法启动受控派发线程，任务继续占用".to_string()
@@ -160,11 +179,7 @@ impl TaskLedgerState {
         revision: u64,
     ) -> Result<WorkbenchView, String> {
         let control = {
-            let active = self
-                .runtime
-                .active
-                .lock()
-                .map_err(|_| "受控派发状态不可用".to_string())?;
+            let active = self.runtime.lock_active();
             let dispatch = active
                 .as_ref()
                 .ok_or_else(|| "当前没有可停止的受控派发".to_string())?;
@@ -227,6 +242,25 @@ impl TaskLedgerState {
             }
         }
         self.workbench()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DispatchRuntime;
+
+    #[test]
+    fn dispatch_lock_recovers_after_poison() {
+        let runtime = DispatchRuntime::default();
+        let active = runtime.active.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = active.lock().expect("lock active dispatch");
+            panic!("poison active dispatch lock");
+        })
+        .join();
+
+        assert!(runtime.active.is_poisoned());
+        assert!(runtime.lock_active().is_none());
     }
 }
 

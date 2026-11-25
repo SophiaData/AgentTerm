@@ -52,6 +52,9 @@ describe("AgentTerm application shell", () => {
     expect(html).toContain('title="查看或管理 Agent 创建的定时任务"');
     expect(html).toContain("工具状态");
     expect(html).toContain("重新检测 CLI 工具");
+    expect(html.match(/role="separator"/g)).toHaveLength(1);
+    expect(html).toContain('aria-label="调整项目栏宽度"');
+    expect(html).toContain('tabindex="0"');
     expect(html).not.toContain("启用任务记录");
     expect(html).not.toContain("保存任务计划");
     expect(html).not.toContain("正在读取任务");

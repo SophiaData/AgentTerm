@@ -29,6 +29,11 @@ pub(crate) fn companion(path: &Path, suffix: &str) -> PathBuf {
 }
 
 pub(crate) fn regular_or_missing(path: &Path) -> std::io::Result<bool> {
+    recover_interrupted(path)?;
+    plain_regular_or_missing(path)
+}
+
+fn plain_regular_or_missing(path: &Path) -> std::io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(true),
         Ok(_) => Err(std::io::Error::other(
@@ -106,9 +111,11 @@ pub(crate) fn append(path: &Path, bytes: &[u8], create_new: bool) -> std::io::Re
 /// Atomically install a compacted journal while retaining the previous file as
 /// an archive. The current file stays bounded; prior history is not deleted.
 pub(crate) fn replace_and_archive(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    recover_interrupted(path)?;
     let nonce = unique_nonce();
     let candidate = companion(path, &format!(".compact-{nonce}.tmp"));
     let archive = companion(path, &format!(".archive-{nonce}"));
+    let marker = companion(path, ".compacting");
     let mut candidate_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -117,18 +124,105 @@ pub(crate) fn replace_and_archive(path: &Path, bytes: &[u8]) -> std::io::Result<
     candidate_file.sync_all()?;
     drop(candidate_file);
 
-    let had_existing = regular_or_missing(path)?;
+    let had_existing = plain_regular_or_missing(path)?;
     if had_existing {
+        write_marker(&marker, &candidate, &archive)?;
         fs::rename(path, &archive)?;
+        sync_parent(path)?;
     }
     if let Err(error) = fs::rename(&candidate, path) {
         if had_existing {
             let _ = fs::rename(&archive, path);
+            let _ = fs::remove_file(&marker);
+            let _ = sync_parent(path);
         }
+        let _ = fs::remove_file(&candidate);
         return Err(error);
     }
     sync_parent(path)?;
+    if had_existing {
+        fs::remove_file(&marker)?;
+        sync_parent(path)?;
+    }
     Ok(archive)
+}
+
+fn write_marker(marker: &Path, candidate: &Path, archive: &Path) -> std::io::Result<()> {
+    let candidate = candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("compaction candidate name is invalid"))?;
+    let archive = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("compaction archive name is invalid"))?;
+    let body = format!("{candidate}\n{archive}\n");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)?;
+    file.write_all(body.as_bytes())?;
+    file.sync_all()?;
+    sync_parent(marker)
+}
+
+/// Finish or roll back a compaction whose process died between the two
+/// renames. The marker is written and synced before the original file moves;
+/// recovery therefore never mistakes an interrupted compaction for first use.
+pub(crate) fn recover_interrupted(path: &Path) -> std::io::Result<()> {
+    let marker = companion(path, ".compacting");
+    let metadata = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4096 {
+        return Err(std::io::Error::other(
+            "compaction marker must be a small regular file",
+        ));
+    }
+    let body = fs::read_to_string(&marker)?;
+    let mut lines = body.lines();
+    let candidate_name = lines.next().unwrap_or_default();
+    let archive_name = lines.next().unwrap_or_default();
+    if lines.next().is_some()
+        || !safe_companion_name(path, candidate_name, ".compact-", ".tmp")
+        || !safe_companion_name(path, archive_name, ".archive-", "")
+    {
+        return Err(std::io::Error::other("compaction marker is invalid"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("journal path has no parent"))?;
+    let candidate = parent.join(candidate_name);
+    let archive = parent.join(archive_name);
+    if !plain_regular_or_missing(path)? {
+        if plain_regular_or_missing(&candidate)? {
+            fs::rename(&candidate, path)?;
+        } else if plain_regular_or_missing(&archive)? {
+            fs::rename(&archive, path)?;
+        } else {
+            return Err(std::io::Error::other(
+                "interrupted journal compaction has no recoverable file",
+            ));
+        }
+        sync_parent(path)?;
+    } else if plain_regular_or_missing(&candidate)? {
+        fs::remove_file(&candidate)?;
+    }
+    fs::remove_file(&marker)?;
+    sync_parent(path)
+}
+
+fn safe_companion_name(path: &Path, name: &str, prefix: &str, suffix: &str) -> bool {
+    let original = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    !name.contains('/')
+        && !name.contains('\\')
+        && name.starts_with(&format!("{original}{prefix}"))
+        && name.ends_with(suffix)
 }
 
 pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
@@ -146,4 +240,53 @@ fn unique_nonce() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agentterm-journal-{label}-{}-{}.log",
+            std::process::id(),
+            unique_nonce()
+        ))
+    }
+
+    #[test]
+    fn recovery_installs_a_synced_candidate_after_the_first_rename() {
+        let path = test_path("candidate");
+        let candidate = companion(&path, ".compact-test.tmp");
+        let archive = companion(&path, ".archive-test");
+        let marker = companion(&path, ".compacting");
+        fs::write(&path, b"old").unwrap();
+        fs::write(&candidate, b"new").unwrap();
+        write_marker(&marker, &candidate, &archive).unwrap();
+        fs::rename(&path, &archive).unwrap();
+
+        recover_interrupted(&path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::read(&archive).unwrap(), b"old");
+        assert!(!marker.exists());
+        assert!(!candidate.exists());
+    }
+
+    #[test]
+    fn recovery_rolls_back_to_the_archive_when_the_candidate_is_missing() {
+        let path = test_path("archive");
+        let candidate = companion(&path, ".compact-test.tmp");
+        let archive = companion(&path, ".archive-test");
+        let marker = companion(&path, ".compacting");
+        fs::write(&path, b"durable").unwrap();
+        write_marker(&marker, &candidate, &archive).unwrap();
+        fs::rename(&path, &archive).unwrap();
+
+        recover_interrupted(&path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"durable");
+        assert!(!archive.exists());
+        assert!(!marker.exists());
+    }
 }

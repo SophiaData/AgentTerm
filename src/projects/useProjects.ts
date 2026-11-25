@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Project } from "./types";
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -13,21 +13,25 @@ export function useProjects() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pendingRemovalId, setPendingRemovalId] = useState<string | null>(null);
+  const loadVersion = useRef(0);
 
   const pendingRemoval =
     projects.find((project) => project.id === pendingRemovalId) ?? null;
 
   const load = useCallback(async () => {
+    const version = ++loadVersion.current;
     setLoading(true);
     setError(null);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const existing = await invoke<Project[]>("list_projects");
+      if (version !== loadVersion.current) return;
       setProjects(existing);
     } catch (error) {
+      if (version !== loadVersion.current) return;
       setError(errorMessage(error, "无法读取项目列表"));
     } finally {
-      setLoading(false);
+      if (version === loadVersion.current) setLoading(false);
     }
   }, []);
 
@@ -53,6 +57,8 @@ export function useProjects() {
 
       const { invoke } = await import("@tauri-apps/api/core");
       const project = await invoke<Project>("add_project", { path: selected });
+      loadVersion.current += 1;
+      setLoading(false);
       setProjects((previous) => [...previous, project]);
     } catch (error) {
       setError(errorMessage(error, "无法添加项目"));
@@ -81,6 +87,8 @@ export function useProjects() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       await invoke<Project>("remove_project", { id: pendingRemovalId });
+      loadVersion.current += 1;
+      setLoading(false);
       setProjects((previous) =>
         previous.filter((project) => project.id !== pendingRemovalId),
       );

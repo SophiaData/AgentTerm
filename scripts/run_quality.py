@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -62,6 +63,17 @@ def validate_policy(policy, has_code):
     return commands
 
 
+def platform_argv(argv):
+    if os.name != 'nt':
+        return argv
+    resolved = shutil.which(argv[0])
+    if not resolved:
+        return argv
+    if resolved.lower().endswith(('.cmd', '.bat')):
+        return [os.environ.get('COMSPEC', 'cmd.exe'), '/D', '/C', resolved, *argv[1:]]
+    return [resolved, *argv[1:]]
+
+
 def main():
     policy = json.loads((ROOT / 'project-policy.json').read_text(encoding='utf-8'))
     commands = validate_policy(policy, has_application_code())
@@ -72,7 +84,7 @@ def main():
         argv = check['argv']
         print(f"Running {i}/{len(commands)} [{check['category']}]: {argv[0]}", flush=True)
         try:
-            result = subprocess.run(argv, cwd=ROOT, check=False, timeout=600)
+            result = subprocess.run(platform_argv(argv), cwd=ROOT, check=False, timeout=600)
         except (OSError, subprocess.TimeoutExpired) as exc:
             sys.exit(f'ERROR: check {i} could not complete: {exc}')
         if result.returncode:

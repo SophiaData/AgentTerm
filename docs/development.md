@@ -27,6 +27,31 @@ or parallel test workers.
 
 For a new stack, configure real test/typecheck/lint commands in `project-policy.json` before shipping source.
 
+## Packaging
+
+The package workflow builds the desktop and TUI artifacts independently after a
+quality-gated commit. The Windows desktop job also runs:
+
+```bash
+node scripts/package-npm.mjs src-tauri/target/release/agentterm.exe dist-npm
+```
+
+This stages the real desktop executable under `vendor/` and creates a Windows
+x64 npm tarball. Release publication remains manual. After downloading the
+builder artifacts, assemble normalized names and hashes with:
+
+```bash
+node scripts/package-release.mjs \
+  --installer AgentTerm_0.2.0-rc.8_x64-setup.exe \
+  --desktop agentterm.exe \
+  --tui agentterm-tui.exe \
+  --npm agentterm-0.2.0-rc.8.tgz \
+  --output dist-release
+```
+
+The script writes `SHA256SUMS.txt` and `release-manifest.json`; creating the
+GitHub pre-release remains an explicit authorized action.
+
 ## Project initialization and template upgrades
 
 The template is versioned in `TEMPLATE_VERSION`. Run

@@ -11,8 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = [
     'AGENTS.md', 'CLAUDE.md', 'README.md', 'TEMPLATE_VERSION',
     'docs/architecture.md', 'docs/development.md', 'docs/testing.md',
-    'docs/template-upgrades.md', '.github/pull_request_template.md',
-    '.github/workflows/quality.yml', 'project-policy.json',
+    'docs/tasks.md', 'docs/workflow.md', 'docs/template-upgrades.md',
+    '.github/pull_request_template.md',
+    '.github/workflows/quality.yml', '.github/workflows/packages.yml',
+    'project-policy.json', 'CHANGELOG.md',
+    'tests/test_template_contract.py', 'scripts/run_contract_tests.py',
     '.agents/skills/project-plan/SKILL.md',
     '.agents/skills/project-implement/SKILL.md',
     '.agents/skills/project-review/SKILL.md',
