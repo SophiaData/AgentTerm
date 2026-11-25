@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { scheduleLabel } from "./parseSchedule";
 import type { ScheduledTask } from "./types";
 
@@ -42,10 +42,15 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const loadVersion = useRef(0);
 
   const load = useCallback(async () => {
     const { invoke } = await import("@tauri-apps/api/core");
-    setTasks(await invoke<ScheduledTask[]>("list_scheduled_tasks"));
+    const version = ++loadVersion.current;
+    const next = await invoke<ScheduledTask[]>("list_scheduled_tasks");
+    if (version !== loadVersion.current) return;
+    setTasks(next);
     setError(null);
     setLoading(false);
   }, []);
@@ -90,11 +95,17 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       await invoke(command, args);
-      await load();
       if (command === "run_scheduled_task_now")
         onNotice("定时任务已运行，结果已更新");
     } catch (cause) {
       setError(`定时任务操作失败：${errorText(cause)}`);
+      setBusy(false);
+      return;
+    }
+    try {
+      await load();
+    } catch (cause) {
+      setError(`操作已成功，但无法刷新任务列表：${errorText(cause)}`);
     } finally {
       setBusy(false);
     }
@@ -138,11 +149,17 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
             {tasks.map((task) => (
               <li
                 key={task.id}
-                className={`schedule-card${task.enabled ? " is-enabled" : " is-disabled"}`}
+                className={`schedule-card${task.enabled ? " is-enabled" : " is-disabled"}${task.approvalPending ? " is-pending" : ""}`}
               >
                 <div className="schedule-card-head">
                   <strong>{task.name}</strong>
-                  <span>{task.enabled ? "启用" : "停用"}</span>
+                  <span>
+                    {task.approvalPending
+                      ? "待确认"
+                      : task.enabled
+                        ? "启用"
+                        : "停用"}
+                  </span>
                 </div>
                 <p className="schedule-meta">
                   {scheduleLabel(taskSchedule(task))}
@@ -173,28 +190,58 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
                       })
                     }
                   >
-                    {task.enabled ? "暂停" : "启用"}
+                    {task.approvalPending
+                      ? "确认启用"
+                      : task.enabled
+                        ? "暂停"
+                        : "启用"}
                   </button>
                   <button
                     type="button"
-                    disabled={busy}
+                    disabled={busy || task.approvalPending}
                     onClick={() =>
                       void act("run_scheduled_task_now", { id: task.id })
                     }
                   >
                     立即运行
                   </button>
-                  <button
-                    type="button"
-                    className="is-danger"
-                    disabled={busy}
-                    onClick={() =>
-                      void act("remove_scheduled_task", { id: task.id })
-                    }
-                  >
-                    删除
-                  </button>
+                  {deletingId === task.id ? (
+                    <>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => setDeletingId(null)}
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        className="is-danger"
+                        disabled={busy}
+                        onClick={() => {
+                          setDeletingId(null);
+                          void act("remove_scheduled_task", { id: task.id });
+                        }}
+                      >
+                        确认删除
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className="is-danger"
+                      disabled={busy}
+                      onClick={() => setDeletingId(task.id)}
+                    >
+                      删除
+                    </button>
+                  )}
                 </div>
+                {deletingId === task.id ? (
+                  <p className="schedule-delete-confirm" role="alert">
+                    将永久删除“{task.name}”及其运行历史。
+                  </p>
+                ) : null}
                 {task.runs[0] ? (
                   <details className="schedule-result">
                     <summary>

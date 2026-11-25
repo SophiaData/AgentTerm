@@ -1,6 +1,6 @@
 [package]
 name = "agentterm"
-version = "0.2.0-rc.7"
+version = "0.2.0-rc.8"
 description = "A focused desktop manager for AI command-line tools"
 edition = "2024"
 rust-version = "1.90"
@@ -17,7 +17,9 @@ tauri = { version = "2.12", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.9"
+getrandom = "0.3"
 tauri-plugin-dialog = "2.8.4"
+tauri-plugin-single-instance = "2"
 portable-pty = "0.9.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 semver = "1"
@@ -27,4 +29,5 @@ libc = "0.2"
 
 [dev-dependencies]
 anyhow = "1"
+chrono-tz = "0.10"
 libc = "0.2"

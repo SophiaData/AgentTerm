@@ -244,11 +244,11 @@ export default function TerminalView({
   }, [focusRequest]);
 
   return (
-    <div className="terminal-view">
+    <div className={`terminal-view${compact ? " is-compact" : ""}`}>
       <div className="terminal-toolbar">
         <span role="status">
           {compact
-            ? "简洁模式只保留最近输出"
+            ? "简洁模式已隐藏终端辅助栏"
             : phase === "connecting"
               ? "正在连接终端…"
               : phase === "error"
@@ -263,7 +263,7 @@ export default function TerminalView({
             className="ghost-button"
             onClick={() => setCompact((value) => !value)}
           >
-            {compact ? "完整输出" : "简洁模式"}
+            {compact ? "完整界面" : "简洁模式"}
           </button>
           <button
             type="button"

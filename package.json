@@ -1,23 +1,23 @@
 {
   "name": "agentterm",
   "private": true,
-  "version": "0.2.0-rc.7",
+  "version": "0.2.0-rc.8",
   "type": "module",
   "packageManager": "pnpm@11.24.0",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.22.2"
   },
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "dev:app": "tauri dev",
     "tauri": "tauri",
-    "check": "python3 scripts/verify_project.py && python3 scripts/run_quality.py",
+    "check": "node scripts/check_project.mjs",
     "test": "vitest run --maxWorkers=1 --no-file-parallelism",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --max-warnings=0",
-    "format": "prettier --write README.md CLAUDE.md CHANGELOG.md docs src index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json",
-    "format:check": "prettier --check README.md CLAUDE.md CHANGELOG.md docs src index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json"
+    "format": "prettier --write README.md CLAUDE.md CHANGELOG.md docs src scripts/*.mjs index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json",
+    "format:check": "prettier --check README.md CLAUDE.md CHANGELOG.md docs src scripts/*.mjs index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.5",
@@ -30,10 +30,13 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@tauri-apps/cli": "2.12.5",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.13",
     "@types/node": "26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "eslint": "10.15.0",
+    "jsdom": "^31.0.1",
     "prettier": "3.10.1",
     "typescript": "6.0.3",
     "typescript-eslint": "8.73.0",

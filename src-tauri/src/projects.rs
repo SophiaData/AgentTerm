@@ -297,17 +297,17 @@ pub fn remove_project_from_list(projects: &mut Vec<Project>, id: &str) -> Result
     Ok(projects.remove(index))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_projects(state: tauri::State<'_, ProjectStore>) -> Result<Vec<Project>, String> {
     state.list()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_project(state: tauri::State<'_, ProjectStore>, path: String) -> Result<Project, String> {
     state.add(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_project(
     state: tauri::State<'_, ProjectStore>,
     id: String,

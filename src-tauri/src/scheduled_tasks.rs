@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{Local, NaiveTime, TimeZone};
+use chrono::{DateTime, Local, LocalResult, NaiveTime, TimeZone};
 
 use crate::journal;
 use crate::projects::normalize_project_dir;
@@ -43,6 +43,8 @@ pub struct ScheduledTask {
     pub schedule: Option<ScheduleSpec>,
     pub timeout_minutes: u64,
     pub enabled: bool,
+    #[serde(default)]
+    pub approval_pending: bool,
     pub next_run_at_ms: u64,
     pub runs: Vec<ScheduledRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,6 +72,8 @@ pub struct ScheduledTaskDraft {
     pub schedule: ScheduleSpec,
     pub timeout_minutes: u64,
     pub enabled: bool,
+    #[serde(default)]
+    pub approval_pending: bool,
     #[serde(default)]
     pub source_session_id: Option<String>,
 }
@@ -129,6 +133,7 @@ impl Scheduler {
         Ok(task)
     }
 
+    #[cfg(test)]
     pub fn update(&self, id: &str, draft: ScheduledTaskDraft) -> Result<ScheduledTask, String> {
         let mut inner = self.lock()?;
         load_if_configured(&mut inner)?;
@@ -159,6 +164,7 @@ impl Scheduler {
             .ok_or_else(|| "定时任务不存在".to_string())?;
         task.enabled = enabled;
         if enabled {
+            task.approval_pending = false;
             task.next_run_at_ms = initial_next_run(&effective_schedule(task), now_ms())?;
         }
         let saved = task.clone();
@@ -226,30 +232,40 @@ impl Scheduler {
                 return Ok(());
             }
             let now = now_ms();
-            let task = inner
+            let task_id = inner
                 .tasks
                 .iter()
-                .filter(|task| task.enabled && task.next_run_at_ms <= now)
+                .filter(|task| task.enabled && !task.approval_pending && task.next_run_at_ms <= now)
                 .min_by_key(|task| task.next_run_at_ms)
-                .cloned();
-            if task.is_some() {
-                inner.running = true;
-            }
-            task
+                .map(|task| task.id.clone());
+            let Some(task_id) = task_id else {
+                return Ok(());
+            };
+            let task = inner
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == task_id)
+                .ok_or_else(|| "定时任务不存在".to_string())?;
+            let schedule = effective_schedule(task);
+            // Advance durably before starting a process with external side
+            // effects. If the disk is unavailable, the task is not executed.
+            // A crash after this write can skip one occurrence, but can never
+            // execute the same occurrence every 30 seconds.
+            task.schedule = Some(schedule.clone());
+            task.next_run_at_ms = advance_next_run(&schedule, now)?;
+            let task_to_run = task.clone();
+            persist(&inner)?;
+            inner.running = true;
+            task_to_run
         };
-        let Some(task) = due else {
-            return Ok(());
-        };
+        let task = due;
         let run = execute(&task);
         let mut inner = self.lock()?;
         inner.running = false;
         load_if_configured(&mut inner)?;
         if let Some(current) = inner.tasks.iter_mut().find(|item| item.id == task.id) {
-            let schedule = effective_schedule(current);
             current.runs.insert(0, run);
             current.runs.truncate(RUN_LIMIT);
-            current.schedule = Some(schedule.clone());
-            current.next_run_at_ms = advance_next_run(&schedule, now_ms())?;
             persist(&inner)?;
         }
         Ok(())
@@ -283,6 +299,9 @@ fn normalize_draft(
 ) -> Result<ScheduledTask, String> {
     let name = clean_text(&draft.name, "任务名称", 80)?;
     let prompt = clean_text(&draft.prompt, "任务指令", TEXT_LIMIT)?;
+    if prompt.starts_with('-') {
+        return Err("任务指令不能以命令选项符号 - 开头".into());
+    }
     let model = match draft
         .model
         .as_deref()
@@ -334,6 +353,7 @@ fn normalize_draft(
         schedule: Some(draft.schedule),
         timeout_minutes: draft.timeout_minutes,
         enabled: draft.enabled,
+        approval_pending: draft.approval_pending,
         next_run_at_ms: next,
         runs: existing.map(|task| task.runs.clone()).unwrap_or_default(),
         source_session_id,
@@ -381,21 +401,25 @@ fn advance_next_run(schedule: &ScheduleSpec, now: u64) -> Result<u64, String> {
 }
 
 fn next_daily(now_ms: u64, hour: u8, minute: u8) -> Result<u64, String> {
+    next_daily_in(Local, now_ms, hour, minute)
+}
+
+fn next_daily_in<Tz: TimeZone>(
+    timezone: Tz,
+    now_ms: u64,
+    hour: u8,
+    minute: u8,
+) -> Result<u64, String> {
     let time = NaiveTime::from_hms_opt(u32::from(hour), u32::from(minute), 0)
         .ok_or_else(|| "每天执行时间无效".to_string())?;
-    let now = Local
+    let now = timezone
         .timestamp_millis_opt(now_ms as i64)
-        .single()
+        .earliest()
         .ok_or_else(|| "无法读取本地时间".to_string())?;
     let mut date = now.date_naive();
-    for _ in 0..3 {
-        let candidate = Local
-            .from_local_datetime(&date.and_time(time))
-            .single()
-            .ok_or_else(|| "无法计算下一次执行时间".to_string())?;
-        let candidate_ms = u64::try_from(candidate.timestamp_millis())
-            .map_err(|_| "无法计算下一次执行时间".to_string())?;
-        if candidate_ms > now_ms {
+    for _ in 0..370 {
+        let local = timezone.from_local_datetime(&date.and_time(time));
+        if let Some(candidate_ms) = candidate_after(local, now_ms)? {
             return Ok(candidate_ms);
         }
         date = date
@@ -403,6 +427,22 @@ fn next_daily(now_ms: u64, hour: u8, minute: u8) -> Result<u64, String> {
             .ok_or_else(|| "无法计算下一次执行时间".to_string())?;
     }
     Err("无法计算下一次执行时间".into())
+}
+
+fn candidate_after<Tz: TimeZone>(
+    local: LocalResult<DateTime<Tz>>,
+    now_ms: u64,
+) -> Result<Option<u64>, String> {
+    let candidates = match local {
+        LocalResult::Single(candidate) => vec![candidate],
+        LocalResult::Ambiguous(first, second) => vec![first, second],
+        LocalResult::None => return Ok(None),
+    };
+    Ok(candidates
+        .into_iter()
+        .filter_map(|candidate| u64::try_from(candidate.timestamp_millis()).ok())
+        .filter(|candidate| *candidate > now_ms)
+        .min())
 }
 
 fn clean_text(value: &str, label: &str, limit: usize) -> Result<String, String> {
@@ -757,6 +797,21 @@ mod tests {
         assert!(next > super::now_ms());
     }
 
+    #[test]
+    fn daily_schedule_skips_a_nonexistent_dst_clock_time() {
+        use chrono::TimeZone;
+        let timezone = chrono_tz::America::New_York;
+        let now = timezone
+            .with_ymd_and_hms(2025, 3, 8, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis() as u64;
+        let next = super::next_daily_in(timezone, now, 2, 30).unwrap();
+        let next = timezone.timestamp_millis_opt(next as i64).single().unwrap();
+        assert_eq!(next.date_naive().to_string(), "2025-03-10");
+        assert_eq!(next.format("%H:%M").to_string(), "02:30");
+    }
+
     fn draft(prompt: &str) -> ScheduledTaskDraft {
         ScheduledTaskDraft {
             name: "每日检查".into(),
@@ -767,6 +822,7 @@ mod tests {
             schedule: ScheduleSpec::Interval { minutes: 60 },
             timeout_minutes: 20,
             enabled: true,
+            approval_pending: false,
             source_session_id: None,
         }
     }
@@ -845,10 +901,12 @@ mod tests {
         task.next_run_at_ms = 1;
         super::write_store(&path, std::slice::from_ref(&task)).unwrap();
         let scheduler = Scheduler::default();
-        scheduler.configure(path).unwrap();
+        scheduler.configure(path.clone()).unwrap();
         let mut calls = 0;
         scheduler
             .tick_with(|selected| {
+                let persisted = super::read_store(&path).unwrap();
+                assert!(persisted[0].next_run_at_ms > super::now_ms());
                 calls += 1;
                 assert_eq!(selected.id, "task-due");
                 super::ScheduledRun {
@@ -867,6 +925,31 @@ mod tests {
         assert_eq!(calls, 1);
         assert_eq!(saved.runs.len(), 1);
         assert!(saved.next_run_at_ms > super::now_ms());
+    }
+
+    #[test]
+    fn agent_created_task_waits_for_explicit_enable() {
+        let mut task = super::normalize_draft(draft("有效指令"), None).unwrap();
+        task.id = "task-pending".into();
+        task.enabled = false;
+        task.approval_pending = true;
+        task.next_run_at_ms = 1;
+        let scheduler = Scheduler::default();
+        scheduler.lock().unwrap().tasks.push(task.clone());
+        scheduler
+            .tick_with(|_| panic!("pending approval must not execute"))
+            .unwrap();
+        let enabled = scheduler.set_enabled(&task.id, true).unwrap();
+        assert!(enabled.enabled);
+        assert!(!enabled.approval_pending);
+    }
+
+    #[test]
+    fn prompt_cannot_be_parsed_as_a_cli_option() {
+        let error = Scheduler::default()
+            .save(draft("--dangerously-skip-permissions"))
+            .unwrap_err();
+        assert!(error.contains("不能以命令选项符号"), "{error}");
     }
 
     #[test]
@@ -939,31 +1022,14 @@ mod tests {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_scheduled_tasks(
     state: tauri::State<'_, Scheduler>,
 ) -> Result<Vec<ScheduledTask>, String> {
     state.list()
 }
 
-#[tauri::command]
-pub fn save_scheduled_task(
-    state: tauri::State<'_, Scheduler>,
-    draft: ScheduledTaskDraft,
-) -> Result<ScheduledTask, String> {
-    state.save(draft)
-}
-
-#[tauri::command]
-pub fn update_scheduled_task(
-    state: tauri::State<'_, Scheduler>,
-    id: String,
-    draft: ScheduledTaskDraft,
-) -> Result<ScheduledTask, String> {
-    state.update(&id, draft)
-}
-
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_scheduled_task_enabled(
     state: tauri::State<'_, Scheduler>,
     id: String,
@@ -972,7 +1038,7 @@ pub fn set_scheduled_task_enabled(
     state.set_enabled(&id, enabled)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_scheduled_task(state: tauri::State<'_, Scheduler>, id: String) -> Result<(), String> {
     state.remove(&id)
 }

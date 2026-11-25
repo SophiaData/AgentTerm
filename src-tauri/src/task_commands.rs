@@ -545,7 +545,7 @@ fn recovery_observation_name(observation: crate::task_relay::RecoveryObservation
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn recover_main_task_reservation(
     state: tauri::State<'_, TaskLedgerState>,
     projects: tauri::State<'_, ProjectStore>,
@@ -557,7 +557,7 @@ pub fn recover_main_task_reservation(
     state.recover(&projects, &task_id, generation, expected_revision, release)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resume_main_task_after_recovery(
     state: tauri::State<'_, TaskLedgerState>,
     task_id: String,
@@ -567,7 +567,7 @@ pub fn resume_main_task_after_recovery(
     state.resume_after_recovery(&task_id, generation, expected_revision)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn release_completed_task(
     state: tauri::State<'_, TaskLedgerState>,
     task_id: String,
@@ -577,14 +577,14 @@ pub fn release_completed_task(
     state.release_completed(&task_id, generation, expected_revision)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn workbench_snapshot(
     state: tauri::State<'_, TaskLedgerState>,
 ) -> Result<WorkbenchView, String> {
     state.workbench()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_workbench_task(
     state: tauri::State<'_, TaskLedgerState>,
     projects: tauri::State<'_, ProjectStore>,
@@ -593,7 +593,7 @@ pub fn create_workbench_task(
     state.create_task(&projects, input)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn attach_task_plan(
     state: tauri::State<'_, TaskLedgerState>,
     projects: tauri::State<'_, ProjectStore>,
@@ -615,7 +615,7 @@ pub fn attach_task_plan(
     state.workbench()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn reference_task_artifact(
     state: tauri::State<'_, TaskLedgerState>,
     task_id: String,
@@ -629,7 +629,7 @@ pub fn reference_task_artifact(
     state.workbench()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn associate_task_session(
     state: tauri::State<'_, TaskLedgerState>,
     sessions: tauri::State<'_, SessionManager>,
@@ -666,7 +666,7 @@ pub fn associate_task_session(
     state.workbench()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn reassociate_task_session_after_recovery(
     state: tauri::State<'_, TaskLedgerState>,
     sessions: tauri::State<'_, SessionManager>,
@@ -709,7 +709,7 @@ pub fn reassociate_task_session_after_recovery(
     state.workbench()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn dispatch_controlled_task(
     state: tauri::State<'_, TaskLedgerState>,
     sessions: tauri::State<'_, SessionManager>,
@@ -729,7 +729,7 @@ pub fn dispatch_controlled_task(
     state.workbench()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn request_stop_controlled_task(
     state: tauri::State<'_, TaskLedgerState>,
     task_id: String,
@@ -739,7 +739,7 @@ pub fn request_stop_controlled_task(
     state.request_controlled_stop(&task_id, generation, expected_revision)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn preview_task_artifact(
     state: tauri::State<'_, TaskLedgerState>,
     task_id: String,
@@ -751,7 +751,7 @@ pub fn preview_task_artifact(
     store.preview(&artifact_id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn task_ledger_initialize(
     state: tauri::State<'_, TaskLedgerState>,
 ) -> Result<TaskLedgerView, String> {
@@ -762,7 +762,7 @@ pub fn task_ledger_initialize(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn task_ledger_snapshot(
     state: tauri::State<'_, TaskLedgerState>,
 ) -> Result<TaskLedgerView, String> {
@@ -773,7 +773,7 @@ pub fn task_ledger_snapshot(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn claim_main_task(
     state: tauri::State<'_, TaskLedgerState>,
     projects: tauri::State<'_, ProjectStore>,
@@ -783,7 +783,7 @@ pub fn claim_main_task(
     state.claim(&projects, &task_id, &project_id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cancel_main_task_reservation(
     state: tauri::State<'_, TaskLedgerState>,
     task_id: String,

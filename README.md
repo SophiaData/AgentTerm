@@ -46,7 +46,7 @@ AgentTerm 不读取或复制 CLI 账号凭据。Claude Code、Codex、Agy
 
 ## 本地开发
 
-需要 Node.js 22.13+、pnpm、Rust 1.90+、Python 3，以及对应平台的 Tauri
+需要 Node.js 22.22.2+、pnpm、Rust 1.90+、Python 3，以及对应平台的 Tauri
 系统依赖。
 
 ```bash
@@ -60,8 +60,9 @@ pnpm dev:app
 pnpm check
 ```
 
-完整测试和 Windows/macOS 打包优先由 GitHub Actions 串行执行。项目结构、存储
-边界和原生验收记录分别见 [架构说明](docs/architecture.md)、
+完整测试优先由 GitHub Actions 在 Linux、macOS 和 Windows 上执行；桌面与 TUI
+打包使用独立 job，可在质量门通过后并行运行。项目结构、存储边界和原生验收
+记录分别见 [架构说明](docs/architecture.md)、
 [测试记录](docs/testing.md) 和 [任务日志](docs/task-log/2026-11.md)。
 
 ## 许可证

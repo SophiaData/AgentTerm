@@ -149,8 +149,8 @@ pub(crate) fn run_scheduler_process(
     let stdout = child.stdout.take().ok_or(ProcessError::OutputRead)?;
     let stderr = child.stderr.take().ok_or(ProcessError::OutputRead)?;
     let per_stream_limit = (output_limit / 2).max(1);
-    let stdout_thread = std::thread::spawn(move || read_tail(stdout, per_stream_limit));
-    let stderr_thread = std::thread::spawn(move || read_tail(stderr, per_stream_limit));
+    let stdout = spawn_read_tail(stdout, per_stream_limit);
+    let stderr = spawn_read_tail(stderr, per_stream_limit);
 
     let started = Instant::now();
     let status = loop {
@@ -162,8 +162,6 @@ pub(crate) fn run_scheduler_process(
             }
             Ok(None) if started.elapsed() >= timeout => {
                 let stopped = scope.stop(&mut child);
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
                 return Err(if stopped {
                     ProcessError::Timeout
                 } else {
@@ -180,11 +178,12 @@ pub(crate) fn run_scheduler_process(
     }
     let had_descendants = scope.has_processes();
     let stopped = scope.stop(&mut child);
-    let stdout = stdout_thread.join().map_err(|_| ProcessError::OutputRead)?;
-    let stderr = stderr_thread.join().map_err(|_| ProcessError::OutputRead)?;
     if !stopped {
         return Err(ProcessError::StopUnconfirmed);
     }
+    let read_deadline = Instant::now() + Duration::from_secs(3);
+    let stdout = receive_tail(&stdout, read_deadline).ok_or(ProcessError::StopUnconfirmed)?;
+    let stderr = receive_tail(&stderr, read_deadline).ok_or(ProcessError::StopUnconfirmed)?;
     let mut output = stdout.map_err(|_| ProcessError::OutputRead)?;
     let stderr = stderr.map_err(|_| ProcessError::OutputRead)?;
     if !stderr.is_empty() {
@@ -200,6 +199,27 @@ pub(crate) fn run_scheduler_process(
         exit_code: status.code().unwrap_or(-1),
         output,
     })
+}
+
+fn spawn_read_tail(
+    reader: impl Read + Send + 'static,
+    limit: usize,
+) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(read_tail(reader, limit));
+    });
+    receiver
+}
+
+fn receive_tail(
+    receiver: &std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> Option<std::io::Result<Vec<u8>>> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or_default();
+    receiver.recv_timeout(remaining).ok()
 }
 
 fn read_tail(mut reader: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
@@ -853,6 +873,15 @@ mod windows_scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_receiver_honors_its_deadline_when_reader_is_stuck() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let result = receive_tail(&receiver, Instant::now() + Duration::from_millis(30));
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
     fn spec(mode: &str) -> ProcessSpec {
         ProcessSpec {
             binary: std::env::current_exe().unwrap(),

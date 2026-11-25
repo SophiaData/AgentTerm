@@ -7,16 +7,20 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 const REQUEST_LIMIT: usize = 64 * 1024;
 const AI_CONFIG_LIMIT: u64 = 1024 * 1024;
 const TOOL_NAME: &str = "agentterm_scheduler";
 const CHANGED_EVENT: &str = "scheduled-tasks-changed";
+const SCHEDULE_TOKEN_ENV: &str = "AGENTTERM_SCHEDULE_TOKEN";
+const MAX_CONNECTIONS: usize = 32;
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+const REPLAY_WINDOW: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug)]
 struct AgentContext {
@@ -29,6 +33,7 @@ struct AgentContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionBridge {
     endpoint: String,
+    token: String,
 }
 
 impl SessionBridge {
@@ -38,6 +43,9 @@ impl SessionBridge {
                 TOOL_NAME: {
                     "type": "http",
                     "url": self.endpoint,
+                    "headers": {
+                        "Authorization": format!("Bearer ${{{SCHEDULE_TOKEN_ENV}}}")
+                    }
                 }
             }
         });
@@ -49,6 +57,10 @@ impl SessionBridge {
                 Ok(vec![
                     "-c".into(),
                     format!("mcp_servers.{TOOL_NAME}.url={url}"),
+                    "-c".into(),
+                    format!(
+                        "mcp_servers.{TOOL_NAME}.bearer_token_env_var=\"{SCHEDULE_TOKEN_ENV}\""
+                    ),
                 ])
             }
             "agy" => Ok(Vec::new()),
@@ -59,6 +71,10 @@ impl SessionBridge {
     #[cfg(test)]
     fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub fn environment(&self) -> Vec<(String, String)> {
+        vec![(SCHEDULE_TOKEN_ENV.into(), self.token.clone())]
     }
 }
 
@@ -72,10 +88,12 @@ struct McpState {
     scheduler: Option<Scheduler>,
     app: Option<AppHandle>,
     port: u16,
-    server_token: String,
     sequence: u64,
     sessions: HashMap<String, AgentContext>,
     tokens: HashMap<String, String>,
+    active_connections: usize,
+    recent_calls: HashMap<String, Instant>,
+    auth_failures: HashMap<IpAddr, (u8, Instant)>,
 }
 
 impl ScheduleMcp {
@@ -90,7 +108,6 @@ impl ScheduleMcp {
             .local_addr()
             .map_err(|error| format!("无法读取 Agent 定时任务工具地址：{error}"))?
             .port();
-        let server_token = random_token(0, "agentterm-scheduler");
         {
             let mut state = self.lock()?;
             if state.scheduler.is_some() {
@@ -99,7 +116,6 @@ impl ScheduleMcp {
             state.scheduler = Some(scheduler);
             state.app = Some(app);
             state.port = port;
-            state.server_token = server_token;
         }
         let shared = Arc::clone(&self.state);
         std::thread::Builder::new()
@@ -108,7 +124,38 @@ impl ScheduleMcp {
                 for connection in listener.incoming() {
                     match connection {
                         Ok(stream) => {
-                            handle_connection(stream, Arc::clone(&shared));
+                            let admitted = shared
+                                .lock()
+                                .map(|mut state| {
+                                    if state.active_connections >= MAX_CONNECTIONS {
+                                        false
+                                    } else {
+                                        state.active_connections += 1;
+                                        true
+                                    }
+                                })
+                                .unwrap_or(false);
+                            if !admitted {
+                                let mut stream = stream;
+                                let _ = write_response(&mut stream, 429, "Too many connections");
+                                continue;
+                            }
+                            let worker_state = Arc::clone(&shared);
+                            if std::thread::Builder::new()
+                                .name("agentterm-schedule-mcp-connection".into())
+                                .spawn(move || {
+                                    handle_connection(stream, Arc::clone(&worker_state));
+                                    if let Ok(mut state) = worker_state.lock() {
+                                        state.active_connections =
+                                            state.active_connections.saturating_sub(1);
+                                    }
+                                })
+                                .is_err()
+                                && let Ok(mut state) = shared.lock()
+                            {
+                                state.active_connections =
+                                    state.active_connections.saturating_sub(1);
+                            }
                         }
                         Err(error) => {
                             eprintln!("AgentTerm schedule MCP accept failed: {error}");
@@ -140,11 +187,8 @@ impl ScheduleMcp {
             return Err("Agy 定时任务工具一次只能绑定一个运行中的会话".into());
         }
         state.sequence = state.sequence.wrapping_add(1);
-        let token = random_token(state.sequence, session_id);
-        let endpoint = format!(
-            "http://127.0.0.1:{}/mcp/{}/{}",
-            state.port, state.server_token, token
-        );
+        let token = random_token();
+        let endpoint = format!("http://127.0.0.1:{}/mcp", state.port);
         if tool_id == "agy" {
             write_agy_mcp_config(&endpoint)?;
         }
@@ -158,7 +202,7 @@ impl ScheduleMcp {
                 model,
             },
         );
-        Ok(SessionBridge { endpoint })
+        Ok(SessionBridge { endpoint, token })
     }
 
     pub fn revoke_session(&self, session_id: &str) {
@@ -199,6 +243,11 @@ impl ScheduleMcp {
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<McpState>>) {
+    let remote = stream.peer_addr().ok().map(|address| address.ip());
+    if remote.is_some_and(|address| auth_limited(&state, address)) {
+        let _ = write_response(&mut stream, 429, "Too many authentication failures");
+        return;
+    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
     let request = match read_request(&mut stream) {
@@ -216,10 +265,28 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<McpState>>) {
         );
         return;
     }
-    let Some(token) = authenticated_token(&request.path, &state) else {
+    if request.path != "/mcp" {
+        let _ = write_response(&mut stream, 404, "Unknown AgentTerm scheduling endpoint");
+        return;
+    }
+    if !valid_host(request.host.as_deref(), &state)
+        || !valid_origin(request.origin.as_deref(), &state)
+    {
+        let _ = write_response(&mut stream, 403, "Invalid scheduling MCP origin");
+        return;
+    }
+    let Some(token) = authenticated_token(request.authorization.as_deref(), &state) else {
+        if let Some(address) = remote {
+            record_auth_failure(&state, address);
+        }
         let _ = write_response(&mut stream, 404, "Unknown AgentTerm scheduling endpoint");
         return;
     };
+    if let Some(address) = remote
+        && let Ok(mut state) = state.lock()
+    {
+        state.auth_failures.remove(&address);
+    }
     let payload: Value = match serde_json::from_slice(&request.body) {
         Ok(payload) => payload,
         Err(_) => {
@@ -235,6 +302,11 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<McpState>>) {
         let _ = write_response(&mut stream, 202, "");
         return;
     };
+    if is_schedule_write(&payload) && !register_unique_call(&state, &token, &request.body) {
+        let replay = jsonrpc_error(id, -32001, "Duplicate scheduling request");
+        let _ = write_json_response(&mut stream, 409, &replay);
+        return;
+    }
     let response = match process_request(&payload, &token, &state) {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err((code, message)) => jsonrpc_error(id, code, &message),
@@ -242,21 +314,105 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<McpState>>) {
     let _ = write_json_response(&mut stream, 200, &response);
 }
 
-fn authenticated_token(path: &str, state: &Arc<Mutex<McpState>>) -> Option<String> {
-    let mut segments = path.trim_start_matches('/').split('/');
-    if segments.next()? != "mcp" {
-        return None;
-    }
-    let server = segments.next()?;
-    let token = segments.next()?;
-    if segments.next().is_some() {
+fn authenticated_token(
+    authorization: Option<&str>,
+    state: &Arc<Mutex<McpState>>,
+) -> Option<String> {
+    let token = authorization?.strip_prefix("Bearer ")?;
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let state = state.lock().ok()?;
-    if server != state.server_token || !state.tokens.contains_key(token) {
-        return None;
+    state
+        .tokens
+        .keys()
+        .find(|candidate| constant_time_eq(candidate.as_bytes(), token.as_bytes()))
+        .cloned()
+}
+
+fn valid_host(host: Option<&str>, state: &Arc<Mutex<McpState>>) -> bool {
+    let Ok(state) = state.lock() else {
+        return false;
+    };
+    let expected = format!("127.0.0.1:{}", state.port);
+    host.is_some_and(|host| host.eq_ignore_ascii_case(&expected))
+}
+
+fn valid_origin(origin: Option<&str>, state: &Arc<Mutex<McpState>>) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let Ok(state) = state.lock() else {
+        return false;
+    };
+    let expected = format!("http://127.0.0.1:{}", state.port);
+    origin.eq_ignore_ascii_case(&expected)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
     }
-    Some(token.to_string())
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn auth_limited(state: &Arc<Mutex<McpState>>, address: IpAddr) -> bool {
+    let Ok(state) = state.lock() else {
+        return true;
+    };
+    state
+        .auth_failures
+        .get(&address)
+        .is_some_and(|(attempts, since)| {
+            *attempts >= 20 && since.elapsed() < Duration::from_secs(60)
+        })
+}
+
+fn record_auth_failure(state: &Arc<Mutex<McpState>>, address: IpAddr) {
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let entry = state.auth_failures.entry(address).or_insert((0, now));
+    if now.duration_since(entry.1) >= Duration::from_secs(60) {
+        *entry = (1, now);
+    } else {
+        entry.0 = entry.0.saturating_add(1);
+    }
+}
+
+fn is_schedule_write(payload: &Value) -> bool {
+    payload.get("method").and_then(Value::as_str) == Some("tools/call")
+        && payload
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            == Some("schedule_task")
+}
+
+fn register_unique_call(state: &Arc<Mutex<McpState>>, token: &str, body: &[u8]) -> bool {
+    let Ok(mut state) = state.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    state
+        .recent_calls
+        .retain(|_, created| now.duration_since(*created) <= REPLAY_WINDOW);
+    let mut digest = Sha256::new();
+    digest.update(token.as_bytes());
+    digest.update([0]);
+    digest.update(body);
+    let key = format!("{:x}", digest.finalize());
+    if state.recent_calls.contains_key(&key) {
+        return false;
+    }
+    state.recent_calls.insert(key, now);
+    true
 }
 
 fn process_request(
@@ -302,7 +458,7 @@ fn process_request(
                 "name": "agentterm-scheduler",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "AgentTerm 已提供持久定时任务工具。用户要求定时执行时，调用 schedule_task。频率或时间不明确时先向用户确认，不要把“每天”自行改成每小时。prompt 只写到点后要执行的工作，不要重复“每天几点”等排期描述。项目、CLI 和来源会话由当前 AgentTerm 会话自动绑定。"
+            "instructions": "AgentTerm 已提供持久定时任务工具。用户要求定时执行时，调用 schedule_task。频率或时间不明确时先向用户确认，不要把“每天”自行改成每小时。任务创建后保持待确认，必须由用户在 AgentTerm 面板启用。prompt 只写到点后要执行的工作，不要重复“每天几点”等排期描述。项目、CLI 和来源会话由当前 AgentTerm 会话自动绑定。"
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tool_definitions()})),
@@ -384,11 +540,12 @@ fn create_schedule(
         prompt,
         schedule,
         timeout_minutes,
-        enabled: true,
+        enabled: false,
+        approval_pending: true,
         source_session_id: Some(context.session_id.clone()),
     })?;
     let text = format!(
-        "定时任务“{}”已创建。下次运行：{}。AgentTerm 管理面板已同步更新。",
+        "定时任务“{}”已创建，正在等待用户在 AgentTerm 面板确认启用。计划时间：{}。",
         task.name,
         format_time(task.next_run_at_ms)
     );
@@ -471,7 +628,16 @@ fn write_agy_mcp_config_at(path: &Path, endpoint: &str) -> Result<(), String> {
     let servers = servers
         .as_object_mut()
         .ok_or_else(|| "Agy mcpServers 配置不是对象".to_string())?;
-    servers.insert(TOOL_NAME.into(), json!({"type": "http", "url": endpoint}));
+    servers.insert(
+        TOOL_NAME.into(),
+        json!({
+            "type": "http",
+            "url": endpoint,
+            "headers": {
+                "Authorization": format!("Bearer ${{{SCHEDULE_TOKEN_ENV}}}")
+            }
+        }),
+    );
     write_json_atomic(path, &Value::Object(root))
 }
 
@@ -530,6 +696,12 @@ fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
         serde_json::to_vec_pretty(value).map_err(|_| "无法编码 Agy MCP 配置".to_string())?;
     body.push(b'\n');
     std::fs::write(&temporary, body).map_err(|error| format!("无法写入 Agy MCP 配置：{error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("无法保护 Agy MCP 配置：{error}"))?;
+    }
     std::fs::rename(&temporary, path).map_err(|error| format!("无法替换 Agy MCP 配置：{error}"))
 }
 
@@ -537,7 +709,7 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "schedule_task",
-            "description": "When the user asks to run something later or repeatedly in AgentTerm, create a persistent scheduled task. Ask the user for missing frequency or exact daily time before calling. The current project, CLI, and source session are supplied automatically.",
+            "description": "When the user asks to run something later or repeatedly in AgentTerm, create a persistent scheduled task in pending-confirmation state. Ask the user for missing frequency or exact daily time before calling. The current project, CLI, and source session are supplied automatically; the user must confirm it in AgentTerm before it can run.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -588,10 +760,14 @@ fn tool_definitions() -> Vec<Value> {
 struct HttpRequest {
     method: String,
     path: String,
+    host: Option<String>,
+    origin: Option<String>,
+    authorization: Option<String>,
     body: Vec<u8>,
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
+    let deadline = Instant::now() + REQUEST_DEADLINE;
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
     let header_end = loop {
@@ -601,6 +777,11 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
         if bytes.len() >= REQUEST_LIMIT {
             return Err("Request headers too large");
         }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or("Request deadline exceeded")?;
+        let _ = stream.set_read_timeout(Some(remaining.min(Duration::from_secs(3))));
         let read = stream
             .read(&mut chunk)
             .map_err(|_| "Unable to read request")?;
@@ -618,11 +799,21 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
     let target = parts.next().ok_or("Missing request target")?;
     let path = target.split('?').next().unwrap_or(target).to_string();
     let mut content_length = 0usize;
+    let mut host = None;
+    let mut origin = None;
+    let mut authorization = None;
     for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse().map_err(|_| "Invalid Content-Length")?;
+        if let Some((name, value)) = line.split_once(':') {
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.parse().map_err(|_| "Invalid Content-Length")?;
+            } else if name.eq_ignore_ascii_case("host") {
+                host = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("origin") {
+                origin = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("authorization") {
+                authorization = Some(value.to_string());
+            }
         }
     }
     let body_start = header_end + 4;
@@ -630,6 +821,11 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
         return Err("Request body too large");
     }
     while bytes.len() < body_start + content_length {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or("Request deadline exceeded")?;
+        let _ = stream.set_read_timeout(Some(remaining.min(Duration::from_secs(3))));
         let read = stream
             .read(&mut chunk)
             .map_err(|_| "Unable to read request body")?;
@@ -644,6 +840,9 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, &'static str> {
     Ok(HttpRequest {
         method,
         path,
+        host,
+        origin,
+        authorization,
         body: bytes[body_start..body_start + content_length].to_vec(),
     })
 }
@@ -678,6 +877,9 @@ fn write_response_with_type(
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
+        403 => "Forbidden",
+        429 => "Too Many Requests",
         _ => "Error",
     };
     write!(
@@ -697,13 +899,13 @@ fn jsonrpc_error(id: Value, code: i64, message: &str) -> Value {
     })
 }
 
-fn random_token(sequence: u64, subject: &str) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let digest = Sha256::digest(format!("{now}:{}:{sequence}:{subject}", std::process::id()));
-    format!("{digest:x}")[..48].to_string()
+fn random_token() -> String {
+    let mut bytes = [0_u8; 32];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Entropy failure is unrecoverable for an authenticated endpoint.
+        panic!("operating-system randomness is unavailable");
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -720,17 +922,26 @@ mod tests {
     #[test]
     fn session_bridge_uses_http_mcp_for_every_supported_cli() {
         let bridge = SessionBridge {
-            endpoint: "http://127.0.0.1:43210/mcp/server/session".into(),
+            endpoint: "http://127.0.0.1:43210/mcp".into(),
+            token: "ab".repeat(32),
         };
         let claude = bridge.command_args("claude").unwrap();
         assert_eq!(claude[0], "--mcp-config");
         assert!(claude[1].contains("\"type\":\"http\""));
         assert!(claude[1].contains(&bridge.endpoint()));
+        assert!(claude[1].contains("${AGENTTERM_SCHEDULE_TOKEN}"));
+        assert!(!claude[1].contains(&bridge.token));
 
         let codex = bridge.command_args("codex").unwrap();
         assert_eq!(codex[0], "-c");
         assert!(codex[1].contains("mcp_servers.agentterm_scheduler.url="));
         assert!(codex[1].contains(&bridge.endpoint()));
+        assert!(codex[3].contains("bearer_token_env_var"));
+        assert!(!codex.iter().any(|arg| arg.contains(&bridge.token)));
+        assert_eq!(
+            bridge.environment(),
+            vec![("AGENTTERM_SCHEDULE_TOKEN".into(), bridge.token.clone())]
+        );
 
         let agy = bridge.command_args("agy").unwrap();
         assert!(agy.is_empty());
@@ -750,7 +961,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "agentterm-agent-source-{}-{}.json",
             std::process::id(),
-            super::random_token(1, "test")
+            super::random_token()
         ));
         let scheduler = Scheduler::default();
         scheduler.configure(path).unwrap();
@@ -790,7 +1001,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "agentterm-agent-rpc-{}-{}.json",
             std::process::id(),
-            super::random_token(2, "test")
+            super::random_token()
         ));
         let scheduler = Scheduler::default();
         scheduler.configure(path).unwrap();
@@ -804,10 +1015,12 @@ mod tests {
             scheduler: Some(scheduler.handle()),
             app: None,
             port: 0,
-            server_token: "server-token".into(),
             sequence: 1,
             sessions: HashMap::from([(context.session_id.clone(), context)]),
-            tokens: HashMap::from([("session-token".into(), "session-rpc".into())]),
+            tokens: HashMap::from([("ab".repeat(32), "session-rpc".into())]),
+            active_connections: 0,
+            recent_calls: HashMap::new(),
+            auth_failures: HashMap::new(),
         }));
         let response = process_request(
             &json!({
@@ -823,7 +1036,7 @@ mod tests {
                     }
                 }
             }),
-            "session-token",
+            "ab".repeat(32).as_str(),
             &shared,
         )
         .unwrap();
@@ -839,7 +1052,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "agentterm-agy-mcp-{}-{}.json",
             std::process::id(),
-            super::random_token(3, "test")
+            super::random_token()
         ));
         std::fs::write(
             &path,
@@ -854,6 +1067,10 @@ mod tests {
             "http://127.0.0.1:2/mcp/server/session"
         );
         assert_eq!(
+            configured["mcpServers"]["agentterm_scheduler"]["headers"]["Authorization"],
+            "Bearer ${AGENTTERM_SCHEDULE_TOKEN}"
+        );
+        assert_eq!(
             configured["mcpServers"]["existing"]["url"],
             "http://127.0.0.1:1/mcp"
         );
@@ -866,5 +1083,34 @@ mod tests {
             restored["mcpServers"]["existing"]["url"],
             "http://127.0.0.1:1/mcp"
         );
+    }
+
+    #[test]
+    fn random_tokens_are_256_bit_and_do_not_repeat() {
+        let first = super::random_token();
+        let second = super::random_token();
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn bearer_auth_requires_an_exact_session_token_and_limits_failures() {
+        let token = super::random_token();
+        let shared = Arc::new(Mutex::new(McpState {
+            tokens: HashMap::from([(token.clone(), "session-auth".into())]),
+            ..McpState::default()
+        }));
+        assert_eq!(
+            super::authenticated_token(Some(&format!("Bearer {token}")), &shared),
+            Some(token.clone())
+        );
+        assert!(super::authenticated_token(Some("Bearer wrong"), &shared).is_none());
+
+        let address = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        for _ in 0..20 {
+            super::record_auth_failure(&shared, address);
+        }
+        assert!(super::auth_limited(&shared, address));
     }
 }

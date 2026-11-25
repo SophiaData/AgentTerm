@@ -49,6 +49,10 @@ pub fn download_and_launch(url: &str) -> Result<(), String> {
     }
     let releases: Vec<Release> = serde_json::from_slice(&http_get(RELEASE_API)?)
         .map_err(|error| format!("无法重新校验更新信息：{error}"))?;
+    let status = select_update(&releases, CURRENT_VERSION)?;
+    if !status.update_available || status.download_url.as_deref() != Some(url) {
+        return Err("更新地址不是当前允许安装的最新版本".into());
+    }
     let digest = releases
         .iter()
         .flat_map(|release| &release.assets)
@@ -218,7 +222,7 @@ fn valid_digest(value: &str) -> Option<&str> {
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>, String> {
-    let mut command = Command::new("curl");
+    let mut command = Command::new(curl_program()?);
     command.args([
         "--fail",
         "--location",
@@ -227,6 +231,10 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
         "--proto",
         "=https",
         "--tlsv1.2",
+        "--connect-timeout",
+        "15",
+        "--max-time",
+        "300",
         "--max-filesize",
         "209715200",
         url,
@@ -243,6 +251,26 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
         return Err("检查更新失败，请稍后重试".into());
     }
     Ok(output.stdout)
+}
+
+fn curl_program() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let path = PathBuf::from(root).join("System32").join("curl.exe");
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    for path in ["/usr/bin/curl", "/bin/curl"] {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err("找不到可信的系统 curl，已拒绝更新请求".into())
 }
 
 #[tauri::command]

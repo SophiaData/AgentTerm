@@ -989,6 +989,17 @@ h2 {
   flex-direction: column;
   gap: 8px;
 }
+.terminal-view.is-compact .terminal-toolbar > span,
+.terminal-view.is-compact .terminal-actions .ghost-button:not(:first-child) {
+  display: none;
+}
+.terminal-view.is-compact .terminal-toolbar {
+  justify-content: flex-end;
+  min-height: 28px;
+}
+.terminal-view.is-compact .terminal-host {
+  padding: 2px;
+}
 
 .terminal-toolbar,
 .terminal-actions {
@@ -1892,6 +1903,10 @@ h2 {
     transition: transform 160ms ease-out;
     box-shadow: 14px 0 32px #0007;
   }
+  .session-workspace:not(.is-sidebar-open) .workspace-sidebar {
+    visibility: hidden;
+    pointer-events: none;
+  }
   .session-workspace.is-sidebar-open .workspace-sidebar {
     transform: translateX(0);
   }
@@ -2365,6 +2380,10 @@ h2 {
 .schedule-card.is-disabled {
   opacity: 0.65;
 }
+.schedule-card.is-pending {
+  border-color: #8f6d34;
+  background: rgb(143 109 52 / 11%);
+}
 .schedule-card-head {
   display: flex;
   align-items: center;
@@ -2416,6 +2435,45 @@ h2 {
 }
 .schedule-actions button.is-danger {
   color: #ff9a9a;
+}
+.schedule-delete-confirm {
+  margin: 0;
+  color: #ffb0a8;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.renderer-error {
+  display: grid;
+  max-width: 720px;
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 40px 24px;
+  align-content: center;
+  gap: 16px;
+  color: #dbe5ee;
+  background: #0d131b;
+}
+
+.renderer-error h1 {
+  margin: 0;
+  font-size: 28px;
+}
+
+.renderer-error p,
+.renderer-error pre {
+  margin: 0;
+  line-height: 1.7;
+}
+
+.renderer-error pre {
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid #3b2a2d;
+  border-radius: 8px;
+  background: #1b1114;
+  color: #ffb0a8;
+  white-space: pre-wrap;
 }
 .schedule-result summary {
   color: #9fb0bf;

@@ -68,6 +68,12 @@ class ProjectTemplateContract(unittest.TestCase):
         checks = [{'category': 'test', 'argv': ['python', '-m', 'unittest']}]
         self.assertEqual(quality.validate_policy(self.policy(checks), True), checks)
 
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows command shim regression')
+    def test_windows_command_shim_is_wrapped_with_comspec(self):
+        argv = quality.platform_argv(['pnpm', '--version'])
+        self.assertTrue(Path(argv[0]).name.lower().endswith(('cmd.exe', 'powershell.exe')))
+        self.assertIn('/C', argv)
+
     def test_unsafe_release_setting_rejected(self):
         policy = self.policy([])
         policy['release_mode'] = 'automatic'
@@ -101,6 +107,16 @@ class ProjectTemplateContract(unittest.TestCase):
         argv = [sys.executable, 'scripts/verify_project.py']
         proc = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_critical_governance_files_are_explicitly_required(self):
+        for path in (
+            'CHANGELOG.md',
+            'docs/tasks.md',
+            'docs/workflow.md',
+            '.github/workflows/packages.yml',
+            'tests/test_template_contract.py',
+        ):
+            self.assertIn(path, verify.REQUIRED)
 
     @staticmethod
     def policy(checks):

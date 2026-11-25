@@ -143,6 +143,22 @@ describe("independent CLI sessions", () => {
     expect(session.statusUnknown).toBe(false);
   });
 
+  it("discards a reconcile response that started before a new session", async () => {
+    const { store, invoke } = fixture();
+    const delayedList = deferred<unknown>();
+    invoke.mockImplementationOnce(() => delayedList.promise);
+
+    const reconciling = store.reconcile();
+    await store.start(project, tool);
+    delayedList.resolve([]);
+
+    await expect(reconciling).resolves.toBe(false);
+    const state = store.getSnapshot();
+    expect(state.sessions).toHaveLength(1);
+    expect(state.sessions[0].running).toBe(true);
+    expect(state.activeId).toBe(state.sessions[0].info.id);
+  });
+
   it("closing one session leaves the other and ignores late events", async () => {
     const { store, invoke } = fixture();
     await store.start(project, tool);

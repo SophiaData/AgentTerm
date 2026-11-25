@@ -1,4 +1,11 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { PRODUCT_NAME } from "./meta";
 import { loadStoredLayout, saveStoredLayout } from "./layout";
 import TaskWorkbench from "./TaskWorkbench";
@@ -29,6 +36,51 @@ function toolStatusIcon(kind: string): string {
       return "!";
   }
 }
+
+function resizeWithPointer(
+  event: ReactPointerEvent<HTMLDivElement>,
+  start: number,
+  setWidth: (width: number) => void,
+  invert: boolean,
+) {
+  const target = event.currentTarget;
+  const startX = event.clientX;
+  target.setPointerCapture(event.pointerId);
+  const move = (next: PointerEvent) => {
+    if (!target.hasPointerCapture(event.pointerId)) return;
+    const delta = next.clientX - startX;
+    const width = start + (invert ? -delta : delta);
+    setWidth(Math.min(invert ? 720 : 420, Math.max(invert ? 280 : 160, width)));
+  };
+  const stop = () => {
+    target.removeEventListener("pointermove", move);
+    target.removeEventListener("pointerup", stop);
+    target.removeEventListener("pointercancel", stop);
+    target.removeEventListener("lostpointercapture", stop);
+    if (target.hasPointerCapture(event.pointerId)) {
+      target.releasePointerCapture(event.pointerId);
+    }
+  };
+  target.addEventListener("pointermove", move);
+  target.addEventListener("pointerup", stop);
+  target.addEventListener("pointercancel", stop);
+  target.addEventListener("lostpointercapture", stop);
+}
+
+function resizeWithKeyboard(
+  event: ReactKeyboardEvent<HTMLDivElement>,
+  current: number,
+  setWidth: (width: number) => void,
+  invert: boolean,
+) {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  event.preventDefault();
+  const direction = event.key === "ArrowRight" ? 1 : -1;
+  const delta = direction * (invert ? -16 : 16);
+  setWidth(
+    Math.min(invert ? 720 : 420, Math.max(invert ? 280 : 160, current + delta)),
+  );
+}
 import { emptyPlan } from "./workbenchState";
 
 export default function App() {
@@ -44,6 +96,7 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth] = useState(204);
   const [sideWidth, setSideWidth] = useState(390);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [narrowLayout, setNarrowLayout] = useState(false);
   const [closeConfirmation, setCloseConfirmation] =
     useState<ActiveSession | null>(null);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
@@ -68,6 +121,7 @@ export default function App() {
   const hasSidePanel =
     recordsOpen || scheduleOpen || (filesOpen && !!fileProject);
   const historyReloaded = useRef(false);
+  const closeTriggerFocus = useRef<HTMLElement | null>(null);
   const reloadHistory = history.reload;
   useEffect(() => {
     const layout = loadStoredLayout();
@@ -77,6 +131,35 @@ export default function App() {
     setFilesOpen(layout.filesOpen);
     if (layout.projectId) setProjectId(layout.projectId);
   }, []);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 900px)");
+    const update = () => {
+      setNarrowLayout(media.matches);
+      if (!media.matches) setSidebarOpen(false);
+    };
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  useEffect(() => {
+    if (!closeConfirmation) return;
+    const previous = closeTriggerFocus.current;
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setCloseConfirmation(null);
+    };
+    window.addEventListener("keydown", escape);
+    return () => {
+      window.removeEventListener("keydown", escape);
+      previous?.focus();
+    };
+  }, [closeConfirmation]);
+  useEffect(() => {
+    if (!closeConfirmation) return;
+    const current = launcher.sessions.find(
+      (session) => session.info.id === closeConfirmation.info.id,
+    );
+    if (!current?.running) setCloseConfirmation(null);
+  }, [closeConfirmation, launcher.sessions]);
   useEffect(() => {
     saveStoredLayout({ sidebarWidth, sideWidth, filesOpen, projectId });
   }, [sidebarWidth, sideWidth, filesOpen, projectId]);
@@ -103,6 +186,7 @@ export default function App() {
     setSidebarOpen(false);
   };
   const requestClose = (session: ActiveSession) => {
+    closeTriggerFocus.current = document.activeElement as HTMLElement | null;
     if (session.running) setCloseConfirmation(session);
     else void launcher.close(session.info.id);
   };
@@ -151,7 +235,12 @@ export default function App() {
           onClick={() => setSidebarOpen(false)}
         />
       ) : null}
-      <aside className="workspace-sidebar" aria-label="项目与会话">
+      <aside
+        className="workspace-sidebar"
+        aria-label="项目与会话"
+        aria-hidden={narrowLayout && !sidebarOpen ? true : undefined}
+        inert={narrowLayout && !sidebarOpen ? true : undefined}
+      >
         <div className="workspace-brand">
           <span className="workspace-brand-icon" aria-hidden="true">
             &gt;_
@@ -335,20 +424,16 @@ export default function App() {
         role="separator"
         aria-orientation="vertical"
         aria-label="调整项目栏宽度"
-        onPointerDown={(event) => {
-          const startX = event.clientX;
-          const start = sidebarWidth;
-          const move = (next: PointerEvent) =>
-            setSidebarWidth(
-              Math.min(420, Math.max(160, start + next.clientX - startX)),
-            );
-          const stop = () => {
-            window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", stop);
-          };
-          window.addEventListener("pointermove", move);
-          window.addEventListener("pointerup", stop);
-        }}
+        aria-valuemin={160}
+        aria-valuemax={420}
+        aria-valuenow={sidebarWidth}
+        tabIndex={0}
+        onPointerDown={(event) =>
+          resizeWithPointer(event, sidebarWidth, setSidebarWidth, false)
+        }
+        onKeyDown={(event) =>
+          resizeWithKeyboard(event, sidebarWidth, setSidebarWidth, false)
+        }
       />
 
       <section className="workspace-main" aria-label="Agent 会话工作区">
@@ -578,7 +663,8 @@ export default function App() {
         {closeConfirmation ? (
           <div
             className="workspace-close-confirmation"
-            role="group"
+            role="alertdialog"
+            aria-modal="true"
             aria-label="确认结束运行中的会话"
           >
             <span>
@@ -844,20 +930,16 @@ export default function App() {
           role="separator"
           aria-orientation="vertical"
           aria-label="调整右侧面板宽度"
-          onPointerDown={(event) => {
-            const startX = event.clientX;
-            const start = sideWidth;
-            const move = (next: PointerEvent) =>
-              setSideWidth(
-                Math.min(720, Math.max(280, start - (next.clientX - startX))),
-              );
-            const stop = () => {
-              window.removeEventListener("pointermove", move);
-              window.removeEventListener("pointerup", stop);
-            };
-            window.addEventListener("pointermove", move);
-            window.addEventListener("pointerup", stop);
-          }}
+          aria-valuemin={280}
+          aria-valuemax={720}
+          aria-valuenow={sideWidth}
+          tabIndex={0}
+          onPointerDown={(event) =>
+            resizeWithPointer(event, sideWidth, setSideWidth, true)
+          }
+          onKeyDown={(event) =>
+            resizeWithKeyboard(event, sideWidth, setSideWidth, true)
+          }
         />
       ) : null}
       {filesOpen && fileProject ? (

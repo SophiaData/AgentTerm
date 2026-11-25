@@ -6,6 +6,7 @@ import {
   type FormEvent,
 } from "react";
 import type { Project } from "./projects/types";
+import { displayPath } from "./projects/displayPath";
 import type { SessionInfo } from "./terminal/types";
 import {
   acceptSnapshot,
@@ -141,7 +142,7 @@ export function TaskCard({
         </span>
       </div>
       <div className="task-meta">
-        <span>{projectName ?? active.projectId}</span>
+        <span>{projectName ?? displayPath(active.projectId)}</span>
         {document && <span>负责人 · {document.plan.owner}</span>}
       </div>
       {document ? (
@@ -350,7 +351,7 @@ export function TaskCard({
               <summary>项目路径与任务详情</summary>
               <dl className="task-facts">
                 <dt>项目路径</dt>
-                <dd className="task-path">{active.projectId}</dd>
+                <dd className="task-path">{displayPath(active.projectId)}</dd>
                 <dt>交付目录</dt>
                 <dd className="task-path">{document.plan.outputDir}</dd>
                 <dt>任务编号</dt>
@@ -854,14 +855,7 @@ export default function TaskWorkbench({
   useEffect(() => {
     if (!pollingTask) return;
     statusPoll.current = setInterval(() => void pollStatus(), 350);
-    const deadline = setTimeout(() => {
-      stopStatusPolling();
-      setReadError("受控执行状态刷新已超时，请重新核对；任务占用仍保留。");
-    }, 650_000);
-    return () => {
-      clearTimeout(deadline);
-      stopStatusPolling();
-    };
+    return stopStatusPolling;
   }, [pollingTask, pollStatus, stopStatusPolling]);
   useEffect(() => {
     mounted.current = true;
@@ -1069,7 +1063,7 @@ export default function TaskWorkbench({
       )}
       {view && (
         <TaskCard
-          key={`${active?.taskId ?? "idle"}:${view.ledger.revision}`}
+          key={active?.taskId ?? "idle"}
           view={view}
           busy={blocked}
           preview={preview}

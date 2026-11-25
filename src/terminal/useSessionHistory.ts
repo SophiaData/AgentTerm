@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { SessionHistoryRecord } from "./types";
 
 type Invoke = <T>(command: string, args: Record<string, unknown>) => Promise<T>;
@@ -24,16 +24,20 @@ export function useSessionHistory(
   const [records, setRecords] = useState<SessionHistoryRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const loadVersion = useRef(0);
   const reload = useCallback(async () => {
+    const version = ++loadVersion.current;
     setLoading(true);
     setError(null);
     try {
-      setRecords(await invoke<SessionHistoryRecord[]>("session_history", {}));
+      const next = await invoke<SessionHistoryRecord[]>("session_history", {});
+      if (version === loadVersion.current) setRecords(next);
     } catch (cause) {
+      if (version !== loadVersion.current) return;
       const detail = cause instanceof Error ? cause.message : String(cause);
       setError(`无法读取最近会话：${detail}`);
     } finally {
-      setLoading(false);
+      if (version === loadVersion.current) setLoading(false);
     }
   }, [invoke]);
   useEffect(() => {

@@ -21,6 +21,7 @@ export type ScheduledTask = {
   schedule?: ScheduleSpec | null;
   timeoutMinutes: number;
   enabled: boolean;
+  approvalPending?: boolean;
   nextRunAtMs: number;
   runs: ScheduledRun[];
   sourceSessionId?: string | null;

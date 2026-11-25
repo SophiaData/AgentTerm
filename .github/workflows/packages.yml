@@ -28,24 +28,30 @@ jobs:
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        # pnpm/action-setup v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           version: 11.24.0
           run_install: false
 
-      - uses: actions/setup-node@v4
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22.13'
           cache: pnpm
 
-      - uses: dtolnay/rust-toolchain@stable
+      # dtolnay/rust-toolchain stable branch commit; toolchain is fixed separately
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
         with:
+          toolchain: 1.90.0
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: src-tauri -> target
 
@@ -53,10 +59,25 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build desktop package
-        uses: tauri-apps/tauri-action@v1
+        # tauri-apps/tauri-action v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         with:
           args: ${{ matrix.platform == 'macos-latest' && '--target aarch64-apple-darwin --bundles dmg' || '--bundles nsis' }}
           uploadWorkflowArtifacts: true
+
+      - name: Package Windows desktop npm artifact
+        if: runner.os == 'Windows'
+        run: node scripts/package-npm.mjs src-tauri/target/release/agentterm.exe dist-npm
+
+      - name: Upload npm desktop package
+        if: runner.os == 'Windows'
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agentterm-npm-windows-x64
+          path: dist-npm/*.tgz
+          if-no-files-found: error
+          retention-days: 7
 
   tui:
     if: ${{ inputs.include_tui }}
@@ -67,11 +88,16 @@ jobs:
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - uses: dtolnay/rust-toolchain@stable
+      # dtolnay/rust-toolchain stable branch commit; toolchain is fixed separately
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: 1.90.0
 
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: agentterm-tui -> target
 
@@ -79,7 +105,8 @@ jobs:
         run: cargo build --release --manifest-path agentterm-tui/Cargo.toml
 
       - name: Upload TUI binary
-        uses: actions/upload-artifact@v4
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ matrix.platform == 'macos-latest' && 'agentterm-macos-arm64' || 'agentterm-windows-x64' }}
           path: agentterm-tui/target/release/${{ matrix.platform == 'macos-latest' && 'agentterm' || 'agentterm.exe' }}

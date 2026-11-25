@@ -1,5 +1,31 @@
 # Testing policy
 
+## issues #71–#80 与 v0.2.0-rc.8（2026-11-25）
+
+- 本候选绑定 `codex/issues-71-80`，Windows 本机已直接执行
+  `pnpm check`，跨平台 Python 启动器和 `.cmd/.bat` shim 均通过。14 项质量门：
+  前端 142 passed，Rust 213 passed / 2 ignored，TUI 15 passed，模板契约
+  15 passed，lint、类型、构建、clippy 与格式通过。
+- #71：due 任务先持久化推进结果再执行；新增 DST 不存在时刻、执行前持久化和
+  待确认不自动运行回归。#72：压实增加 synced marker、候选/归档恢复，以及
+  “崩溃后不得重开为空账本”回归。
+- #73/#77：MCP URL 不再包含令牌，改用 Bearer 环境变量；令牌为操作系统
+  CSPRNG，服务端加入整体 deadline、32 连接上限、失败限流、Host/Origin 校验、
+  常量时间比较和写请求防重放。Agent 创建任务默认“待确认”，用户启用后才运行。
+- #74：Windows、macOS、Linux 均执行完整项目质量门；GitHub Actions 固定到
+  commit SHA，Rust 固定 1.90.0。#75：npm 打包冒烟生成 3,785,390 bytes
+  tgz，确认含 `vendor/agentterm.exe`（11,758,592 bytes），该证据绑定当前
+  rc.7 桌面 EXE 的打包脚本验证，不冒充 rc.8 最终资产。
+- #76/#78：launcher 对账加入 mutation epoch；调度读取改为有界接收；Unix
+  停止先杀进程组再移除；受控 relay 在退出时先停止；桌面加入单实例约束；
+  Tauri 磁盘 I/O 命令转到 async 调度；受控派发运行时锁在中毒后恢复，并新增
+  回归。
+- #79/#80：新增 jsdom/Testing Library 交互回归；关闭确认、检查更新、定时任务
+  确认/删除/刷新失败、文件搜索范围均有 DOM 覆盖。分隔条改为 pointer capture，
+  支持方向键；窄窗侧栏使用 inert/visibility；任务卡不再随 revision 重挂载。
+- 本节是合并前候选记录。GitHub CI、macOS/Linux 原生结果、rc.8 安装包和 Release
+  摘要仍待后续补入，不能把本地 Windows 通过冒充其他平台。
+
 ## 定时任务入口收口与 v0.2.0-rc.7（2026-11-25）
 
 - 顶栏“定时任务”由完整文字按钮改为 30px 时钟图标；保留
@@ -137,7 +163,11 @@
 
 ## #12 串行评审补修（2026-11-23）
 
-- 根据用户最新 D2 要求，单个 DeepSeek 子代理只读评审，主代理等待结束后修复。首轮静态结论 FAIL：非 Linux Unix 错用 `/proc` 缺失判退出；停止与后续阶段写入竞争可能把任务留在同一 owner 的 `pausing`。旧规则中“无子代理”仅适用于 11 月 21 日的历史工作。
+- 历史记录（已由当前规则取代）：该轮曾使用单个 DeepSeek 子代理做只读评审。
+  当前项目按用户 2026-11-20 的明确要求禁止开发/评审子代理，统一执行
+  主 Agent 串行自检；仓库内 `.claude/agents/qa-reviewer.md` 已改为禁用的
+  只读遗留说明。当时首轮静态结论 FAIL：非 Linux Unix 错用 `/proc` 缺失判
+  退出；停止与后续阶段写入竞争可能把任务留在同一 owner 的 `pausing`。
 - 停止竞态回归先在旧实现实测失败：`stop_racing_with_handoff_or_final_report_keeps_task_recoverable`，实际 `Pausing`、预期 `RecoveryRequired`，0 passed / 1 failed；修复后执行转验收和最后报告两个竞争窗口均通过。
 - 修复：Unix 只在 `kill(pid, 0)` 明确返回 ESRCH 时证明退出；`/proc` 仅用于 Linux 身份核对。macOS 活进程身份暂归 `Unknown`，继续阻断恢复。后台异常后有界读取当前版本并推进待核实，仅允许本次派发的版本；持久化仍失败时，空闲后台加执行阶段显示只读核实入口，人工接回再次验证全部旧进程已退出，并持有运行锁防止同时新派发。
 - Windows 本地 `pnpm check` 13 项全部通过：前端 89、Rust 后端 162 passed / 2 ignored、TUI 15、模板契约 13；单 worker、单 Rust job。新增 5 项回归覆盖停止竞争、迟到失败不覆盖新尝试/owner、后台结束后同 owner 接回、身份未知继续占用、活进程无启动身份不得判退出。另有 Unix 非法 PID 断言，须由 Unix CI 执行。跨平台旧夹具已改用实测退出的子进程 PID，不以 `u32::MAX` 假定退出。
