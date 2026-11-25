@@ -43,7 +43,7 @@ pub struct ScheduledTask {
     pub schedule: Option<ScheduleSpec>,
     pub timeout_minutes: u64,
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub approval_pending: bool,
     pub next_run_at_ms: u64,
     pub runs: Vec<ScheduledRun>,
@@ -749,6 +749,8 @@ fn storage_error(error: std::io::Error) -> String {
 mod tests {
     use super::{ScheduleSpec, ScheduledTaskDraft, Scheduler};
     use chrono::{TimeZone, Timelike};
+    use serde::Serialize;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::Path;
 
@@ -850,6 +852,60 @@ mod tests {
         let reloaded = Scheduler::default();
         reloaded.configure(path.clone()).unwrap();
         assert_eq!(reloaded.list().unwrap()[0].prompt, "检查失败任务");
+        let _ = fs::remove_file(path);
+    }
+
+    #[derive(Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyTask {
+        id: String,
+        name: String,
+        project_path: String,
+        tool_id: String,
+        model: Option<String>,
+        prompt: String,
+        interval_minutes: u64,
+        timeout_minutes: u64,
+        enabled: bool,
+        next_run_at_ms: u64,
+        runs: Vec<serde_json::Value>,
+    }
+
+    #[test]
+    fn legacy_record_without_approval_pending_remains_readable() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-legacy-schedule-{}-{}.json",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let legacy_task = LegacyTask {
+            id: "legacy-task".into(),
+            name: "旧任务".into(),
+            project_path: "E:\\AgentTerm".into(),
+            tool_id: "claude".into(),
+            model: None,
+            prompt: "检查项目状态".into(),
+            interval_minutes: 60,
+            timeout_minutes: 20,
+            enabled: true,
+            next_run_at_ms: 1,
+            runs: Vec::new(),
+        };
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(1_u64, vec![legacy_task.clone()])).unwrap())
+        );
+        let task_json = serde_json::to_string(&legacy_task).unwrap();
+        let record =
+            format!(r#"{{"schema":1,"revision":1,"tasks":[{task_json}],"sha256":"{digest}"}}"#);
+        fs::write(&path, format!("{record}\n")).unwrap();
+
+        let scheduler = Scheduler::default();
+        scheduler.configure(path.clone()).unwrap();
+        let tasks = scheduler.list().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "legacy-task");
+        assert!(!tasks[0].approval_pending);
         let _ = fs::remove_file(path);
     }
 
