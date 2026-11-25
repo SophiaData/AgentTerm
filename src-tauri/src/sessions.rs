@@ -1739,7 +1739,7 @@ mod tests {
         let dir = std::env::temp_dir().join("agentterm-buffer-test");
         std::fs::create_dir_all(&dir).expect("dir should be created");
 
-        let mut pty = spawn_pty(Path::new("/bin/cat"), &dir, 30, 120, &[]).unwrap();
+        let mut pty = spawn_pty(Path::new("/bin/cat"), &dir, 30, 120, &[], &[]).unwrap();
         pty.writer.write_all(b"replay-me\r").unwrap();
         pty.writer.flush().unwrap();
 
@@ -1762,8 +1762,8 @@ mod tests {
         std::fs::create_dir_all(&first_dir).expect("dir a should be created");
         std::fs::create_dir_all(&second_dir).expect("dir b should be created");
 
-        let mut first = spawn_pty(Path::new("/bin/cat"), &first_dir, 24, 80, &[]).unwrap();
-        let mut second = spawn_pty(Path::new("/bin/cat"), &second_dir, 24, 80, &[]).unwrap();
+        let mut first = spawn_pty(Path::new("/bin/cat"), &first_dir, 24, 80, &[], &[]).unwrap();
+        let mut second = spawn_pty(Path::new("/bin/cat"), &second_dir, 24, 80, &[], &[]).unwrap();
 
         first.writer.write_all(b"alpha\r").unwrap();
         first.writer.flush().unwrap();
@@ -1960,7 +1960,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
 
         // A shell that prints a marker then exits immediately.
-        let mut pty = spawn_pty(Path::new("/bin/sh"), &dir, 30, 120, &[]).unwrap();
+        let mut pty = spawn_pty(Path::new("/bin/sh"), &dir, 30, 120, &[], &[]).unwrap();
         use std::io::Write;
         pty.writer.write_all(b"echo TAIL-MARKER; exit 0\r").unwrap();
         pty.writer.flush().unwrap();
