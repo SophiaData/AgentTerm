@@ -990,7 +990,9 @@ h2 {
   gap: 8px;
 }
 .terminal-view.is-compact .terminal-toolbar > span,
-.terminal-view.is-compact .terminal-actions .ghost-button:not(:first-child) {
+.terminal-view.is-compact
+  .terminal-actions
+  .ghost-button:not(:first-child):not(.terminal-clipboard-action) {
   display: none;
 }
 .terminal-view.is-compact .terminal-toolbar {

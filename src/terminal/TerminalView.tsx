@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPromptLineTracker } from "./sessionNaming";
 import { connectSession, type ConnectionPhase } from "./sessionTransport";
+import { createTerminalClipboard } from "./terminalClipboard";
 import type { SessionInfo } from "./types";
 
 type Props = {
@@ -54,9 +55,13 @@ export default function TerminalView({
     scroll: () => void;
     layout: () => void;
     input: () => void;
+    copy: () => Promise<void>;
+    paste: () => Promise<void>;
+    invalidatePaste: () => void;
   } | null>(null);
   const [phase, setPhase] = useState<ConnectionPhase>("connecting");
   const [problem, setProblem] = useState<string | null>(null);
+  const [clipboardProblem, setClipboardProblem] = useState<string | null>(null);
   const [connection, setConnection] = useState(0);
   const [compact, setCompact] = useState(false);
 
@@ -68,14 +73,16 @@ export default function TerminalView({
     let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     setPhase("connecting");
     setProblem(null);
+    setClipboardProblem(null);
 
     async function mount() {
-      const [{ Terminal }, { FitAddon }, { listen }, { invoke }] =
+      const [{ Terminal }, { FitAddon }, { listen }, { invoke }, clipboardApi] =
         await Promise.all([
           import("@xterm/xterm"),
           import("@xterm/addon-fit"),
           import("@tauri-apps/api/event"),
           import("@tauri-apps/api/core"),
+          import("@tauri-apps/plugin-clipboard-manager"),
         ]);
       if (disposed || !hostRef.current) return;
 
@@ -154,11 +161,29 @@ export default function TerminalView({
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(resize, 60);
       };
+      const clipboard = createTerminalClipboard({
+        terminal,
+        readText: clipboardApi.readText,
+        writeText: clipboardApi.writeText,
+        canPaste: () =>
+          !disposed &&
+          localPhase === "ready" &&
+          current.current.visible &&
+          current.current.focused &&
+          current.current.running &&
+          !current.current.busy,
+        problem: setClipboardProblem,
+      });
+      terminal.attachCustomKeyEventHandler(clipboard.key);
+      cleanups.push(clipboard.dispose);
       controls.current = {
         focus,
         scroll: () => terminal.scrollToBottom(),
         layout,
         input,
+        copy: clipboard.copy,
+        paste: clipboard.paste,
+        invalidatePaste: clipboard.invalidate,
       };
       const observer = new ResizeObserver(layout);
       observer.observe(hostRef.current);
@@ -174,6 +199,7 @@ export default function TerminalView({
           phase: (next, error) => {
             if (disposed) return;
             localPhase = next;
+            clipboard.invalidate();
             setPhase(next);
             setProblem(error);
             current.current.onConnection(session.id, next, error);
@@ -237,11 +263,12 @@ export default function TerminalView({
   }, [session.id, connection]);
 
   useEffect(() => {
+    controls.current?.invalidatePaste();
     controls.current?.input();
     if (visible) {
       controls.current?.layout();
     }
-  }, [visible, running, busy]);
+  }, [visible, focused, running, busy]);
 
   useEffect(() => {
     if (current.current.visible && current.current.focused)
@@ -260,7 +287,7 @@ export default function TerminalView({
                 ? "终端连接需要处理"
                 : !running || phase === "exited"
                   ? "进程已结束，输出保留在下方"
-                  : "可直接输入 · Ctrl+C 中断当前命令"}
+                  : "选中文字后 Ctrl+C 复制 · Ctrl+V 粘贴 · 未选择时 Ctrl+C 中断"}
         </span>
         <div className="terminal-actions">
           <button
@@ -269,6 +296,23 @@ export default function TerminalView({
             onClick={() => setCompact((value) => !value)}
           >
             {compact ? "完整界面" : "简洁模式"}
+          </button>
+          <button
+            type="button"
+            className="ghost-button terminal-clipboard-action"
+            title="复制选中文字 · Ctrl+Shift+C / ⌘C"
+            onClick={() => void controls.current?.copy()}
+          >
+            复制
+          </button>
+          <button
+            type="button"
+            className="ghost-button terminal-clipboard-action"
+            title="粘贴文本 · Ctrl+V / Ctrl+Shift+V / ⌘V"
+            disabled={phase !== "ready" || !running || busy}
+            onClick={() => void controls.current?.paste()}
+          >
+            粘贴
           </button>
           <button
             type="button"
@@ -287,6 +331,11 @@ export default function TerminalView({
           </button>
         </div>
       </div>
+      {clipboardProblem ? (
+        <div className="terminal-problem" role="alert">
+          <span>{clipboardProblem}</span>
+        </div>
+      ) : null}
       {problem ? (
         <div className="terminal-problem" role="alert">
           <span>{problem}</span>
