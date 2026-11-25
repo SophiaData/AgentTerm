@@ -48,6 +48,12 @@ describe("ScheduledTasks interactions", () => {
     render(<ScheduledTasks onClose={vi.fn()} onNotice={vi.fn()} />);
 
     expect(await screen.findByText("待确认")).toBeTruthy();
+    // A pending draft must not be runnable from the panel either; the backend
+    // rejects it as well, so both layers agree.
+    expect(
+      (screen.getByRole("button", { name: "立即运行" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
     await user.click(screen.getByRole("button", { name: "确认启用" }));
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("set_scheduled_task_enabled", {

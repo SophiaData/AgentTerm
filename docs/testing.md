@@ -12,6 +12,21 @@
 
 本机：Rust 224 passed / 2 ignored，Clippy `-D warnings` 通过。
 
+### rc.12 发布与实机复核
+
+- PR #86 CI run `45576130321` 三端 pass；合并 `main@b2dc6b2`；打包 run `45576835369`
+  四项成功。
+- 发布 [v0.2.0-rc.12](https://github.com/SophiaData/AgentTerm/releases/tag/v0.2.0-rc.12)
+  Pre-release（未签名）。资产：setup 2,825,112 bytes / `636557c7…`、desktop
+  12,769,088 bytes / `36c0f6be…`、tui 481,792 bytes / `ad84b8df…`、tgz 4,084,766 bytes /
+  `4c0fbdf3…`；GitHub 回读一致。
+- 覆盖安装 `/S /UPDATE /D=E:\AgentTerm\app-b2dc6b2` 退出 0，注册与文件版本均为
+  0.2.0-rc.12，安装后 EXE `800bc408…`；检查更新显示“当前已是 0.2.0-rc.12”。
+- 待确认拦截双端一致：DOM 回归新增断言“待确认任务的『立即运行』按钮为 disabled”
+  （`ScheduledTasks.dom.test.tsx`），后端由 `a_pending_task_cannot_be_run_through_ipc`
+  覆盖；实机截图 `rc12-acceptance-03-pending.png` 显示“待确认”卡片。
+- 真实任务存储已从 `backups/rc12-precheck-store.json` 还原（哈希 `692c596f…`）。
+
 ## v0.2.0-rc.11 交付自审复核（2026-11-25）
 
 对 rc.10 做只读自审（主代理串行，不启用子代理）后，发现并修复 3 个真问题：
