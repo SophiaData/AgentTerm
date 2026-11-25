@@ -60,7 +60,7 @@
 | `@tauri-apps/api` 2.12.5                                  | 前端调用后端命令       | Tauri 官方接口，版本与 CLI 对齐                                                    | #2              |
 | `tauri-plugin-dialog` / `@tauri-apps/plugin-dialog` 2.8.4 | 原生文件夹选择框       | 官方插件，避免手打路径，权限仅开放 `dialog:allow-open`                             | #3              |
 | `tauri-plugin-single-instance` 2.5.5                      | 单实例约束             | 防止两个调度器并发执行同一任务                                                     | #78             |
-| `tauri-plugin-clipboard-manager` 2.3.2 / JS 2.5.0         | 原生文本剪贴板         | xterm 默认键盘会发送 Ctrl+C/V 控制字符；显式接入系统文本读写，仅开放主窗口文本权限 | rc.14           |
+| `tauri-plugin-clipboard-manager` / JS 2.5.0               | 原生文本剪贴板         | xterm 默认键盘会发送 Ctrl+C/V 控制字符；显式接入系统文本读写，仅开放主窗口文本权限 | rc.14           |
 | `jsdom` / Testing Library                                 | DOM 交互回归           | 覆盖点击、焦点和二次确认，不依赖静态字符串测试                                     | #79 / #80       |
 
 ## 终端复制粘贴（2026-11-25）
