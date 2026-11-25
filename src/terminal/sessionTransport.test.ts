@@ -191,8 +191,13 @@ describe("existing terminal connection", () => {
       ),
     );
     c.send("also blocked");
-    expect(f.invoke).toHaveBeenCalledTimes(2);
-    expect(f.removed).toHaveLength(2);
+    expect(f.invoke).toHaveBeenCalledTimes(3);
+    expect(f.invoke).toHaveBeenLastCalledWith("block_session_input", {
+      sessionId: "one",
+    });
+    expect(f.removed).toHaveLength(0);
+    f.emit("output", { data: "alive", endOffset: 10 });
+    expect(f.output).toHaveBeenLastCalledWith("alive");
     expect(f.exit).not.toHaveBeenCalled();
   });
 
@@ -276,6 +281,83 @@ describe("existing terminal connection", () => {
       ),
     );
     expect(f.phase).not.toHaveBeenLastCalledWith("error", expect.anything());
+    c.send("next");
+    await vi.waitFor(() =>
+      expect(f.invoke).toHaveBeenLastCalledWith("write_session_input", {
+        sessionId: "one",
+        data: "next",
+      }),
+    );
+    expect(
+      f.invoke.mock.calls.some(
+        ([command]) => command === "block_session_input",
+      ),
+    ).toBe(false);
+  });
+
+  it("blocks input after a partially delivered paste and preserves the block across reconnect", async () => {
+    const f = fixture();
+    const delivered: string[] = [];
+    let blocked = false;
+    let writes = 0;
+    f.invoke.mockImplementation(async (command, args) => {
+      if (command === "session_snapshot") {
+        return {
+          data: "hello",
+          offset: 5,
+          running: true,
+          inputBlocked: blocked,
+        };
+      }
+      if (command === "block_session_input") {
+        blocked = true;
+        return null;
+      }
+      writes += 1;
+      if (writes === 2)
+        throw new Error("终端输入积压过多，请等待当前输入写入后再试");
+      delivered.push(args.data as string);
+      return null;
+    });
+    const connection = f.connect();
+    await connection.ready;
+    connection.send("\x1b[200~" + "中🙂".repeat(14000) + "\x1b[201~");
+    await vi.waitFor(() => expect(blocked).toBe(true));
+    expect(delivered.join("")).toContain("\x1b[200~");
+    expect(delivered.join("")).not.toContain("\x1b[201~");
+    expect(f.phase).toHaveBeenLastCalledWith(
+      "error",
+      expect.stringContaining("一部分"),
+    );
+    connection.send("\r");
+    expect(writes).toBe(2);
+    expect(f.problem).not.toHaveBeenCalled();
+    f.emit("output", { data: "alive", endOffset: 10 });
+    expect(f.output).toHaveBeenLastCalledWith("alive");
+    connection.dispose();
+    const reconnected = f.connect();
+    await reconnected.ready;
+    expect(f.phase).toHaveBeenLastCalledWith(
+      "error",
+      expect.stringContaining("仅恢复显示"),
+    );
+    reconnected.send("must stay blocked\r");
+    expect(writes).toBe(2);
+  });
+
+  it("ignores a late write failure after disposal", async () => {
+    const f = fixture();
+    const connection = f.connect();
+    await connection.ready;
+    const pending = deferred<unknown>();
+    f.invoke.mockImplementationOnce(() => pending.promise);
+    connection.send("test");
+    connection.dispose();
+    pending.reject(new Error("终端输入积压过多"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(f.problem).not.toHaveBeenCalled();
+    expect(f.invoke).toHaveBeenCalledTimes(2);
   });
 
   it("times out a stalled connection and discards its late response", async () => {
