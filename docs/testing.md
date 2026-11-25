@@ -1,5 +1,38 @@
 # Testing policy
 
+## 定时任务入口收口与 v0.2.0-rc.7（2026-11-25）
+
+- 顶栏“定时任务”由完整文字按钮改为 30px 时钟图标；保留
+  `aria-label`、悬停提示、`aria-controls` 和展开态，面板内容与调度行为不变。
+- App 定向回归 7 passed；Prettier、ESLint、TypeScript、治理校验和 Cargo
+  lock 一致性通过。完整检查由 GitHub CI 执行。
+- [PR #69](https://github.com/SophiaData/AgentTerm/pull/69) 的 CI
+  `45528441685` 两端全绿后合入 `main`，合并提交
+  `ccda90b4800f2b09410525199d9d9650a733d993`；合并后 main CI
+  `45528745930` 在 Linux 与 Windows 两端通过。
+- Windows 桌面与 TUI 打包运行
+  [45529027876](https://github.com/SophiaData/AgentTerm/actions/runs/45529027876)
+  成功。rc.7 安装器覆盖安装退出 0，实际安装
+  `E:\AgentTerm\app-ccda90b\agentterm.exe`，EXE SHA-256 为
+  `8736b15fd99729dfeefd9a8004f14433228e3f2b660b0d7494ea5a73b1263d7e`。
+- 桌面和开始菜单快捷方式均已切换到新 EXE，测试时只保留一个 AgentTerm 进程。
+  720×720 实机 UIA 中“定时任务”按钮为 `30×29`，点击后正常展开面板；
+  证据为
+  `E:\AgentTerm\runtime\acceptance-rc7-ccda90b\agentterm-rc7-compact-schedule.png`
+  与同目录的 `agentterm-rc7-schedule-open.png`。
+- 已发布
+  [v0.2.0-rc.7 Pre-release](https://github.com/SophiaData/AgentTerm/releases/tag/v0.2.0-rc.7)，
+  绑定提交 `ccda90b`，GitHub 回读 digest 与本地一致：
+
+| 资产                                         |   bytes | SHA-256                                                            |
+| -------------------------------------------- | ------: | ------------------------------------------------------------------ |
+| `AgentTerm-0.2.0-rc.7-windows-x64-setup.exe` | 2685357 | `2edcc6f64bfb1e6acad3e393455fd0b9537fbbce937b1599730c249c0278d4ca` |
+| `agentterm-0.2.0-rc.7-windows-x64.exe`       |  455680 | `d5148f55182c842521f733e941d5d00877fb0f89b061878f68d2b65a81659081` |
+| `agentterm-0.2.0-rc.7.tgz`                   |  237436 | `3299e8a19bdff48154fb82b6ba7391e7bb2f6907816969510b82b9b8f16f2503` |
+
+- rc.7 客户端实际检查更新后显示“当前已是 0.2.0-rc.7”。本轮仍是主 Agent
+  串行自验收，不冒充用户验收或独立评审。
+
 ## issues #55–#66 与 v0.2.0-rc.6（2026-11-25）
 
 - 本轮按仓库 `project-policy.json` 逐项执行质量门。Windows 环境没有 `python3`
