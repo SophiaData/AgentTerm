@@ -13,6 +13,25 @@
 本机结果：Rust 223 passed / 2 ignored，前端 143 passed，`cargo clippy --all-targets
 -- -D warnings` 与格式检查通过。
 
+### rc.11 发布与实机复核
+
+- PR #85 CI run `45573219294` 三端 pass；合并 `main@619b469`；打包 run `45573824979`
+  四项成功。
+- 发布 [v0.2.0-rc.11](https://github.com/SophiaData/AgentTerm/releases/tag/v0.2.0-rc.11)
+  Pre-release（未签名）。资产：setup 2,826,699 bytes / `a7aa9261…`、desktop
+  12,761,088 bytes / `225e7d99…`、tui 481,792 bytes / `fd7ac2fd…`、tgz 4,077,627 bytes /
+  `74c8cf5f…`；GitHub 回读摘要一致。
+- 覆盖安装 `/S /UPDATE /D=E:\AgentTerm\app-619b469` 退出 0，注册与文件版本均为
+  0.2.0-rc.11，安装后 EXE `2bef2db0…`。
+- 实机确认自审修复（证据 `E:\AgentTerm\runtime\rc11-acceptance`）：
+  - 篡改夹具（第 2 条记录可解析但校验和伪造）：面板红字“定时任务存储校验失败”，
+    存储文件 512 bytes **原样保留**、未产生 archive，未回退到 revision 1。
+  - 残行夹具（第 2 条记录写到一半）：任务正常显示，文件重建为单条 374 bytes，
+    损坏原件归档 451 bytes——自愈仍然有效。
+  - 检查更新显示“当前已是 0.2.0-rc.11”。
+- 边界：安装助手的新写法（内联 `-Command` + 固定 PowerShell 路径）需要一次真实升级
+  才能端到端验证，本轮无更高版本可升，标注未验。
+
 ## v0.2.0-rc.10 缺陷收口（2026-11-25）
 
 上一轮全面审核列出的问题，本轮逐项修复并补回归：
