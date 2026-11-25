@@ -42,10 +42,10 @@ builder artifacts, assemble normalized names and hashes with:
 
 ```bash
 node scripts/package-release.mjs \
-  --installer AgentTerm_0.2.0-rc.12_x64-setup.exe \
+  --installer AgentTerm_0.2.0-rc.13_x64-setup.exe \
   --desktop agentterm.exe \
   --tui agentterm-tui.exe \
-  --npm agentterm-0.2.0-rc.12.tgz \
+  --npm agentterm-0.2.0-rc.13.tgz \
   --output dist-release
 ```
 
