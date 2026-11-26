@@ -124,6 +124,19 @@ impl Scheduler {
         Ok(inner.tasks.clone())
     }
 
+    /// Task list and running marker read under one lock, so the panel never
+    /// shows a task list from one instant and a running flag from another.
+    pub fn snapshot(&self) -> Result<(Vec<ScheduledTask>, Option<String>), String> {
+        let mut inner = self.lock()?;
+        load_if_configured(&mut inner)?;
+        let running = if inner.running && !inner.running_task.is_empty() {
+            Some(inner.running_task.clone())
+        } else {
+            None
+        };
+        Ok((inner.tasks.clone(), running))
+    }
+
     pub fn save(&self, draft: ScheduledTaskDraft) -> Result<ScheduledTask, String> {
         let mut task = normalize_draft(draft, None)?;
         let mut inner = self.lock()?;
@@ -1524,6 +1537,13 @@ pub fn list_scheduled_tasks(
     state: tauri::State<'_, Scheduler>,
 ) -> Result<Vec<ScheduledTask>, String> {
     state.list()
+}
+
+#[tauri::command(async)]
+pub fn scheduled_tasks_snapshot(
+    state: tauri::State<'_, Scheduler>,
+) -> Result<(Vec<ScheduledTask>, Option<String>), String> {
+    state.snapshot()
 }
 
 #[tauri::command(async)]

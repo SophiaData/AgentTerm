@@ -19,21 +19,33 @@ const desktop = option("desktop");
 const tui = option("tui");
 const npmPackage = option("npm");
 const output = option("output");
+// macOS assets are optional so the existing Windows-only invocation stays valid.
+const macosDmg = option("macos-dmg");
+const macosTui = option("macos-tui");
 if (!installer || !desktop || !tui || !npmPackage || !output) {
   console.error(
-    "usage: node scripts/package-release.mjs --installer <exe> --desktop <exe> --tui <exe> --npm <tgz> --output <dir>",
+    "usage: node scripts/package-release.mjs --installer <exe> --desktop <exe> --tui <exe> --npm <tgz> --output <dir> [--macos-dmg <dmg>] [--macos-tui <bin>]",
   );
+  process.exit(2);
+}
+if (Boolean(macosDmg) !== Boolean(macosTui)) {
+  console.error("--macos-dmg and --macos-tui must be provided together");
   process.exit(2);
 }
 
 const version = JSON.parse(readFileSync("package.json", "utf8")).version;
 mkdirSync(output, { recursive: true });
-const assets = [
+const inputs = [
   [resolve(installer), `AgentTerm-${version}-windows-x64-setup.exe`],
   [resolve(desktop), `agentterm-${version}-windows-x64.exe`],
   [resolve(tui), `agentterm-${version}-windows-x64-tui.exe`],
   [resolve(npmPackage), `agentterm-${version}.tgz`],
-].map(([source, name]) => {
+];
+if (macosDmg && macosTui) {
+  inputs.push([resolve(macosDmg), `AgentTerm-${version}-macos-arm64.dmg`]);
+  inputs.push([resolve(macosTui), `agentterm-${version}-macos-arm64-tui`]);
+}
+const assets = inputs.map(([source, name]) => {
   if (!statSync(source).isFile())
     throw new Error(`Missing release input: ${source}`);
   const destination = join(resolve(output), name);

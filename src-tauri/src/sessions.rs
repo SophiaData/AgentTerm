@@ -1305,12 +1305,21 @@ impl SessionManager {
 
         // Kill succeeded (or the process was already gone): now release it.
         let session = self.lock()?.remove(session_id);
+        // Capture the byte count before dropping the session so an explicit
+        // stop keeps the same history detail as a natural exit.
+        let output_bytes = session.as_ref().and_then(|session| {
+            session
+                .buffer
+                .lock()
+                .ok()
+                .map(|buffer| buffer.data.len() as u64)
+        });
         // Drop any finished-buffer leftover for this id so it cannot accumulate.
         if let Ok(mut done) = self.finished.lock() {
             done.remove(session_id);
         }
         drop(session);
-        self.record_end(session_id, Some(reason.to_string()), None);
+        self.record_end(session_id, Some(reason.to_string()), output_bytes);
         Ok(())
     }
 

@@ -662,6 +662,15 @@ pub fn associate_task_session(
     {
         return Err("任务计划与当前账本不匹配，不能关联会话".into());
     }
+    // The session may have exited while the ledger and document were being
+    // validated. Re-check just before persisting so a stale binding is not
+    // written; dispatch still revalidates, but the UI must not show a dead link.
+    let live = sessions
+        .session_info(&session_id)
+        .map_err(|_| "CLI 会话已结束，不能关联".to_string())?;
+    if live.id != session.id || live.tool_id != session.tool_id {
+        return Err("CLI 会话已变化，请重新关联".into());
+    }
     store.associate_session(session)?;
     state.workbench()
 }

@@ -70,6 +70,7 @@ pub fn run() {
             task_commands::request_stop_controlled_task,
             task_commands::preview_task_artifact,
             scheduled_tasks::list_scheduled_tasks,
+            scheduled_tasks::scheduled_tasks_snapshot,
             scheduled_tasks::set_scheduled_task_enabled,
             scheduled_tasks::remove_scheduled_task,
             scheduled_tasks::run_scheduled_task_now,

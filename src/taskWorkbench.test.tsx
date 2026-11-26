@@ -124,6 +124,51 @@ describe("task workbench", () => {
       vi.useRealTimers();
     }
   });
+  it("a late poll response cannot overwrite a newer load", async () => {
+    vi.useFakeTimers();
+    try {
+      const active = { ...view(), dispatchActive: true };
+      const newer = view();
+      newer.document!.plan.goal = "更新后的目标";
+      let resolveLate!: (value: unknown) => void;
+      const late = new Promise((resolve) => {
+        resolveLate = resolve;
+      });
+      // initial load -> poll (deferred) -> refresh load
+      invoke
+        .mockResolvedValueOnce(active)
+        .mockReturnValueOnce(late as never)
+        .mockResolvedValueOnce(newer);
+      await act(async () => {
+        render(
+          <TaskWorkbench
+            projects={[]}
+            projectBusy={false}
+            projectError={null}
+            draft={emptyPlan()}
+            onDraftChange={() => {}}
+            onAddProject={() => {}}
+            onRefreshProjects={() => {}}
+            currentSession={null}
+          />,
+        );
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(350));
+      // Trigger a newer full load while the poll is still in flight.
+      await act(async () => {
+        screen.getByRole("button", { name: "刷新状态" }).click();
+      });
+      await act(async () => resolveLate(active));
+      // The late poll carried the old goal; the newer load must still win.
+      expect(screen.getByText("更新后的目标")).toBeTruthy();
+      expect(screen.queryByText("核对 SQL 草稿")).toBeNull();
+    } finally {
+      cleanup();
+      invoke.mockReset();
+      vi.useRealTimers();
+    }
+  });
+
   it("offers explicit reassociation only for a recovered matching project and tool", () => {
     const current = view();
     current.ledger.active!.phase = "recoveredReserved";

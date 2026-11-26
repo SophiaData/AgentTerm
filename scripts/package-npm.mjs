@@ -5,7 +5,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const executable = resolve(
@@ -42,7 +42,9 @@ copyFileSync(
   join(packageDir, "bin", "agentterm.js"),
 );
 copyFileSync(resolve("LICENSE"), join(packageDir, "LICENSE"));
-copyFileSync(executable, join(packageDir, "vendor", basename(executable)));
+// The launcher always starts vendor/agentterm.exe, so normalize the staged
+// name regardless of which input path CI passes in.
+copyFileSync(executable, join(packageDir, "vendor", "agentterm.exe"));
 
 const manifest = JSON.parse(
   readFileSync(join(sourceDir, "package.json"), "utf8"),

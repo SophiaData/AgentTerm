@@ -41,11 +41,9 @@ const task = {
 describe("ScheduledTasks interactions", () => {
   it("requires explicit enable for an Agent-created task", async () => {
     invoke
-      .mockResolvedValueOnce([task])
-      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce([[task], null])
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce(null);
+      .mockResolvedValueOnce([[task], null]);
     const user = userEvent.setup();
     render(<ScheduledTasks onClose={vi.fn()} onNotice={vi.fn()} />);
 
@@ -68,12 +66,14 @@ describe("ScheduledTasks interactions", () => {
   it("asks before permanently deleting a task", async () => {
     invoke
       .mockResolvedValueOnce([
-        { ...task, enabled: true, approvalPending: false },
+        [{ ...task, enabled: true, approvalPending: false }],
+        null,
       ])
-      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(undefined)
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce(null);
+      .mockResolvedValueOnce([
+        [{ ...task, enabled: true, approvalPending: false }],
+        null,
+      ]);
     const user = userEvent.setup();
     render(<ScheduledTasks onClose={vi.fn()} onNotice={vi.fn()} />);
 
@@ -93,9 +93,9 @@ describe("ScheduledTasks interactions", () => {
   it("reports refresh failure separately after a successful command", async () => {
     invoke
       .mockResolvedValueOnce([
-        { ...task, enabled: true, approvalPending: false },
+        [{ ...task, enabled: true, approvalPending: false }],
+        null,
       ])
-      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error("disk busy"));
     const user = userEvent.setup();
@@ -111,12 +111,14 @@ describe("ScheduledTasks interactions", () => {
   it("offers a stop action while a run is in flight", async () => {
     invoke
       .mockResolvedValueOnce([
-        { ...task, enabled: true, approvalPending: false },
+        [{ ...task, enabled: true, approvalPending: false }],
+        task.id,
       ])
-      .mockResolvedValueOnce("task-1")
       .mockResolvedValueOnce(true)
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce(null);
+      .mockResolvedValueOnce([
+        [{ ...task, enabled: true, approvalPending: false }],
+        null,
+      ]);
     const user = userEvent.setup();
     render(<ScheduledTasks onClose={vi.fn()} onNotice={vi.fn()} />);
 
@@ -131,11 +133,9 @@ describe("ScheduledTasks interactions", () => {
 
   it("does not report a stop when the displayed task already ended", async () => {
     invoke
-      .mockResolvedValueOnce([task])
-      .mockResolvedValueOnce(task.id)
+      .mockResolvedValueOnce([[task], task.id])
       .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce([task])
-      .mockResolvedValueOnce(null);
+      .mockResolvedValueOnce([[task], null]);
     const onNotice = vi.fn();
     const user = userEvent.setup();
     render(<ScheduledTasks onClose={vi.fn()} onNotice={onNotice} />);
@@ -151,14 +151,14 @@ describe("ScheduledTasks interactions", () => {
       rejectOld = reject;
     });
     const onNotice = vi.fn();
-    invoke.mockReturnValueOnce(old).mockResolvedValueOnce(null);
+    invoke.mockReturnValueOnce(old);
     render(<ScheduledTasks onClose={vi.fn()} onNotice={onNotice} />);
     await waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith("list_scheduled_tasks");
+      expect(invoke).toHaveBeenCalledWith("scheduled_tasks_snapshot");
       expect(listen).toHaveBeenCalled();
     });
 
-    invoke.mockResolvedValueOnce([task]).mockResolvedValueOnce(null);
+    invoke.mockResolvedValueOnce([[task], null]);
     listen.mock.calls[0][1]();
     expect(await screen.findByText(task.name)).toBeTruthy();
     await act(async () => rejectOld(new Error("obsolete error")));
