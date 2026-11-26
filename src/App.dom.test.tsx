@@ -15,14 +15,14 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 const swProps = vi.hoisted(() => ({
   latest: null as null | {
     activities?: Record<string, string>;
-    onOutputActivity?: (id: string) => void;
+    onOutputActivity?: (id: string, text?: string) => void;
     onUserInput?: (id: string) => void;
   },
 }));
 vi.mock("./terminal/SessionWorkspace", () => ({
   default: (props: {
     activities?: Record<string, string>;
-    onOutputActivity?: (id: string) => void;
+    onOutputActivity?: (id: string, text?: string) => void;
     onUserInput?: (id: string) => void;
   }) => {
     swProps.latest = props;
@@ -242,17 +242,19 @@ describe("App interactions", () => {
     expect(requestRemove).toHaveBeenCalledWith("project-2");
   });
 
-  it("shows working and completed badges on session tabs", async () => {
+  it("shows streaming output badge on session tabs and settles to running without claiming completed", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       mockLauncher();
       render(<App />);
       expect(swProps.latest?.onOutputActivity).toBeTruthy();
-      swProps.latest?.onOutputActivity?.(session.info.id);
-      expect(await screen.findAllByText("执行中")).toHaveLength(2);
+      swProps.latest?.onOutputActivity?.(session.info.id, "正在输出…");
+      expect(await screen.findAllByText("输出中")).toHaveLength(2);
       await waitFor(() => {}, { timeout: 10 });
-      vi.advanceTimersByTime(2500);
-      expect(await screen.findAllByText("已完成")).toHaveLength(2);
+      vi.advanceTimersByTime(4000);
+      await waitFor(() => expect(screen.queryByText("输出中")).toBeNull());
+      expect(screen.queryByText("已完成")).toBeNull();
+      expect(screen.getByText("运行中")).toBeTruthy();
     } finally {
       vi.useRealTimers();
     }

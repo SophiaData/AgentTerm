@@ -133,7 +133,7 @@ export default function App() {
     useState<PreparedUpdateStatus | null>(null);
   const [restoringUpdates, setRestoringUpdates] = useState(false);
   const [taskNotice, setTaskNotice] = useState<string | null>(null);
-  const activity = useSessionActivity(launcher.sessions, launcher.activeId);
+  const activity = useSessionActivity(launcher.sessions);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
     projects.projects.find((p) => p.id === projectId) ?? projects.projects[0];
@@ -435,14 +435,12 @@ export default function App() {
         ? ""
         : state === "working"
           ? " is-working"
-          : state === "done"
-            ? " is-done"
-            : " is-running";
+          : " is-running";
     return (
       <button
         type="button"
         key={session.info.id}
-        className={`workspace-session-link${state === "done" ? " is-done" : ""}`}
+        className="workspace-session-link"
         aria-current={
           launcher.activeId === session.info.id ? "true" : undefined
         }
@@ -857,11 +855,11 @@ export default function App() {
                       : -1
                   }
                   className={`workspace-tab${
-                    sessionActivities[session.info.id] === "done"
-                      ? " is-done"
-                      : sessionActivities[session.info.id] === "working"
-                        ? " is-working"
-                        : ""
+                    session.running &&
+                    !session.statusUnknown &&
+                    sessionActivities[session.info.id] === "working"
+                      ? " is-working"
+                      : ""
                   }`}
                   title={displayPath(session.info.projectPath)}
                   onClick={() => selectSession(session)}
@@ -900,22 +898,16 @@ export default function App() {
                           ? ""
                           : sessionActivities[session.info.id] === "working"
                             ? " is-working"
-                            : sessionActivities[session.info.id] === "done"
-                              ? " is-done"
-                              : " is-running"
+                            : " is-running"
                     }`}
                     aria-hidden="true"
                   />
                   <span className="workspace-tab-label">{session.label}</span>
                   {session.running &&
                   !session.statusUnknown &&
-                  sessionActivities[session.info.id] !== "idle" ? (
-                    <span
-                      className={`workspace-tab-state is-${sessionActivities[session.info.id]}`}
-                    >
-                      {sessionActivities[session.info.id] === "working"
-                        ? "执行中"
-                        : "已完成"}
+                  sessionActivities[session.info.id] === "working" ? (
+                    <span className="workspace-tab-state is-working">
+                      输出中
                     </span>
                   ) : null}
                 </button>

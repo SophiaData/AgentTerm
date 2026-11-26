@@ -18,7 +18,7 @@ type Props = {
     error: string | null,
   ) => void;
   onPromptLine?: (id: string, line: string) => void;
-  onOutputActivity?: (id: string) => void;
+  onOutputActivity?: (id: string, text?: string) => void;
   onUserInput?: (id: string) => void;
 };
 
@@ -205,7 +205,7 @@ export default function TerminalView({
             if (disposed) return;
             terminal.write(text);
             if (localPhase === "ready" && text) {
-              current.current.onOutputActivity?.(session.id);
+              current.current.onOutputActivity?.(session.id, text);
             }
           },
           phase: (next, error) => {
