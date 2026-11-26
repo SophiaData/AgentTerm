@@ -2,7 +2,9 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::session_history::{SessionHistory, SessionRecord, normalize_session_title, now_ms};
+use crate::session_history::{
+    SessionHistory, SessionRecord, is_valid_uuid, normalize_session_title, now_ms,
+};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -35,7 +37,7 @@ const ENV_BLOCKLIST: &[&str] = &[
     "ZELLIJ_PANE_ID",
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub id: String,
@@ -44,6 +46,8 @@ pub struct SessionInfo {
     pub project_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -315,6 +319,87 @@ pub struct SessionLaunch<'a> {
     pub tool_args: Vec<String>,
     pub tool_env: Vec<(String, String)>,
     pub schedule_guard: ScheduleMcp,
+    pub cli_session_id: Option<String>,
+    pub title: Option<String>,
+}
+
+fn new_uuid_v4() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| format!("无法生成会话标识：{error}"))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    ))
+}
+
+fn build_tool_launch_args(
+    tool_id: &str,
+    bridge_args: Vec<String>,
+    cli_session_id: Option<&str>,
+    resume: bool,
+) -> Result<(Option<String>, Vec<String>), String> {
+    if let Some(id) = cli_session_id
+        && !is_valid_uuid(id)
+    {
+        return Err("无效的 CLI 会话恢复标识".to_string());
+    }
+    match tool_id {
+        "claude" => {
+            if resume {
+                let mut args = if let Some(id) = cli_session_id {
+                    vec!["--resume".to_string(), id.to_string()]
+                } else {
+                    vec!["--continue".to_string()]
+                };
+                args.extend(bridge_args);
+                Ok((cli_session_id.map(str::to_string), args))
+            } else {
+                let uuid = match cli_session_id {
+                    Some(id) => id.to_string(),
+                    None => new_uuid_v4()?,
+                };
+                let mut args = vec!["--session-id".to_string(), uuid.clone()];
+                args.extend(bridge_args);
+                Ok((Some(uuid), args))
+            }
+        }
+        "codex" => {
+            if resume {
+                let mut args = vec!["resume".to_string(), "--last".to_string()];
+                args.extend(bridge_args);
+                Ok((None, args))
+            } else {
+                Ok((None, bridge_args))
+            }
+        }
+        "agy" => {
+            if resume {
+                let mut args = vec!["--continue".to_string()];
+                args.extend(bridge_args);
+                Ok((None, args))
+            } else {
+                Ok((None, bridge_args))
+            }
+        }
+        _ => Err(format!("不支持的工具：{tool_id}")),
+    }
 }
 
 fn has_utf8_locale(value: Option<&std::ffi::OsStr>) -> bool {
@@ -930,7 +1015,19 @@ impl SessionManager {
             tool_args,
             tool_env,
             schedule_guard,
+            cli_session_id,
+            title,
         } = request;
+        if let Some(id) = cli_session_id.as_deref()
+            && !is_valid_uuid(id)
+        {
+            return Err("无效的 CLI 会话标识".to_string());
+        }
+        let normalized_title = title
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(normalize_session_title)
+            .transpose()?;
         let tool = TOOL_DEFINITIONS
             .iter()
             .find(|definition| definition.id == tool_id)
@@ -966,7 +1063,8 @@ impl SessionManager {
             tool_id: tool.id.to_string(),
             tool_name: tool.name.to_string(),
             project_path: project_dir.display().to_string(),
-            title: None,
+            title: normalized_title.clone(),
+            cli_session_id: cli_session_id.clone(),
         };
 
         #[cfg(unix)]
@@ -1001,7 +1099,8 @@ impl SessionManager {
             tool_id: tool.id.to_string(),
             tool_name: tool.name.to_string(),
             project_path: info.project_path.clone(),
-            title: None,
+            title: normalized_title,
+            cli_session_id,
             started_at_ms: now_ms(),
             ended_at_ms: None,
             exit_reason: None,
@@ -1397,14 +1496,24 @@ pub fn start_session(
     project_path: String,
     rows: u16,
     cols: u16,
+    resume: Option<bool>,
+    cli_session_id: Option<String>,
+    title: Option<String>,
 ) -> Result<SessionInfo, String> {
     // Reserve before the MCP bridge: a duplicate must not replace or revoke
     // the existing session's registration. Keep it through error cleanup.
     let reservation = Arc::new(state.reserve_start(&session_id)?);
     let bridge = schedule_mcp.issue_session(&session_id, &project_path, &tool_id, None)?;
     let tool_env = bridge.environment();
-    let tool_args = match bridge.command_args(&tool_id) {
-        Ok(args) => args,
+    let (resolved_cli_id, tool_args) = match bridge.command_args(&tool_id).and_then(|args| {
+        build_tool_launch_args(
+            &tool_id,
+            args,
+            cli_session_id.as_deref(),
+            resume.unwrap_or(false),
+        )
+    }) {
+        Ok(result) => result,
         Err(error) => {
             schedule_mcp.revoke_session(&session_id);
             return Err(error);
@@ -1421,6 +1530,8 @@ pub fn start_session(
             tool_args,
             tool_env,
             schedule_guard: schedule_mcp.handle(),
+            cli_session_id: resolved_cli_id,
+            title,
         },
         Arc::clone(&reservation),
     ) {
@@ -1682,6 +1793,7 @@ mod tests {
                     tool_name: "Claude Code".into(),
                     project_path: std::env::current_dir().unwrap().to_string_lossy().into(),
                     title: None,
+                    cli_session_id: None,
                 },
                 master: Box::new(FakeMaster),
                 #[cfg(unix)]
@@ -2617,6 +2729,7 @@ mod tests {
             tool_name: "Claude Code".to_string(),
             project_path: history_project(),
             title: None,
+            cli_session_id: None,
             started_at_ms: 10,
             ended_at_ms: None,
             exit_reason: None,
@@ -2651,6 +2764,7 @@ mod tests {
             tool_name: "Claude Code".to_string(),
             project_path: history_project(),
             title: None,
+            cli_session_id: None,
             started_at_ms: 10,
             ended_at_ms: None,
             exit_reason: None,
@@ -2679,6 +2793,7 @@ mod tests {
                 tool_name: "Claude Code".to_string(),
                 project_path: history_project(),
                 title: None,
+                cli_session_id: None,
                 started_at_ms: 10,
                 ended_at_ms: None,
                 exit_reason: None,
@@ -2772,6 +2887,7 @@ mod tests {
             tool_name: "Claude Code".to_string(),
             project_path: history_project(),
             title: None,
+            cli_session_id: None,
             started_at_ms: 10,
             ended_at_ms: None,
             exit_reason: None,
@@ -2798,5 +2914,53 @@ mod tests {
         assert_eq!(after_stop, "归档：接口排查");
         let listed = manager.list_history().unwrap();
         assert_eq!(listed[0].title.as_deref(), Some("归档：接口排查"));
+    }
+
+    #[test]
+    fn build_tool_launch_args_supports_fresh_and_resume_modes() {
+        let (fresh_id, fresh_claude) = super::build_tool_launch_args(
+            "claude",
+            vec!["--mcp-config".into(), "{}".into()],
+            None,
+            false,
+        )
+        .unwrap();
+        let uuid = fresh_id.expect("fresh claude session gets a UUID");
+        assert!(super::is_valid_uuid(&uuid));
+        assert_eq!(
+            fresh_claude,
+            vec!["--session-id", &uuid, "--mcp-config", "{}"]
+        );
+
+        let (resumed_id, resumed_claude) = super::build_tool_launch_args(
+            "claude",
+            vec!["--mcp-config".into(), "{}".into()],
+            Some(&uuid),
+            true,
+        )
+        .unwrap();
+        assert_eq!(resumed_id.as_deref(), Some(uuid.as_str()));
+        assert_eq!(
+            resumed_claude,
+            vec!["--resume", &uuid, "--mcp-config", "{}"]
+        );
+
+        let (fallback_id, fallback_claude) =
+            super::build_tool_launch_args("claude", vec![], None, true).unwrap();
+        assert_eq!(fallback_id, None);
+        assert_eq!(fallback_claude, vec!["--continue"]);
+
+        let (codex_id, codex_resume) =
+            super::build_tool_launch_args("codex", vec!["-c".into(), "foo=bar".into()], None, true)
+                .unwrap();
+        assert_eq!(codex_id, None);
+        assert_eq!(codex_resume, vec!["resume", "--last", "-c", "foo=bar"]);
+
+        let (agy_id, agy_resume) =
+            super::build_tool_launch_args("agy", vec![], None, true).unwrap();
+        assert_eq!(agy_id, None);
+        assert_eq!(agy_resume, vec!["--continue"]);
+
+        assert!(super::build_tool_launch_args("claude", vec![], Some("bad-id"), true).is_err());
     }
 }

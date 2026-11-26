@@ -4,6 +4,7 @@ export type SessionInfo = {
   toolName: string;
   projectPath: string;
   title?: string | null;
+  cliSessionId?: string | null;
 };
 
 export type SessionExit = {
@@ -17,6 +18,7 @@ export type SessionHistoryRecord = {
   toolName: string;
   projectPath: string;
   title?: string | null;
+  cliSessionId?: string | null;
   startedAtMs: number;
   endedAtMs: number | null;
   exitReason: string | null;

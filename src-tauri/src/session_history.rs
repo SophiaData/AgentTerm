@@ -26,6 +26,24 @@ pub fn normalize_session_title(raw: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+pub fn is_valid_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        let expect_dash = matches!(index, 8 | 13 | 18 | 23);
+        if expect_dash {
+            if *byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
 /// A persisted manual terminal session. Only identity, timestamps and end state
 /// are kept; no output, credentials or environment are stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +55,8 @@ pub struct SessionRecord {
     pub project_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_session_id: Option<String>,
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub exit_reason: Option<String>,
@@ -307,6 +327,7 @@ fn validate_record(record: &SessionRecord) -> Result<(), String> {
         .title
         .as_deref()
         .is_none_or(|title| normalize_session_title(title).is_ok_and(|clean| clean == title));
+    let cli_session_ok = record.cli_session_id.as_deref().is_none_or(is_valid_uuid);
     let reason_ok = record.exit_reason.as_deref().is_none_or(|reason| {
         !reason.is_empty() && reason.len() <= 1024 && !reason.chars().any(char::is_control)
     });
@@ -327,6 +348,7 @@ fn validate_record(record: &SessionRecord) -> Result<(), String> {
         || record.tool_name.chars().any(char::is_control)
         || record.started_at_ms == 0
         || !title_ok
+        || !cli_session_ok
         || !reason_ok
         || !ended_ok
     {
@@ -380,6 +402,7 @@ mod tests {
             }
             .to_string(),
             title: None,
+            cli_session_id: None,
             started_at_ms: started,
             ended_at_ms: None,
             exit_reason: None,
@@ -609,6 +632,27 @@ mod tests {
         history.record_rename("legacy-1", "旧记录改名").unwrap();
         let after = history.list().unwrap();
         assert_eq!(after[0].title.as_deref(), Some("旧记录改名"));
+        assert_eq!(after[0].cli_session_id, None);
+    }
+
+    #[test]
+    fn cli_session_id_roundtrips_and_rejects_non_uuid() {
+        let path = temp_store("cli-session-id");
+        let history = SessionHistory::configure(path.clone()).unwrap();
+        let mut valid = record("s-uuid", 10);
+        valid.cli_session_id = Some("01234567-89ab-4cde-8123-456789abcdef".to_string());
+        history.record_start(valid).unwrap();
+
+        let mut invalid = record("s-bad-uuid", 20);
+        invalid.cli_session_id = Some("not-a-uuid".to_string());
+        assert!(history.record_start(invalid).is_err());
+
+        let listed = SessionHistory::configure(path).unwrap().list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].cli_session_id.as_deref(),
+            Some("01234567-89ab-4cde-8123-456789abcdef")
+        );
     }
 
     #[test]

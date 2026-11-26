@@ -60,6 +60,10 @@ impl Drop for DispatchLease {
 }
 
 impl TaskLedgerState {
+    pub(crate) fn is_dispatch_active(&self) -> bool {
+        self.runtime.lock_active().is_some()
+    }
+
     pub(crate) fn stop_controlled_dispatches(&self, timeout: Duration) -> Result<(), String> {
         let control = self
             .runtime
