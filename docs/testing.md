@@ -1,6 +1,6 @@
 # Testing policy
 
-## rc.14 发布、安装与验收（2026-11-25）
+## rc.14 发布、安装与验收（2026-11-25～26）
 
 固定应用代码 `286cc0a913cbef3a060bed6e07312d497e3eb0b8`，PR #90 / #91 / #92 已合入。
 [测试版 Release](https://github.com/SophiaData/AgentTerm/releases/tag/v0.2.0-rc.14)
@@ -19,15 +19,24 @@
 - 新版“检查更新”实际显示“当前已是 0.2.0-rc.14”。定时任务面板正常打开，当前有效记录 0 条；
   安装前后真实文件摘要均为 `692c596fc6093e10dc75e42039d3746ab4136870c0dc2a455100833168a399bb`。
   rc.7/rc.8 记录读取、更新和重载由本次三端回归验证，没有往真实文件注入测试记录或启动旧任务。
-- 原生验收已在真实 ConPTY 中启动只处理合成文本的本地程序，没有调用模型。当前 Windows
-  前台为 `LockApp`，`OpenClipboard` 返回 Win32 error 5，粘贴按钮正确显示失败提示；
-  系统剪贴板往返与物理快捷键尚未通过，不能用单元测试代替。未读取用户剪贴板。
-  测试程序已退出，应用按普通 PATH 重启，仅保留一个 AgentTerm；待解锁补验。
+- 11 月 25 日首次原生验收因 Windows 锁屏受阻，`OpenClipboard` 返回 Win32 error 5；
+  11 月 26 日用户解锁后，在同一个已安装的 rc.14 包补验通过，没有修改应用或重建包。
+  真实 ConPTY 本地程序精确匹配中英文、emoji 和 bracketed paste 起止标记：Ctrl+V、
+  Ctrl+Shift+V、粘贴按钮各送达一次，共 3 次；选区 Ctrl+C、Ctrl+Shift+C、复制按钮各
+  完成系统剪贴板复制后粘贴回终端，共 3 次，均未误中断。清除选区后 Ctrl+C 送达 `0x03`，
+  测试程序退出，界面显示“已退出：Success”。结果为 `pasteCount=3`、`copyCount=3`、
+  `interruptReceived=true`。测试仅处理合成文本，不调用模型，不读取用户原有剪贴板内容。
+  自动键盘事件只在确认 AgentTerm 为前台后发送；抢焦点的尝试没有输入，不计入通过次数。
+- 测试程序已退出并归档，应用按普通 PATH 重启，仅保留一个 AgentTerm。重启后再次点击
+  更新检查显示当前已是 rc.14；安装 EXE 与旧任务文件摘要和上方发布安装证据一致。
 - 主代理串行自检：代码、权限、异步失效与失败路径、变异回归、固定提交 CI、发布摘要和安装
-  证据已核对；不称独立审核或 cc PASS。未发现本轮检查范围内的新增代码阻塞；剩余实机验收未完成。
+  及原生剪贴板证据已核对，本轮工程交付验收通过；不称独立审核或 cc PASS。
+  macOS 真机交互和正式签名仍属原有边界，不计入本轮 Windows 交付通过范围。
 
 证据位于 `E:\AgentTerm\runtime\rc14-acceptance`；安装包与校验清单位于
 `E:\AgentTerm\runtime\rc14-package-286cc0a\release`，备份在项目 `backups/rc14-*`。
+补验结果文件为 `clipboard-native-result-20261126.json`，截图为 `unlocked-exited.png`、
+`unlocked-normal-latest.png`，测试程序与脚本归档在验收目录的 `probes-20261126/`。
 
 ## rc.14 输入异常修复过程（2026-11-25）
 
