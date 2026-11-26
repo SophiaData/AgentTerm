@@ -200,6 +200,7 @@ export default function TerminalView({
             if (disposed) return;
             localPhase = next;
             clipboard.invalidate();
+            setClipboardProblem(null);
             setPhase(next);
             setProblem(error);
             current.current.onConnection(session.id, next, error);
@@ -232,6 +233,7 @@ export default function TerminalView({
           current.current.running &&
           !current.current.busy
         ) {
+          setClipboardProblem(null);
           transport.send(text);
           for (const line of tracker.feed(text)) {
             current.current.onPromptLine?.(session.id, line);
@@ -274,6 +276,14 @@ export default function TerminalView({
     if (current.current.visible && current.current.focused)
       controls.current?.focus();
   }, [focusRequest]);
+
+  useEffect(() => {
+    if (!clipboardProblem) return;
+    const timer = setTimeout(() => {
+      setClipboardProblem(null);
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [clipboardProblem]);
 
   return (
     <div className={`terminal-view${compact ? " is-compact" : ""}`}>
@@ -334,6 +344,13 @@ export default function TerminalView({
       {clipboardProblem ? (
         <div className="terminal-problem" role="alert">
           <span>{clipboardProblem}</span>
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => setClipboardProblem(null)}
+          >
+            关闭
+          </button>
         </div>
       ) : null}
       {problem ? (

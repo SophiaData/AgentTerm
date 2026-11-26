@@ -15,7 +15,24 @@ mod tools;
 mod tray;
 mod updates;
 
+use std::sync::{Arc, Condvar, Mutex};
 use tauri::{Manager, WindowEvent};
+
+struct SchedulerTickerStop(Arc<(Mutex<bool>, Condvar)>);
+
+impl SchedulerTickerStop {
+    fn new() -> Self {
+        Self(Arc::new((Mutex::new(false), Condvar::new())))
+    }
+
+    fn stop(&self) {
+        let (lock, cvar) = &*self.0;
+        if let Ok(mut stopped) = lock.lock() {
+            *stopped = true;
+            cvar.notify_all();
+        }
+    }
+}
 
 pub const PRODUCT_NAME: &str = "AgentTerm";
 
@@ -101,12 +118,29 @@ pub fn run() {
             app.state::<schedule_mcp::ScheduleMcp>()
                 .configure(scheduler.handle(), app.handle().clone())
                 .map_err(std::io::Error::other)?;
+            let ticker_stop = SchedulerTickerStop::new();
+            let ticker_signal = Arc::clone(&ticker_stop.0);
+            app.manage(ticker_stop);
             std::thread::spawn(move || {
+                let (lock, cvar) = &*ticker_signal;
                 loop {
                     if let Err(error) = scheduler.tick() {
                         eprintln!("AgentTerm scheduled task tick failed: {error}");
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    let Ok(guard) = lock.lock() else {
+                        break;
+                    };
+                    if *guard {
+                        break;
+                    }
+                    let Ok((guard, _)) =
+                        cvar.wait_timeout(guard, std::time::Duration::from_secs(30))
+                    else {
+                        break;
+                    };
+                    if *guard {
+                        break;
+                    }
                 }
             });
 
@@ -152,6 +186,9 @@ pub fn run() {
                     api.prevent_exit();
                     tray::report_shutdown_error(app, &error);
                     return;
+                }
+                if let Some(ticker_stop) = app.try_state::<SchedulerTickerStop>() {
+                    ticker_stop.stop();
                 }
                 app.state::<schedule_mcp::ScheduleMcp>().cleanup();
             }
