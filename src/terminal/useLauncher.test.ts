@@ -159,6 +159,38 @@ describe("independent CLI sessions", () => {
     expect(state.activeId).toBe(state.sessions[0].info.id);
   });
 
+  it("does not resurrect a session that exited while a live-list read was pending", async () => {
+    const { store, invoke } = fixture();
+    await store.start(project, tool);
+    const { info } = store.getSnapshot().sessions[0];
+    const delayed = deferred<unknown>();
+    invoke.mockReturnValueOnce(delayed.promise);
+
+    const reading = store.reconcile();
+    store.handleExit(info.id, "exit 0");
+    delayed.resolve([info]);
+    await reading;
+
+    expect(store.getSnapshot().sessions[0]).toMatchObject({
+      running: false,
+      statusUnknown: false,
+      exitReason: "exit 0",
+    });
+  });
+
+  it("ignores an obsolete reconciliation error after starting a new session", async () => {
+    const { store, invoke } = fixture();
+    const delayed = deferred<unknown>();
+    invoke.mockReturnValueOnce(delayed.promise);
+    const reading = store.reconcile();
+    await store.start(project, tool);
+    delayed.reject(new Error("obsolete read"));
+    await reading;
+
+    expect(store.getSnapshot().startError).toBeNull();
+    expect(store.getSnapshot().sessions[0].statusUnknown).toBe(false);
+  });
+
   it("closing one session leaves the other and ignores late events", async () => {
     const { store, invoke } = fixture();
     await store.start(project, tool);

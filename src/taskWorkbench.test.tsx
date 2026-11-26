@@ -1,6 +1,12 @@
+// @vitest-environment jsdom
+
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
-import { PlanForm, TaskCard } from "./TaskWorkbench";
+import { describe, expect, it, vi } from "vitest";
+import TaskWorkbench, { PlanForm, TaskCard } from "./TaskWorkbench";
+
+const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 import {
   acceptSnapshot,
   actionsBlocked,
@@ -85,6 +91,39 @@ const callbacks = {
 };
 
 describe("task workbench", () => {
+  it("clears a transient read error after polling succeeds", async () => {
+    vi.useFakeTimers();
+    try {
+      const active = { ...view(), dispatchActive: true };
+      invoke
+        .mockResolvedValueOnce(active)
+        .mockRejectedValueOnce(new Error("fixture read failure"))
+        .mockResolvedValueOnce({ ...active, dispatchActive: false });
+      await act(async () => {
+        render(
+          <TaskWorkbench
+            projects={[]}
+            projectBusy={false}
+            projectError={null}
+            draft={emptyPlan()}
+            onDraftChange={() => {}}
+            onAddProject={() => {}}
+            onRefreshProjects={() => {}}
+            currentSession={null}
+          />,
+        );
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(350));
+      expect(screen.getByText("fixture read failure")).toBeTruthy();
+      await act(async () => vi.advanceTimersByTimeAsync(350));
+      expect(screen.queryByText("fixture read failure")).toBeNull();
+      expect(invoke).toHaveBeenCalledTimes(3);
+    } finally {
+      cleanup();
+      invoke.mockReset();
+      vi.useRealTimers();
+    }
+  });
   it("offers explicit reassociation only for a recovered matching project and tool", () => {
     const current = view();
     current.ledger.active!.phase = "recoveredReserved";

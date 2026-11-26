@@ -1,13 +1,15 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ScheduledTasks from "./ScheduledTasks";
 
 const { invoke, listen } = vi.hoisted(() => ({
   invoke: vi.fn(),
-  listen: vi.fn(async () => () => undefined),
+  listen: vi.fn<(name: string, callback: () => void) => Promise<() => void>>(
+    async () => () => undefined,
+  ),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -112,7 +114,7 @@ describe("ScheduledTasks interactions", () => {
         { ...task, enabled: true, approvalPending: false },
       ])
       .mockResolvedValueOnce("task-1")
-      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(true)
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce(null);
     const user = userEvent.setup();
@@ -121,7 +123,45 @@ describe("ScheduledTasks interactions", () => {
     expect(await screen.findByText("正在运行…")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "停止运行" }));
     await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("cancel_scheduled_task", {}),
+      expect(invoke).toHaveBeenCalledWith("cancel_scheduled_task", {
+        id: task.id,
+      }),
     );
+  });
+
+  it("does not report a stop when the displayed task already ended", async () => {
+    invoke
+      .mockResolvedValueOnce([task])
+      .mockResolvedValueOnce(task.id)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce([task])
+      .mockResolvedValueOnce(null);
+    const onNotice = vi.fn();
+    const user = userEvent.setup();
+    render(<ScheduledTasks onClose={vi.fn()} onNotice={onNotice} />);
+
+    await user.click(await screen.findByRole("button", { name: "停止运行" }));
+    expect(screen.queryByText("正在运行…")).toBeNull();
+    expect(onNotice).not.toHaveBeenCalled();
+  });
+
+  it("ignores an obsolete load failure after a newer successful refresh", async () => {
+    let rejectOld!: (error: Error) => void;
+    const old = new Promise<never>((_resolve, reject) => {
+      rejectOld = reject;
+    });
+    const onNotice = vi.fn();
+    invoke.mockReturnValueOnce(old).mockResolvedValueOnce(null);
+    render(<ScheduledTasks onClose={vi.fn()} onNotice={onNotice} />);
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith("list_scheduled_tasks");
+      expect(listen).toHaveBeenCalled();
+    });
+
+    invoke.mockResolvedValueOnce([task]).mockResolvedValueOnce(null);
+    listen.mock.calls[0][1]();
+    expect(await screen.findByText(task.name)).toBeTruthy();
+    await act(async () => rejectOld(new Error("obsolete error")));
+    expect(screen.queryByText("obsolete error")).toBeNull();
   });
 });

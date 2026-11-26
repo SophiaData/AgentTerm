@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Local, LocalResult, NaiveTime, TimeZone};
+use chrono::{Local, NaiveTime, TimeZone};
 
 use crate::journal;
 use crate::projects::normalize_project_dir;
@@ -169,7 +169,7 @@ impl Scheduler {
         task.enabled = enabled;
         if enabled {
             task.approval_pending = false;
-            task.next_run_at_ms = initial_next_run(&effective_schedule(task), now_ms())?;
+            task.next_run_at_ms = next_run(&effective_schedule(task), now_ms())?;
         }
         let saved = task.clone();
         persist(&inner)?;
@@ -269,7 +269,7 @@ impl Scheduler {
             // A crash after this write can skip one occurrence, but can never
             // execute the same occurrence every 30 seconds.
             task.schedule = Some(schedule.clone());
-            task.next_run_at_ms = advance_next_run(&schedule, now)?;
+            task.next_run_at_ms = next_run(&schedule, now)?;
             let task_to_run = task.clone();
             persist(&inner)?;
             inner.running = true;
@@ -329,11 +329,11 @@ impl Scheduler {
         }
     }
 
-    /// Ask the running task (scheduled or manual) to stop its process tree.
-    /// Returns whether something was running.
-    pub fn cancel_run(&self) -> Result<bool, String> {
+    /// Ask the specified running task to stop its process tree.
+    /// A stale request must not stop another task that has since started.
+    pub fn cancel_run(&self, task_id: &str) -> Result<bool, String> {
         let inner = self.lock()?;
-        if !inner.running {
+        if !inner.running || inner.running_task != task_id {
             return Ok(false);
         }
         inner.cancel.store(true, Ordering::SeqCst);
@@ -430,7 +430,7 @@ fn normalize_draft(
         .filter(|task| effective_schedule(task) == draft.schedule)
         .map(|task| task.next_run_at_ms)
         .map(Ok)
-        .unwrap_or_else(|| initial_next_run(&draft.schedule, now))?;
+        .unwrap_or_else(|| next_run(&draft.schedule, now))?;
     let interval_minutes = match draft.schedule {
         ScheduleSpec::Interval { minutes } => minutes,
         ScheduleSpec::Daily { .. } => 1440,
@@ -475,16 +475,7 @@ fn effective_schedule(task: &ScheduledTask) -> ScheduleSpec {
     })
 }
 
-fn initial_next_run(schedule: &ScheduleSpec, now: u64) -> Result<u64, String> {
-    match schedule {
-        ScheduleSpec::Interval { minutes } => {
-            Ok(now.saturating_add(minutes.saturating_mul(60_000)))
-        }
-        ScheduleSpec::Daily { hour, minute } => next_daily(now, *hour, *minute),
-    }
-}
-
-fn advance_next_run(schedule: &ScheduleSpec, now: u64) -> Result<u64, String> {
+fn next_run(schedule: &ScheduleSpec, now: u64) -> Result<u64, String> {
     match schedule {
         ScheduleSpec::Interval { minutes } => {
             Ok(now.saturating_add(minutes.saturating_mul(60_000)))
@@ -511,8 +502,13 @@ fn next_daily_in<Tz: TimeZone>(
         .ok_or_else(|| "无法读取本地时间".to_string())?;
     let mut date = now.date_naive();
     for _ in 0..370 {
-        let local = timezone.from_local_datetime(&date.and_time(time));
-        if let Some(candidate_ms) = candidate_after(local, now_ms)? {
+        // Choose the first occurrence before comparing with now, so a clock
+        // that repeats during fall-back cannot schedule the same day twice.
+        let candidate = timezone
+            .from_local_datetime(&date.and_time(time))
+            .earliest()
+            .and_then(|value| u64::try_from(value.timestamp_millis()).ok());
+        if let Some(candidate_ms) = candidate.filter(|value| *value > now_ms) {
             return Ok(candidate_ms);
         }
         date = date
@@ -520,22 +516,6 @@ fn next_daily_in<Tz: TimeZone>(
             .ok_or_else(|| "无法计算下一次执行时间".to_string())?;
     }
     Err("无法计算下一次执行时间".into())
-}
-
-fn candidate_after<Tz: TimeZone>(
-    local: LocalResult<DateTime<Tz>>,
-    now_ms: u64,
-) -> Result<Option<u64>, String> {
-    let candidates = match local {
-        LocalResult::Single(candidate) => vec![candidate],
-        LocalResult::Ambiguous(first, second) => vec![first, second],
-        LocalResult::None => return Ok(None),
-    };
-    Ok(candidates
-        .into_iter()
-        .filter_map(|candidate| u64::try_from(candidate.timestamp_millis()).ok())
-        .filter(|candidate| *candidate > now_ms)
-        .min())
 }
 
 fn clean_text(value: &str, label: &str, limit: usize) -> Result<String, String> {
@@ -1023,6 +1003,23 @@ mod tests {
         assert_eq!(next.format("%H:%M").to_string(), "02:30");
     }
 
+    #[test]
+    fn daily_schedule_runs_only_once_when_the_local_clock_repeats() {
+        let timezone = chrono_tz::America::New_York;
+        let repeated = timezone.with_ymd_and_hms(2025, 11, 2, 1, 30, 0);
+        let first = repeated.earliest().unwrap().timestamp_millis() as u64;
+        let second = repeated.latest().unwrap().timestamp_millis() as u64;
+
+        assert_eq!(super::next_daily_in(timezone, first - 1, 1, 30), Ok(first));
+        let next_day = timezone
+            .with_ymd_and_hms(2025, 11, 3, 1, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert_eq!(super::next_daily_in(timezone, first, 1, 30), Ok(next_day));
+        assert_eq!(super::next_daily_in(timezone, second, 1, 30), Ok(next_day));
+    }
+
     fn draft(prompt: &str) -> ScheduledTaskDraft {
         ScheduledTaskDraft {
             name: "每日检查".into(),
@@ -1443,7 +1440,13 @@ mod tests {
             scheduler.running_task().unwrap().as_deref(),
             Some("task-running")
         );
-        assert!(scheduler.cancel_run().unwrap());
+        assert!(!scheduler.cancel_run("task-obsolete").unwrap());
+        assert!(
+            !scheduler
+                .cancel_flag()
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(scheduler.cancel_run("task-running").unwrap());
         assert!(
             scheduler
                 .cancel_flag()
@@ -1462,7 +1465,7 @@ mod tests {
             false,
         );
         assert!(scheduler.running_task().unwrap().is_none());
-        assert!(!scheduler.cancel_run().unwrap());
+        assert!(!scheduler.cancel_run("task-running").unwrap());
     }
 
     #[test]
@@ -1555,6 +1558,9 @@ pub fn scheduled_task_running(
 }
 
 #[tauri::command(async)]
-pub fn cancel_scheduled_task(state: tauri::State<'_, Scheduler>) -> Result<bool, String> {
-    state.cancel_run()
+pub fn cancel_scheduled_task(
+    state: tauri::State<'_, Scheduler>,
+    id: String,
+) -> Result<bool, String> {
+    state.cancel_run(&id)
 }

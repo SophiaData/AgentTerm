@@ -14,6 +14,7 @@ pub struct Project {
 #[derive(Debug, Default)]
 pub struct ProjectStore {
     pub projects: Vec<Project>,
+    pub load_error: Option<String>,
     /// Where this store persists. `None` means "use the real user config path".
     /// An explicit path lets tests isolate themselves completely, so running the
     /// suite can never touch the developer's real project list.
@@ -33,6 +34,7 @@ impl ProjectStore {
     pub fn load() -> Self {
         let mut store = Self {
             projects: Vec::new(),
+            load_error: None,
             path: config_path(),
         };
         store.read_into_memory();
@@ -45,6 +47,7 @@ impl ProjectStore {
     pub fn with_path(path: PathBuf) -> Self {
         let mut store = Self {
             projects: Vec::new(),
+            load_error: None,
             path: Some(path),
         };
         store.read_into_memory();
@@ -55,33 +58,42 @@ impl ProjectStore {
         let Some(path) = &self.path else {
             return;
         };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => {
+                self.load_error = Some("无法读取项目配置，已保留原文件".to_string());
+                return;
+            }
         };
         let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) else {
+            self.load_error = Some("项目配置损坏，已保留原文件；请修复或移除后重试".to_string());
+            return;
+        };
+        let Some(items) = data.get("projects").and_then(|value| value.as_array()) else {
+            self.load_error =
+                Some("项目配置格式无效，已保留原文件；请修复或移除后重试".to_string());
             return;
         };
 
-        self.projects = data
-            .get("projects")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        let path = item.get("path")?.as_str()?;
-                        let last_tool = item
-                            .get("last_tool")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string);
-                        Some(Project {
-                            path: PathBuf::from(path),
-                            last_tool,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut projects = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(path) = item.get("path").and_then(|value| value.as_str()) else {
+                self.load_error =
+                    Some("项目配置包含无效记录，已保留原文件；请修复或移除后重试".to_string());
+                self.projects.clear();
+                return;
+            };
+            let last_tool = item
+                .get("last_tool")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            projects.push(Project {
+                path: PathBuf::from(path),
+                last_tool,
+            });
+        }
+        self.projects = projects;
     }
 
     #[cfg(test)]
@@ -90,6 +102,9 @@ impl ProjectStore {
     }
 
     pub fn save(&self) -> Result<(), String> {
+        if let Some(error) = &self.load_error {
+            return Err(error.clone());
+        }
         let Some(path) = &self.path else {
             return Err("无法定位配置目录".to_string());
         };
@@ -235,6 +250,45 @@ mod tests {
         assert_eq!(reloaded.projects.len(), 1);
         assert!(reloaded.bound_path() == Some(bound.as_path()));
         let _ = std::fs::remove_file(&bound);
+    }
+
+    #[test]
+    fn damaged_config_is_reported_without_becoming_an_empty_store() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-store-damaged-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"{not-json").unwrap();
+        let store = ProjectStore::with_path(path.clone());
+        assert!(store.projects.is_empty());
+        assert!(store.load_error.is_some());
+        assert!(store.save().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not-json");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_project_record_blocks_overwriting_a_partly_valid_config() {
+        let path = std::env::temp_dir().join(format!(
+            "agentterm-store-bad-record-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let body = br#"{"version":1,"projects":[{"path":"/valid"},{"last_tool":null}]}"#;
+        std::fs::write(&path, body).unwrap();
+        let store = ProjectStore::with_path(path.clone());
+        assert!(store.projects.is_empty());
+        assert!(store.load_error.is_some());
+        assert!(store.save().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

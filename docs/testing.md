@@ -1,5 +1,11 @@
 # Testing policy
 
+## 2026-11-26 可靠性审查修复
+
+本轮在审查分支上修复并回归验证以下行为：同一会话 ID 的并发启动预留；每日任务在 DST 回拨时不重复执行；停止定时任务按任务 ID 校验；受控派发轮询成功后清除暂态读取错误；敏感赋值输入不自动写入会话标题；旧会话/目录响应不覆盖新状态；TUI 项目配置保存失败回滚；损坏 TUI 配置明确报错并阻止覆盖。
+
+`pnpm check`：14/14 项通过。前端 Vitest 21 文件、174 tests 全部通过；Rust AgentTerm 232 passed / 3 ignored，TUI 18 passed；TypeScript、ESLint、Prettier、Rust fmt、Clippy、Vite build 和模板契约均通过。验证使用 Windows 和单 worker/单测试线程；未执行本次改动的真实桌面 GUI、其他平台、打包与安装验收。
+
 ## rc.14 发布、安装与验收（2026-11-25～26）
 
 固定应用代码 `286cc0a913cbef3a060bed6e07312d497e3eb0b8`，PR #90 / #91 / #92 已合入。

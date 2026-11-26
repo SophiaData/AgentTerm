@@ -836,15 +836,24 @@ export default function TaskWorkbench({
     }
   }, []);
   const pollStatus = useCallback(async () => {
-    if (!mounted.current || statusPollInFlight.current) return;
+    if (
+      !mounted.current ||
+      statusPollInFlight.current ||
+      reading.current ||
+      mutation.current
+    )
+      return;
+    const request = order.current.next();
     statusPollInFlight.current = true;
     try {
       const next = await invoke<WorkbenchView>("workbench_snapshot");
-      if (mounted.current) {
+      if (mounted.current && order.current.current(request)) {
         setView((previous) => acceptSnapshot(previous, next));
+        setReadError(null);
       }
     } catch (cause) {
-      if (mounted.current) setReadError(message(cause));
+      if (mounted.current && order.current.current(request))
+        setReadError(message(cause));
     } finally {
       statusPollInFlight.current = false;
     }
