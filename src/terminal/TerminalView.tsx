@@ -18,6 +18,8 @@ type Props = {
     error: string | null,
   ) => void;
   onPromptLine?: (id: string, line: string) => void;
+  onOutputActivity?: (id: string) => void;
+  onUserInput?: (id: string) => void;
 };
 
 export default function TerminalView({
@@ -30,6 +32,8 @@ export default function TerminalView({
   onExit,
   onConnection,
   onPromptLine,
+  onOutputActivity,
+  onUserInput,
 }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const current = useRef({
@@ -40,6 +44,8 @@ export default function TerminalView({
     onExit,
     onConnection,
     onPromptLine,
+    onOutputActivity,
+    onUserInput,
   });
   current.current = {
     visible,
@@ -49,6 +55,8 @@ export default function TerminalView({
     onExit,
     onConnection,
     onPromptLine,
+    onOutputActivity,
+    onUserInput,
   };
   const controls = useRef<{
     focus: () => void;
@@ -194,7 +202,11 @@ export default function TerminalView({
         { listen, invoke },
         {
           output: (text) => {
-            if (!disposed) terminal.write(text);
+            if (disposed) return;
+            terminal.write(text);
+            if (localPhase === "ready" && text) {
+              current.current.onOutputActivity?.(session.id);
+            }
           },
           phase: (next, error) => {
             if (disposed) return;
@@ -234,6 +246,7 @@ export default function TerminalView({
           !current.current.busy
         ) {
           setClipboardProblem(null);
+          current.current.onUserInput?.(session.id);
           transport.send(text);
           for (const line of tracker.feed(text)) {
             current.current.onPromptLine?.(session.id, line);

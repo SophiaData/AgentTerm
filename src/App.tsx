@@ -22,6 +22,11 @@ import {
   recentClosedHistory,
 } from "./terminal/sessionHistory";
 import { useLauncher, type ActiveSession } from "./terminal/useLauncher";
+import {
+  activityLabel,
+  useSessionActivity,
+  type SessionActivity,
+} from "./terminal/useSessionActivity";
 import { useSessionHistory } from "./terminal/useSessionHistory";
 import { badgeLabel, detailText } from "./tools/types";
 import { useTools } from "./tools/useTools";
@@ -99,8 +104,23 @@ export default function App() {
   const [narrowLayout, setNarrowLayout] = useState(false);
   const [closeConfirmation, setCloseConfirmation] =
     useState<ActiveSession | null>(null);
-  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
+  type UpdateStatus = {
+    currentVersion: string;
+    latestVersion: string | null;
+    updateAvailable: boolean;
+    downloadUrl: string | null;
+    notes: string | null;
+    channel: string;
+    message: string;
+  };
+  type UpdateNotice =
+    | { kind: "status"; text: string; isError?: boolean }
+    | { kind: "available"; status: UpdateStatus }
+    | { kind: "downloading"; version: string };
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
   const [taskNotice, setTaskNotice] = useState<string | null>(null);
+  const activity = useSessionActivity(launcher.sessions, launcher.activeId);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
     projects.projects.find((p) => p.id === projectId) ?? projects.projects[0];
@@ -177,6 +197,56 @@ export default function App() {
     runningCount,
     reloadHistory,
   ]);
+  useEffect(() => {
+    if (updateNotice?.kind !== "status" || updateNotice.isError) return;
+    const timer = setTimeout(() => {
+      setUpdateNotice(null);
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [updateNotice]);
+
+  const handleCheckUpdate = async () => {
+    if (checkingUpdate || updateNotice?.kind === "downloading") return;
+    setCheckingUpdate(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const status = await invoke<UpdateStatus>("check_for_update");
+      if (!status.updateAvailable || !status.downloadUrl) {
+        setUpdateNotice({ kind: "status", text: status.message });
+        return;
+      }
+      setUpdateNotice({ kind: "available", status });
+    } catch (error: unknown) {
+      setUpdateNotice({
+        kind: "status",
+        text: error instanceof Error ? error.message : String(error),
+        isError: true,
+      });
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleInstallUpdate = async (status: UpdateStatus) => {
+    if (!status.downloadUrl || updateNotice?.kind === "downloading") return;
+    const targetVersion = status.latestVersion ?? "新版本";
+    setUpdateNotice({ kind: "downloading", version: targetVersion });
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("install_update", { downloadUrl: status.downloadUrl });
+      setUpdateNotice({
+        kind: "status",
+        text: `更新已下载，正在退出并安装 ${targetVersion}`,
+      });
+    } catch (error: unknown) {
+      setUpdateNotice({
+        kind: "status",
+        text: error instanceof Error ? error.message : String(error),
+        isError: true,
+      });
+    }
+  };
+
   const selectSession = (session: ActiveSession) => {
     const project = projects.projects.find(
       (p) => p.path === session.info.projectPath,
@@ -190,29 +260,40 @@ export default function App() {
     if (session.running) setCloseConfirmation(session);
     else void launcher.close(session.info.id);
   };
-  const sessionLink = (session: ActiveSession) => (
-    <button
-      type="button"
-      key={session.info.id}
-      className="workspace-session-link"
-      aria-current={launcher.activeId === session.info.id ? "true" : undefined}
-      onClick={() => selectSession(session)}
-      title={displayPath(session.info.projectPath)}
-    >
-      <span
-        className={`session-dot${session.statusUnknown ? " is-unknown" : session.running ? " is-running" : ""}`}
-        aria-hidden="true"
-      />
-      <span>{session.label}</span>
-      <small>
-        {session.statusUnknown
-          ? "状态未知"
-          : session.running
-            ? "运行中"
-            : "已结束"}
-      </small>
-    </button>
-  );
+  const sessionActivities: Record<string, SessionActivity> = {};
+  for (const s of launcher.sessions) {
+    sessionActivities[s.info.id] = activity.getActivity(s);
+  }
+  const sessionLink = (session: ActiveSession) => {
+    const state = sessionActivities[session.info.id] ?? "idle";
+    const dotClass = session.statusUnknown
+      ? " is-unknown"
+      : !session.running
+        ? ""
+        : state === "working"
+          ? " is-working"
+          : state === "done"
+            ? " is-done"
+            : " is-running";
+    return (
+      <button
+        type="button"
+        key={session.info.id}
+        className={`workspace-session-link${state === "done" ? " is-done" : ""}`}
+        aria-current={
+          launcher.activeId === session.info.id ? "true" : undefined
+        }
+        onClick={() => selectSession(session)}
+        title={displayPath(session.info.projectPath)}
+      >
+        <span className={`session-dot${dotClass}`} aria-hidden="true" />
+        <span>{session.label}</span>
+        <small>
+          {activityLabel(state, session.running, session.statusUnknown)}
+        </small>
+      </button>
+    );
+  };
 
   return (
     <main
@@ -368,48 +449,70 @@ export default function App() {
           ) : null}
         </section>
         <div className="sidebar-bottom">
-          {selectedProject ? (
+          {projects.projects.length ? (
             <details className="sidebar-details">
-              <summary>项目设置</summary>
-              <p>{displayPath(selectedProject.path)}</p>
-              {projects.pendingRemoval ? (
-                <div className="sidebar-removal">
-                  <p>
-                    移除“{projects.pendingRemoval.name}
-                    ”的列表记录，项目文件保留。
-                  </p>
-                  <button
-                    type="button"
-                    className="ghost-button"
-                    disabled={projectBusy}
-                    onClick={projects.cancelRemove}
-                  >
-                    取消
-                  </button>
-                  <button
-                    type="button"
-                    className="danger-button"
-                    disabled={projectBusy}
-                    onClick={() => void projects.confirmRemove()}
-                  >
-                    确认移除
-                  </button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  className="ghost-button"
-                  disabled={
-                    projectBusy ||
-                    launcher.sessions.some(
-                      (s) => s.info.projectPath === selectedProject.path,
-                    )
-                  }
-                  onClick={() => projects.requestRemove(selectedProject.id)}
-                >
-                  移除项目记录
-                </button>
-              )}
+              <summary>项目管理（{projects.projects.length}）</summary>
+              <ul className="sidebar-project-settings-list">
+                {projects.projects.map((project) => {
+                  const isCurrent = selectedProject?.id === project.id;
+                  const hasSessions = launcher.sessions.some(
+                    (s) => s.info.projectPath === project.path,
+                  );
+                  const removingThis =
+                    projects.pendingRemoval?.id === project.id;
+                  return (
+                    <li
+                      key={project.id}
+                      className={`sidebar-project-setting-item${isCurrent ? " is-current" : ""}`}
+                    >
+                      <div className="sidebar-project-setting-head">
+                        <strong>{project.name}</strong>
+                        {isCurrent ? (
+                          <span className="sidebar-current-badge">当前</span>
+                        ) : null}
+                      </div>
+                      <p title={displayPath(project.path)}>
+                        {displayPath(project.path)}
+                      </p>
+                      {removingThis ? (
+                        <div className="sidebar-removal">
+                          <p>移除“{project.name}”的列表记录，项目文件保留。</p>
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            disabled={projectBusy}
+                            onClick={projects.cancelRemove}
+                          >
+                            取消
+                          </button>
+                          <button
+                            type="button"
+                            className="danger-button"
+                            disabled={projectBusy}
+                            onClick={() => void projects.confirmRemove()}
+                          >
+                            确认移除
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          disabled={projectBusy || hasSessions}
+                          title={
+                            hasSessions
+                              ? "请先关闭该项目的已打开会话"
+                              : undefined
+                          }
+                          onClick={() => projects.requestRemove(project.id)}
+                        >
+                          移除项目记录
+                        </button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
             </details>
           ) : null}
           <p className="workspace-note">
@@ -492,43 +595,16 @@ export default function App() {
             <button
               type="button"
               className="ghost-button"
-              onClick={() => {
-                void (async () => {
-                  const { invoke } = await import("@tauri-apps/api/core");
-                  const status = await invoke<{
-                    currentVersion: string;
-                    latestVersion: string | null;
-                    updateAvailable: boolean;
-                    downloadUrl: string | null;
-                    notes: string | null;
-                    channel: string;
-                    message: string;
-                  }>("check_for_update");
-                  if (!status.updateAvailable || !status.downloadUrl) {
-                    setUpdateMessage(status.message);
-                    return;
-                  }
-                  const accepted = window.confirm(
-                    `发现 ${status.latestVersion}\n\n${status.notes ?? "无更新说明"}\n\n现在安装？`,
-                  );
-                  if (!accepted) return;
-                  setUpdateMessage("正在下载更新…");
-                  await invoke("install_update", {
-                    downloadUrl: status.downloadUrl,
-                  });
-                  setUpdateMessage(
-                    `更新已下载，正在退出并安装 ${status.latestVersion}`,
-                  );
-                })().catch((error: unknown) =>
-                  setUpdateMessage(
-                    error instanceof Error ? error.message : String(error),
-                  ),
-                );
-              }}
+              aria-label="检查更新"
+              disabled={checkingUpdate || updateNotice?.kind === "downloading"}
+              onClick={() => void handleCheckUpdate()}
             >
-              检查更新
+              {checkingUpdate
+                ? "检查中…"
+                : updateNotice?.kind === "downloading"
+                  ? "更新中…"
+                  : "检查更新"}
             </button>
-            {updateMessage ? <span role="status">{updateMessage}</span> : null}
             <button
               type="button"
               className="ghost-button workspace-icon-action"
@@ -605,7 +681,13 @@ export default function App() {
                       ? 0
                       : -1
                   }
-                  className="workspace-tab"
+                  className={`workspace-tab${
+                    sessionActivities[session.info.id] === "done"
+                      ? " is-done"
+                      : sessionActivities[session.info.id] === "working"
+                        ? " is-working"
+                        : ""
+                  }`}
                   title={displayPath(session.info.projectPath)}
                   onClick={() => selectSession(session)}
                   onKeyDown={(event) => {
@@ -636,10 +718,31 @@ export default function App() {
                   }}
                 >
                   <span
-                    className={`session-dot${session.statusUnknown ? " is-unknown" : session.running ? " is-running" : ""}`}
+                    className={`session-dot${
+                      session.statusUnknown
+                        ? " is-unknown"
+                        : !session.running
+                          ? ""
+                          : sessionActivities[session.info.id] === "working"
+                            ? " is-working"
+                            : sessionActivities[session.info.id] === "done"
+                              ? " is-done"
+                              : " is-running"
+                    }`}
                     aria-hidden="true"
                   />
                   <span className="workspace-tab-label">{session.label}</span>
+                  {session.running &&
+                  !session.statusUnknown &&
+                  sessionActivities[session.info.id] !== "idle" ? (
+                    <span
+                      className={`workspace-tab-state is-${sessionActivities[session.info.id]}`}
+                    >
+                      {sessionActivities[session.info.id] === "working"
+                        ? "执行中"
+                        : "已完成"}
+                    </span>
+                  ) : null}
                 </button>
                 <button
                   type="button"
@@ -701,6 +804,7 @@ export default function App() {
         ) : null}
         <SessionWorkspace
           sessions={launcher.sessions}
+          activities={sessionActivities}
           paneIds={launcher.paneIds}
           activeId={launcher.activeId}
           focusRequest={launcher.focusRequest}
@@ -718,6 +822,8 @@ export default function App() {
           onConnection={launcher.handleConnection}
           onRename={launcher.rename}
           onPromptLine={(id, line) => void launcher.autoName(id, line)}
+          onOutputActivity={activity.reportOutput}
+          onUserInput={activity.reportInput}
         />
         {!currentSession ? (
           <div className="workspace-start">
@@ -957,12 +1063,96 @@ export default function App() {
           onNotice={setTaskNotice}
         />
       ) : null}
-      {taskNotice ? (
-        <div className="workspace-task-notice" role="status">
-          {taskNotice}
-          <button type="button" onClick={() => setTaskNotice(null)}>
-            关闭
-          </button>
+      {taskNotice || updateNotice ? (
+        <div className="workspace-notices">
+          {updateNotice ? (
+            <section
+              className={`workspace-update-card${
+                updateNotice.kind === "status" && updateNotice.isError
+                  ? " is-error"
+                  : ""
+              }`}
+              role={
+                updateNotice.kind === "status" && updateNotice.isError
+                  ? "alert"
+                  : "status"
+              }
+              aria-label="版本更新"
+            >
+              {updateNotice.kind === "status" ? (
+                <div className="workspace-update-status-row">
+                  <div className="workspace-update-copy">
+                    <strong>
+                      {updateNotice.isError ? "检查更新失败" : "版本状态"}
+                    </strong>
+                    <p>{updateNotice.text}</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => setUpdateNotice(null)}
+                  >
+                    关闭
+                  </button>
+                </div>
+              ) : updateNotice.kind === "downloading" ? (
+                <div className="workspace-update-status-row">
+                  <div className="workspace-update-copy">
+                    <strong>正在准备更新</strong>
+                    <p>正在下载并校验 {updateNotice.version}…</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="workspace-update-available">
+                  <div className="workspace-update-head">
+                    <strong>
+                      发现新版本 {updateNotice.status.latestVersion}
+                    </strong>
+                    <span className="workspace-update-channel">
+                      {updateNotice.status.channel === "stable"
+                        ? "正式版"
+                        : "测试版"}
+                    </span>
+                  </div>
+                  <p className="workspace-update-versions">
+                    当前 {updateNotice.status.currentVersion} →{" "}
+                    {updateNotice.status.latestVersion}
+                  </p>
+                  {updateNotice.status.notes ? (
+                    <pre className="workspace-update-notes">
+                      {updateNotice.status.notes}
+                    </pre>
+                  ) : null}
+                  <div className="workspace-update-actions">
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={() => setUpdateNotice(null)}
+                    >
+                      暂不更新
+                    </button>
+                    <button
+                      type="button"
+                      className="primary-button"
+                      onClick={() =>
+                        void handleInstallUpdate(updateNotice.status)
+                      }
+                    >
+                      立即更新
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+          ) : null}
+          {taskNotice ? (
+            <div className="workspace-task-notice" role="status">
+              {taskNotice}
+              <button type="button" onClick={() => setTaskNotice(null)}>
+                关闭
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
       {recordsOpen ? (

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import SessionPanel from "./SessionPanel";
 import type { ActiveSession, RenameResult } from "./useLauncher";
+import type { SessionActivity } from "./useSessionActivity";
 
 type Props = {
   sessions: ActiveSession[];
+  activities?: Record<string, SessionActivity>;
   paneIds: string[];
   activeId: string | null;
   focusRequest: number;
@@ -17,6 +19,8 @@ type Props = {
   ) => void;
   onRename: (id: string, title: string) => Promise<RenameResult>;
   onPromptLine: (id: string, line: string) => void;
+  onOutputActivity?: (id: string) => void;
+  onUserInput?: (id: string) => void;
 };
 
 export function clampSplitRatio(value: number): number {
@@ -26,6 +30,7 @@ export function clampSplitRatio(value: number): number {
 /** Every session keeps the same parent/key in either layout, including hidden tabs. */
 export default function SessionWorkspace({
   sessions,
+  activities,
   paneIds,
   activeId,
   focusRequest,
@@ -36,6 +41,8 @@ export default function SessionWorkspace({
   onConnection,
   onRename,
   onPromptLine,
+  onOutputActivity,
+  onUserInput,
 }: Props) {
   const host = useRef<HTMLDivElement | null>(null);
   const [ratio, setRatio] = useState(50);
@@ -115,6 +122,7 @@ export default function SessionWorkspace({
               focusRequest={focusRequest}
               running={session.running}
               statusUnknown={session.statusUnknown}
+              activity={activities?.[session.info.id] ?? "idle"}
               exitReason={session.exitReason}
               busy={closingId === session.info.id}
               closeError={session.closeError}
@@ -123,6 +131,8 @@ export default function SessionWorkspace({
               onConnection={onConnection}
               onRename={(title) => onRename(session.info.id, title)}
               onPromptLine={onPromptLine}
+              onOutputActivity={onOutputActivity}
+              onUserInput={onUserInput}
             />
           </div>
         );
