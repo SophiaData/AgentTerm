@@ -15,6 +15,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 const swProps = vi.hoisted(() => ({
   latest: null as null | {
     activities?: Record<string, string>;
+    themeId?: string;
     onOutputActivity?: (id: string, text?: string) => void;
     onUserInput?: (id: string) => void;
   },
@@ -22,6 +23,7 @@ const swProps = vi.hoisted(() => ({
 vi.mock("./terminal/SessionWorkspace", () => ({
   default: (props: {
     activities?: Record<string, string>;
+    themeId?: string;
     onOutputActivity?: (id: string, text?: string) => void;
     onUserInput?: (id: string) => void;
   }) => {
@@ -97,6 +99,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
+  delete document.documentElement.dataset.theme;
   vi.restoreAllMocks();
   invoke.mockReset();
 });
@@ -407,5 +411,26 @@ describe("App interactions", () => {
 
     await user.click(screen.getByRole("button", { name: "暂不恢复" }));
     expect(dismiss).toHaveBeenCalledOnce();
+  });
+
+  it("switches interface skins, forwards themeId to sessions, and persists choice", async () => {
+    mockLauncher();
+    const user = userEvent.setup();
+    const firstRender = render(<App />);
+
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    await user.click(screen.getByRole("button", { name: /切换皮肤/ }));
+    await user.click(screen.getByRole("menuitemradio", { name: /清爽浅白/ }));
+
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(localStorage.getItem("agentterm-theme")).toBe("light");
+    expect(swProps.latest?.themeId).toBe("light");
+
+    firstRender.unmount();
+    render(<App />);
+    await waitFor(() =>
+      expect(document.documentElement.dataset.theme).toBe("light"),
+    );
+    expect(swProps.latest?.themeId).toBe("light");
   });
 });

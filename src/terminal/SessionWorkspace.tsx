@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import SessionPanel from "./SessionPanel";
+import type { ThemeId } from "../theme";
 import type { ActiveSession, RenameResult } from "./useLauncher";
 import type { SessionActivity } from "./useSessionActivity";
 
 type Props = {
   sessions: ActiveSession[];
   activities?: Record<string, SessionActivity>;
+  themeId?: ThemeId;
   paneIds: string[];
   activeId: string | null;
   focusRequest: number;
@@ -31,6 +33,7 @@ export function clampSplitRatio(value: number): number {
 export default function SessionWorkspace({
   sessions,
   activities,
+  themeId,
   paneIds,
   activeId,
   focusRequest,
@@ -123,6 +126,7 @@ export default function SessionWorkspace({
               running={session.running}
               statusUnknown={session.statusUnknown}
               activity={activities?.[session.info.id] ?? "idle"}
+              themeId={themeId}
               exitReason={session.exitReason}
               busy={closingId === session.info.id}
               closeError={session.closeError}

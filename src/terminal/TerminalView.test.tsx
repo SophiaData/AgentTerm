@@ -8,14 +8,19 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getThemePreset } from "../theme";
 import TerminalView from "./TerminalView";
 import { connectSession } from "./sessionTransport";
 
 const mocks = vi.hoisted(() => ({
   readText: vi.fn(async () => "合成粘贴文本\n第二行"),
   writeText: vi.fn<(text: string) => Promise<void>>(async () => {}),
+  initOptions: null as null | Record<string, unknown>,
   terminal: {
-    options: { disableStdin: true },
+    options: { disableStdin: true } as {
+      disableStdin: boolean;
+      theme?: unknown;
+    },
     rows: 24,
     cols: 80,
     getSelection: vi.fn(() => "合成选中文字"),
@@ -35,7 +40,8 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
-    constructor() {
+    constructor(opts?: Record<string, unknown>) {
+      mocks.initOptions = opts ?? null;
       return mocks.terminal;
     }
   },
@@ -71,6 +77,8 @@ const props = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.initOptions = null;
+  mocks.terminal.options = { disableStdin: true };
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -192,5 +200,19 @@ describe("terminal clipboard wiring", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("applies initial theme and updates terminal options live without reconnecting", async () => {
+    const { rerender } = render(<TerminalView {...props} themeId="nord" />);
+    await waitFor(() => expect(connectSession).toHaveBeenCalledOnce());
+    expect(mocks.initOptions?.theme).toEqual(getThemePreset("nord").terminal);
+
+    rerender(<TerminalView {...props} themeId="light" />);
+    await waitFor(() =>
+      expect(mocks.terminal.options.theme).toEqual(
+        getThemePreset("light").terminal,
+      ),
+    );
+    expect(connectSession).toHaveBeenCalledOnce();
   });
 });

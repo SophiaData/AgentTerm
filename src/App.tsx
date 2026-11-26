@@ -8,6 +8,14 @@ import {
 } from "react";
 import { PRODUCT_NAME } from "./meta";
 import { loadStoredLayout, saveStoredLayout } from "./layout";
+import {
+  THEMES,
+  applyDocumentTheme,
+  getThemePreset,
+  loadStoredTheme,
+  saveStoredTheme,
+  type ThemeId,
+} from "./theme";
 import TaskWorkbench from "./TaskWorkbench";
 import ProjectFiles from "./files/ProjectFiles";
 import ScheduledTasks from "./schedule/ScheduledTasks";
@@ -116,6 +124,9 @@ export default function App() {
   const [sideWidth, setSideWidth] = useState(390);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [narrowLayout, setNarrowLayout] = useState(false);
+  const [themeId, setThemeId] = useState<ThemeId>("dark");
+  const [themeMenuOpen, setThemeMenuOpen] = useState(false);
+  const themePickerRef = useRef<HTMLDivElement | null>(null);
   const [closeConfirmation, setCloseConfirmation] =
     useState<ActiveSession | null>(null);
   type UpdateNotice =
@@ -157,6 +168,9 @@ export default function App() {
   const closeTriggerFocus = useRef<HTMLElement | null>(null);
   const reloadHistory = history.reload;
   useEffect(() => {
+    const storedTheme = loadStoredTheme();
+    setThemeId(storedTheme);
+    applyDocumentTheme(storedTheme);
     const layout = loadStoredLayout();
     if (!layout) return;
     setSidebarWidth(layout.sidebarWidth);
@@ -164,6 +178,36 @@ export default function App() {
     setFilesOpen(layout.filesOpen);
     if (layout.projectId) setProjectId(layout.projectId);
   }, []);
+  useEffect(() => {
+    applyDocumentTheme(themeId);
+  }, [themeId]);
+  useEffect(() => {
+    if (!themeMenuOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (
+        themePickerRef.current &&
+        event.target instanceof Node &&
+        !themePickerRef.current.contains(event.target)
+      ) {
+        setThemeMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setThemeMenuOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [themeMenuOpen]);
+  function selectTheme(nextTheme: ThemeId) {
+    setThemeId(nextTheme);
+    saveStoredTheme(nextTheme);
+    applyDocumentTheme(nextTheme);
+    setThemeMenuOpen(false);
+  }
   useEffect(() => {
     const media = window.matchMedia("(max-width: 900px)");
     const update = () => {
@@ -753,6 +797,63 @@ export default function App() {
             >
               {launcher.paneIds.length === 2 ? "返回单屏" : "分屏查看"}
             </button>
+            <div className="workspace-theme-picker" ref={themePickerRef}>
+              <button
+                type="button"
+                className="ghost-button workspace-theme-trigger"
+                aria-haspopup="menu"
+                aria-expanded={themeMenuOpen}
+                aria-label={`切换皮肤，当前：${getThemePreset(themeId).name}`}
+                title={`皮肤：${getThemePreset(themeId).name}`}
+                onClick={() => setThemeMenuOpen((open) => !open)}
+              >
+                <span
+                  className="workspace-theme-swatch"
+                  style={{ background: getThemePreset(themeId).swatch }}
+                  aria-hidden="true"
+                />
+                <span>皮肤</span>
+              </button>
+              {themeMenuOpen ? (
+                <div
+                  className="workspace-theme-menu"
+                  role="menu"
+                  aria-label="选择界面皮肤"
+                >
+                  {THEMES.map((theme) => {
+                    const active = theme.id === themeId;
+                    return (
+                      <button
+                        key={theme.id}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={active}
+                        className="workspace-theme-option"
+                        onClick={() => selectTheme(theme.id)}
+                      >
+                        <span
+                          className="workspace-theme-swatch"
+                          style={{ background: theme.swatch }}
+                          aria-hidden="true"
+                        />
+                        <span className="workspace-theme-option-copy">
+                          <strong>{theme.name}</strong>
+                          <small>{theme.description}</small>
+                        </span>
+                        {active ? (
+                          <span
+                            className="workspace-theme-check"
+                            aria-hidden="true"
+                          >
+                            ✓
+                          </span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
             <button
               type="button"
               className="ghost-button"
@@ -1132,6 +1233,7 @@ export default function App() {
         <SessionWorkspace
           sessions={launcher.sessions}
           activities={sessionActivities}
+          themeId={themeId}
           paneIds={launcher.paneIds}
           activeId={launcher.activeId}
           focusRequest={launcher.focusRequest}

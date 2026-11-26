@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { DEFAULT_THEME_ID, getThemePreset, type ThemeId } from "../theme";
 import { createPromptLineTracker } from "./sessionNaming";
 import { connectSession, type ConnectionPhase } from "./sessionTransport";
 import { createTerminalClipboard } from "./terminalClipboard";
@@ -11,6 +12,7 @@ type Props = {
   focusRequest: number;
   running: boolean;
   busy: boolean;
+  themeId?: ThemeId;
   onExit: (id: string, reason: string) => void;
   onConnection: (
     id: string,
@@ -29,6 +31,7 @@ export default function TerminalView({
   focusRequest,
   running,
   busy,
+  themeId = DEFAULT_THEME_ID,
   onExit,
   onConnection,
   onPromptLine,
@@ -41,6 +44,7 @@ export default function TerminalView({
     focused,
     running,
     busy,
+    themeId,
     onExit,
     onConnection,
     onPromptLine,
@@ -52,6 +56,7 @@ export default function TerminalView({
     focused,
     running,
     busy,
+    themeId,
     onExit,
     onConnection,
     onPromptLine,
@@ -66,6 +71,7 @@ export default function TerminalView({
     copy: () => Promise<void>;
     paste: () => Promise<void>;
     invalidatePaste: () => void;
+    setTheme: (themeId: ThemeId) => void;
   } | null>(null);
   const [phase, setPhase] = useState<ConnectionPhase>("connecting");
   const [problem, setProblem] = useState<string | null>(null);
@@ -106,12 +112,7 @@ export default function TerminalView({
         scrollback: 5000,
         cursorBlink: true,
         disableStdin: true,
-        theme: {
-          background: "#0d1117",
-          foreground: "#e6edf3",
-          cursor: "#8cdec2",
-          selectionBackground: "#26404f",
-        },
+        theme: getThemePreset(current.current.themeId).terminal,
       });
       cleanups.push(() => terminal.dispose());
       const fit = new FitAddon();
@@ -192,6 +193,9 @@ export default function TerminalView({
         copy: clipboard.copy,
         paste: clipboard.paste,
         invalidatePaste: clipboard.invalidate,
+        setTheme: (nextThemeId: ThemeId) => {
+          terminal.options.theme = getThemePreset(nextThemeId).terminal;
+        },
       };
       const observer = new ResizeObserver(layout);
       observer.observe(hostRef.current);
@@ -284,6 +288,10 @@ export default function TerminalView({
       controls.current?.layout();
     }
   }, [visible, focused, running, busy]);
+
+  useEffect(() => {
+    controls.current?.setTheme(themeId);
+  }, [themeId]);
 
   useEffect(() => {
     if (current.current.visible && current.current.focused)

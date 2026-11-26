@@ -3,6 +3,7 @@ import { displayPath } from "../projects/displayPath";
 import TerminalView from "./TerminalView";
 import { SESSION_TITLE_MAX_CHARS, normalizeManualTitle } from "./sessionNaming";
 import { sessionTitle, type SessionInfo } from "./types";
+import type { ThemeId } from "../theme";
 import type { RenameResult } from "./useLauncher";
 import { activityLabel, type SessionActivity } from "./useSessionActivity";
 
@@ -28,6 +29,7 @@ type Props = {
   onPromptLine: (id: string, line: string) => void;
   onOutputActivity?: (id: string) => void;
   onUserInput?: (id: string) => void;
+  themeId?: ThemeId;
 };
 
 export default function SessionPanel({
@@ -39,6 +41,7 @@ export default function SessionPanel({
   running,
   statusUnknown,
   activity = "idle",
+  themeId,
   exitReason,
   busy,
   closeError,
@@ -216,6 +219,7 @@ export default function SessionPanel({
         focusRequest={focusRequest}
         running={running}
         busy={busy}
+        themeId={themeId}
         onExit={onExit}
         onConnection={onConnection}
         onPromptLine={onPromptLine}
