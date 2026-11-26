@@ -52,6 +52,7 @@ pub fn run() {
         .manage(task_commands::TaskLedgerState::default())
         .manage(scheduled_tasks::Scheduler::default())
         .manage(schedule_mcp::ScheduleMcp::default())
+        .manage(updates::UpdateManager::default())
         .invoke_handler(tauri::generate_handler![
             tools::detect_tools,
             projects::list_projects,
@@ -94,7 +95,12 @@ pub fn run() {
             scheduled_tasks::scheduled_task_running,
             scheduled_tasks::cancel_scheduled_task,
             updates::check_for_update,
-            updates::install_update
+            updates::get_update_activity,
+            updates::download_update,
+            updates::install_update,
+            updates::get_update_recovery,
+            updates::consume_update_recovery_session,
+            updates::dismiss_update_recovery
         ])
         .setup(|app| {
             tray::install_tray(app)?;
@@ -113,6 +119,9 @@ pub fn run() {
                 .map_err(std::io::Error::other)?;
             app.state::<scheduled_tasks::Scheduler>()
                 .configure(directory.join("agentterm-scheduled-tasks.json"))
+                .map_err(std::io::Error::other)?;
+            app.state::<updates::UpdateManager>()
+                .configure_recovery(directory.join("agentterm-update-recovery.json"))
                 .map_err(std::io::Error::other)?;
             let scheduler = app.state::<scheduled_tasks::Scheduler>().handle();
             app.state::<schedule_mcp::ScheduleMcp>()

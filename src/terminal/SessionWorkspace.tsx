@@ -19,7 +19,7 @@ type Props = {
   ) => void;
   onRename: (id: string, title: string) => Promise<RenameResult>;
   onPromptLine: (id: string, line: string) => void;
-  onOutputActivity?: (id: string) => void;
+  onOutputActivity?: (id: string, text?: string) => void;
   onUserInput?: (id: string) => void;
 };
 

@@ -506,4 +506,31 @@ describe("independent CLI sessions", () => {
     expect(store.getSnapshot().sessions[0].label).toBe("用户手动命名");
     expect(store.getSnapshot().sessions[0].titleSource).toBe("manual");
   });
+
+  it("resumes a session with cliSessionId and preserves restored title against autoName", async () => {
+    const { store, invoke } = fixture();
+    const ok = await store.start(project, tool, {
+      resume: true,
+      cliSessionId: "01234567-89ab-4cde-8123-456789abcdef",
+      title: "更新前未完成的分析",
+    });
+    expect(ok).toBe(true);
+    expect(invoke).toHaveBeenCalledWith(
+      "start_session",
+      expect.objectContaining({
+        toolId: "claude",
+        projectPath: project.path,
+        resume: true,
+        cliSessionId: "01234567-89ab-4cde-8123-456789abcdef",
+        title: "更新前未完成的分析",
+      }),
+    );
+    const restored = store.getSnapshot().sessions[0];
+    expect(restored.label).toBe("更新前未完成的分析");
+    expect(restored.titleSource).toBe("manual");
+
+    await store.autoName(restored.info.id, "新的问题不应覆盖已恢复的标题");
+    expect(store.getSnapshot().sessions[0].label).toBe("更新前未完成的分析");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
 });

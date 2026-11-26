@@ -1351,6 +1351,7 @@ mod tests {
                 tool_name: "Claude Code".into(),
                 project_path,
                 title: None,
+                cli_session_id: None,
             },
         )
     }

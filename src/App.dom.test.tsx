@@ -8,20 +8,21 @@ import * as launcherModule from "./terminal/useLauncher";
 import * as historyModule from "./terminal/useSessionHistory";
 import * as toolsModule from "./tools/useTools";
 import * as projectsModule from "./projects/useProjects";
+import * as updateRecoveryModule from "./updates/useUpdateRecovery";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 const swProps = vi.hoisted(() => ({
   latest: null as null | {
     activities?: Record<string, string>;
-    onOutputActivity?: (id: string) => void;
+    onOutputActivity?: (id: string, text?: string) => void;
     onUserInput?: (id: string) => void;
   },
 }));
 vi.mock("./terminal/SessionWorkspace", () => ({
   default: (props: {
     activities?: Record<string, string>;
-    onOutputActivity?: (id: string) => void;
+    onOutputActivity?: (id: string, text?: string) => void;
     onUserInput?: (id: string) => void;
   }) => {
     swProps.latest = props;
@@ -84,6 +85,14 @@ beforeEach(() => {
     error: null,
     reload: vi.fn(),
   });
+  vi.spyOn(updateRecoveryModule, "useUpdateRecovery").mockReturnValue({
+    recovery: null,
+    loading: false,
+    error: null,
+    reload: vi.fn(),
+    consumeSession: vi.fn(),
+    dismiss: vi.fn(),
+  });
 });
 
 afterEach(() => {
@@ -92,23 +101,28 @@ afterEach(() => {
   invoke.mockReset();
 });
 
-function mockLauncher(close = vi.fn()) {
+function mockLauncher(
+  close = vi.fn(),
+  sessions = [session],
+  start = vi.fn(async () => true),
+) {
+  const active = sessions[0] ?? null;
   vi.spyOn(launcherModule, "useLauncher").mockReturnValue({
-    sessions: [session],
-    activeId: session.info.id,
-    paneIds: [session.info.id],
+    sessions,
+    activeId: active?.info.id ?? null,
+    paneIds: active ? [active.info.id] : [],
     focusRequest: 0,
     starting: false,
     closingId: null,
     startError: null,
     busy: false,
-    session,
+    session: active,
     select: vi.fn(),
     focus: vi.fn(),
     split: vi.fn(),
     single: vi.fn(),
     showLauncher: vi.fn(),
-    start: vi.fn(),
+    start,
     close,
     handleExit: vi.fn(),
     handleConnection: vi.fn(),
@@ -116,12 +130,12 @@ function mockLauncher(close = vi.fn()) {
     rename: vi.fn(),
     autoName: vi.fn(),
   });
-  return close;
+  return { close, start };
 }
 
 describe("App interactions", () => {
   it("requires confirmation before closing a running tab and supports Escape", async () => {
-    const close = mockLauncher();
+    const { close } = mockLauncher();
     const user = userEvent.setup();
     render(<App />);
 
@@ -159,7 +173,7 @@ describe("App interactions", () => {
   });
 
   it("renders an inline update card when a new version is available", async () => {
-    mockLauncher();
+    mockLauncher(vi.fn(), []);
     invoke
       .mockResolvedValueOnce({
         currentVersion: "0.2.0-rc.14",
@@ -170,7 +184,16 @@ describe("App interactions", () => {
         channel: "prerelease",
         message: "发现新版本 0.2.0-rc.15",
       })
-      .mockResolvedValueOnce(undefined);
+      .mockResolvedValueOnce({
+        liveSessions: [],
+        dispatchActive: false,
+        scheduledTaskId: null,
+        hasActiveWork: false,
+      })
+      .mockResolvedValueOnce({
+        status: "installing",
+        version: "0.2.0-rc.15",
+      });
     const user = userEvent.setup();
     render(<App />);
     await user.click(screen.getByRole("button", { name: "检查更新" }));
@@ -180,6 +203,8 @@ describe("App interactions", () => {
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("install_update", {
         downloadUrl: "https://example.com/setup.exe",
+        latestVersion: "0.2.0-rc.15",
+        allowStopActive: false,
       }),
     );
   });
@@ -217,19 +242,170 @@ describe("App interactions", () => {
     expect(requestRemove).toHaveBeenCalledWith("project-2");
   });
 
-  it("shows working and completed badges on session tabs", async () => {
+  it("shows streaming output badge on session tabs and settles to running without claiming completed", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       mockLauncher();
       render(<App />);
       expect(swProps.latest?.onOutputActivity).toBeTruthy();
-      swProps.latest?.onOutputActivity?.(session.info.id);
-      expect(await screen.findAllByText("执行中")).toHaveLength(2);
+      swProps.latest?.onOutputActivity?.(session.info.id, "正在输出…");
+      expect(await screen.findAllByText("输出中")).toHaveLength(2);
       await waitFor(() => {}, { timeout: 10 });
-      vi.advanceTimersByTime(2500);
-      expect(await screen.findAllByText("已完成")).toHaveLength(2);
+      vi.advanceTimersByTime(4000);
+      await waitFor(() => expect(screen.queryByText("输出中")).toBeNull());
+      expect(screen.queryByText("已完成")).toBeNull();
+      expect(screen.getByText("运行中")).toBeTruthy();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("detects running sessions before updating and allows download-only without exiting", async () => {
+    mockLauncher();
+    invoke
+      .mockResolvedValueOnce({
+        currentVersion: "0.2.0-rc.14",
+        latestVersion: "0.2.0-rc.15",
+        updateAvailable: true,
+        downloadUrl:
+          "https://github.com/SophiaData/AgentTerm/releases/download/v0.2.0-rc.15/AgentTerm-0.2.0-rc.15-windows-x64-setup.exe",
+        notes: "修复恢复问题",
+        channel: "pre-release",
+        message: "发现测试更新 0.2.0-rc.15",
+      })
+      .mockResolvedValueOnce({
+        liveSessions: [session.info],
+        dispatchActive: false,
+        scheduledTaskId: null,
+        hasActiveWork: true,
+      })
+      .mockResolvedValueOnce({
+        downloadUrl:
+          "https://github.com/SophiaData/AgentTerm/releases/download/v0.2.0-rc.15/AgentTerm-0.2.0-rc.15-windows-x64-setup.exe",
+        latestVersion: "0.2.0-rc.15",
+        ready: true,
+      });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "检查更新" }));
+
+    const card = await screen.findByRole("status", { name: "版本更新" });
+    expect(card.textContent).toContain("运行中的终端会话（1 个）");
+
+    await user.click(
+      screen.getByRole("button", { name: "仅下载安装包（稍后安装）" }),
+    );
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("download_update", {
+        downloadUrl:
+          "https://github.com/SophiaData/AgentTerm/releases/download/v0.2.0-rc.15/AgentTerm-0.2.0-rc.15-windows-x64-setup.exe",
+        latestVersion: "0.2.0-rc.15",
+      }),
+    );
+    expect(invoke).not.toHaveBeenCalledWith(
+      "install_update",
+      expect.anything(),
+    );
+    expect(
+      await screen.findByRole("button", { name: "安装 0.2.0-rc.15" }),
+    ).toBeTruthy();
+  });
+
+  it("blocks exit when active work appears during download", async () => {
+    mockLauncher(vi.fn(), []);
+    invoke
+      .mockResolvedValueOnce({
+        currentVersion: "0.2.0-rc.14",
+        latestVersion: "0.2.0-rc.15",
+        updateAvailable: true,
+        downloadUrl:
+          "https://github.com/SophiaData/AgentTerm/releases/download/v0.2.0-rc.15/AgentTerm-0.2.0-rc.15-windows-x64-setup.exe",
+        notes: "修复恢复问题",
+        channel: "pre-release",
+        message: "发现测试更新 0.2.0-rc.15",
+      })
+      .mockResolvedValueOnce({
+        liveSessions: [],
+        dispatchActive: false,
+        scheduledTaskId: null,
+        hasActiveWork: false,
+      })
+      .mockResolvedValueOnce({
+        status: "blocked",
+        installerReady: true,
+        activity: {
+          liveSessions: [],
+          dispatchActive: true,
+          scheduledTaskId: "nightly-job",
+          hasActiveWork: true,
+        },
+      });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "检查更新" }));
+    await user.click(await screen.findByRole("button", { name: "立即更新" }));
+
+    const card = await screen.findByRole("status", { name: "版本更新" });
+    expect(card.textContent).toContain("已就绪，当前仍有任务运行");
+    expect(card.textContent).toContain("任务工作台中有正在执行的受控任务");
+    expect(card.textContent).toContain("定时任务（nightly-job）正在执行");
+    expect(
+      screen.getByRole("button", { name: "保存会话并立即更新" }),
+    ).toBeTruthy();
+  });
+
+  it("recovers interrupted sessions and surfaces task notices after an update", async () => {
+    const { start } = mockLauncher(vi.fn(), []);
+    const consumeSession = vi.fn(async () => {});
+    const dismiss = vi.fn(async () => {});
+    vi.spyOn(updateRecoveryModule, "useUpdateRecovery").mockReturnValue({
+      recovery: {
+        createdAtMs: 1_763_650_000_000,
+        targetVersion: "0.2.0-rc.15",
+        sessions: [
+          {
+            id: "old-s1",
+            toolId: "claude",
+            toolName: "Claude Code",
+            projectPath: "E:\\AgentTerm",
+            title: "修复更新恢复",
+            cliSessionId: "01234567-89ab-4cde-8123-456789abcdef",
+          },
+        ],
+        hadActiveDispatch: true,
+        interruptedScheduledTaskId: "daily-check",
+      },
+      loading: false,
+      error: null,
+      reload: vi.fn(),
+      consumeSession,
+      dismiss,
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    const banner = screen.getByRole("region", { name: "更新后恢复" });
+    expect(banner.textContent).toContain("应用已更新至 0.2.0-rc.15");
+    expect(banner.textContent).toContain("修复更新恢复");
+    expect(banner.textContent).toContain("受控任务正在执行");
+    expect(banner.textContent).toContain("daily-check");
+
+    await user.click(screen.getByRole("button", { name: "全部恢复并继续" }));
+    expect(start).toHaveBeenCalledWith(
+      { id: "project-1", name: "AgentTerm", path: "E:\\AgentTerm" },
+      expect.objectContaining({ id: "claude" }),
+      {
+        resume: true,
+        cliSessionId: "01234567-89ab-4cde-8123-456789abcdef",
+        title: "修复更新恢复",
+      },
+    );
+    expect(consumeSession).toHaveBeenCalledWith("old-s1");
+
+    await user.click(screen.getByRole("button", { name: "暂不恢复" }));
+    expect(dismiss).toHaveBeenCalledOnce();
   });
 });

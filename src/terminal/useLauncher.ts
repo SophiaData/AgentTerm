@@ -10,6 +10,12 @@ import { DEFAULT_ROWS, DEFAULT_COLS } from "./defaults";
 
 export type TitleSource = "default" | "auto" | "manual";
 
+export type StartOptions = {
+  resume?: boolean;
+  cliSessionId?: string | null;
+  title?: string | null;
+};
+
 export type RenameResult =
   { ok: true; title: string } | { ok: false; error: string };
 
@@ -118,8 +124,12 @@ export function createSessionStore(invoke: Invoke) {
   };
   const showLauncher = () => update({ activeId: null, startError: null });
 
-  const start = async (project: Project, tool: ToolStatus) => {
-    if (operation) return;
+  const start = async (
+    project: Project,
+    tool: ToolStatus,
+    options?: StartOptions,
+  ): Promise<boolean> => {
+    if (operation) return false;
     operation = true;
     mutationEpoch += 1;
     update({ starting: true, startError: null });
@@ -131,11 +141,18 @@ export function createSessionStore(invoke: Invoke) {
         projectPath: project.path,
         rows: DEFAULT_ROWS,
         cols: DEFAULT_COLS,
+        ...(options?.resume ? { resume: true } : {}),
+        ...(options?.cliSessionId
+          ? { cliSessionId: options.cliSessionId }
+          : {}),
+        ...(options?.title?.trim() ? { title: options.title.trim() } : {}),
       });
+      const resolvedTitle =
+        info.title?.trim() || options?.title?.trim() || null;
       const next: ActiveSession = {
-        info,
-        label: info.title?.trim() || `${tool.name} · ${++sequence}`,
-        titleSource: info.title?.trim() ? "manual" : "default",
+        info: resolvedTitle ? { ...info, title: resolvedTitle } : info,
+        label: resolvedTitle || `${tool.name} · ${++sequence}`,
+        titleSource: resolvedTitle ? "manual" : "default",
         running: true,
         statusUnknown: false,
         exitReason: null,
@@ -143,8 +160,10 @@ export function createSessionStore(invoke: Invoke) {
       };
       update({ sessions: [...state.sessions, next] });
       select(info.id);
+      return true;
     } catch (error) {
       update({ startError: `无法启动会话：${errorMessage(error)}` });
+      return false;
     } finally {
       operation = false;
       update({ starting: false });

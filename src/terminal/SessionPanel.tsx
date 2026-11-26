@@ -149,9 +149,7 @@ export default function SessionPanel({
                   ? "badge-attention"
                   : activity === "working"
                     ? "badge-working"
-                    : activity === "done"
-                      ? "badge-done"
-                      : "badge-installed"
+                    : "badge-installed"
             }`}
           >
             {running

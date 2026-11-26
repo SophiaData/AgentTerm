@@ -30,6 +30,19 @@ import {
 import { useSessionHistory } from "./terminal/useSessionHistory";
 import { badgeLabel, detailText } from "./tools/types";
 import { useTools } from "./tools/useTools";
+import type {
+  InstallUpdateOutcome,
+  PreparedUpdateStatus,
+  RecoverableSession,
+  UpdateActivity,
+  UpdateStatus,
+} from "./updates/types";
+import {
+  describeUpdateActivity,
+  mergeUpdateActivity,
+  projectForRecovery,
+} from "./updates/updateHelpers";
+import { useUpdateRecovery } from "./updates/useUpdateRecovery";
 
 function toolStatusIcon(kind: string): string {
   switch (kind) {
@@ -93,6 +106,7 @@ export default function App() {
   const projects = useProjects();
   const launcher = useLauncher();
   const history = useSessionHistory();
+  const updateRecovery = useUpdateRecovery();
   const [projectId, setProjectId] = useState<string | null>(null);
   const [toolId, setToolId] = useState<string | null>(null);
   const [recordsOpen, setRecordsOpen] = useState(false);
@@ -104,23 +118,22 @@ export default function App() {
   const [narrowLayout, setNarrowLayout] = useState(false);
   const [closeConfirmation, setCloseConfirmation] =
     useState<ActiveSession | null>(null);
-  type UpdateStatus = {
-    currentVersion: string;
-    latestVersion: string | null;
-    updateAvailable: boolean;
-    downloadUrl: string | null;
-    notes: string | null;
-    channel: string;
-    message: string;
-  };
   type UpdateNotice =
     | { kind: "status"; text: string; isError?: boolean }
-    | { kind: "available"; status: UpdateStatus }
+    | {
+        kind: "available";
+        status: UpdateStatus;
+        activity: UpdateActivity;
+        blockedAfterDownload?: boolean;
+      }
     | { kind: "downloading"; version: string };
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
+  const [preparedUpdate, setPreparedUpdate] =
+    useState<PreparedUpdateStatus | null>(null);
+  const [restoringUpdates, setRestoringUpdates] = useState(false);
   const [taskNotice, setTaskNotice] = useState<string | null>(null);
-  const activity = useSessionActivity(launcher.sessions, launcher.activeId);
+  const activity = useSessionActivity(launcher.sessions);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
     projects.projects.find((p) => p.id === projectId) ?? projects.projects[0];
@@ -181,6 +194,14 @@ export default function App() {
     if (!current?.running) setCloseConfirmation(null);
   }, [closeConfirmation, launcher.sessions]);
   useEffect(() => {
+    if (updateNotice?.kind !== "available") return;
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setUpdateNotice(null);
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, [updateNotice]);
+  useEffect(() => {
     saveStoredLayout({ sidebarWidth, sideWidth, filesOpen, projectId });
   }, [sidebarWidth, sideWidth, filesOpen, projectId]);
   useEffect(() => {
@@ -215,7 +236,19 @@ export default function App() {
         setUpdateNotice({ kind: "status", text: status.message });
         return;
       }
-      setUpdateNotice({ kind: "available", status });
+      const backendActivity = await invoke<UpdateActivity>(
+        "get_update_activity",
+      );
+      const mergedActivity = mergeUpdateActivity(
+        backendActivity,
+        launcher.sessions,
+      );
+      setUpdateNotice({
+        kind: "available",
+        status,
+        activity: mergedActivity,
+        blockedAfterDownload: false,
+      });
     } catch (error: unknown) {
       setUpdateNotice({
         kind: "status",
@@ -227,16 +260,20 @@ export default function App() {
     }
   };
 
-  const handleInstallUpdate = async (status: UpdateStatus) => {
+  const handleDownloadUpdateOnly = async (status: UpdateStatus) => {
     if (!status.downloadUrl || updateNotice?.kind === "downloading") return;
     const targetVersion = status.latestVersion ?? "新版本";
     setUpdateNotice({ kind: "downloading", version: targetVersion });
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("install_update", { downloadUrl: status.downloadUrl });
+      const prepared = await invoke<PreparedUpdateStatus>("download_update", {
+        downloadUrl: status.downloadUrl,
+        latestVersion: status.latestVersion,
+      });
+      setPreparedUpdate(prepared);
       setUpdateNotice({
         kind: "status",
-        text: `更新已下载，正在退出并安装 ${targetVersion}`,
+        text: `${targetVersion} 更新包已下载就绪，当前会话不受影响`,
       });
     } catch (error: unknown) {
       setUpdateNotice({
@@ -244,6 +281,132 @@ export default function App() {
         text: error instanceof Error ? error.message : String(error),
         isError: true,
       });
+    }
+  };
+
+  const handleInstallUpdate = async (
+    status: UpdateStatus,
+    allowStopActive = false,
+  ) => {
+    if (!status.downloadUrl || updateNotice?.kind === "downloading") return;
+    const targetVersion = status.latestVersion ?? "新版本";
+    setUpdateNotice({ kind: "downloading", version: targetVersion });
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const outcome = await invoke<InstallUpdateOutcome>("install_update", {
+        downloadUrl: status.downloadUrl,
+        latestVersion: status.latestVersion,
+        allowStopActive,
+      });
+      if (outcome.status === "blocked") {
+        setPreparedUpdate({
+          downloadUrl: status.downloadUrl,
+          latestVersion: status.latestVersion,
+          ready: outcome.installerReady,
+        });
+        setUpdateNotice({
+          kind: "available",
+          status,
+          activity: mergeUpdateActivity(outcome.activity, launcher.sessions),
+          blockedAfterDownload: true,
+        });
+        return;
+      }
+      setUpdateNotice({
+        kind: "status",
+        text: `更新已下载，正在退出并安装 ${outcome.version ?? targetVersion}`,
+      });
+    } catch (error: unknown) {
+      setUpdateNotice({
+        kind: "status",
+        text: error instanceof Error ? error.message : String(error),
+        isError: true,
+      });
+    }
+  };
+
+  const triggerPreparedInstall = async () => {
+    if (
+      checkingUpdate ||
+      updateNotice?.kind === "downloading" ||
+      !preparedUpdate
+    )
+      return;
+    setCheckingUpdate(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const backendActivity = await invoke<UpdateActivity>(
+        "get_update_activity",
+      );
+      const mergedActivity = mergeUpdateActivity(
+        backendActivity,
+        launcher.sessions,
+      );
+      const status: UpdateStatus = {
+        currentVersion: "",
+        latestVersion: preparedUpdate.latestVersion,
+        updateAvailable: true,
+        downloadUrl: preparedUpdate.downloadUrl,
+        notes: null,
+        channel: "stable",
+        message: "",
+      };
+      if (mergedActivity.hasActiveWork) {
+        setUpdateNotice({
+          kind: "available",
+          status,
+          activity: mergedActivity,
+          blockedAfterDownload: true,
+        });
+        return;
+      }
+      setCheckingUpdate(false);
+      await handleInstallUpdate(status, false);
+    } catch (error: unknown) {
+      setUpdateNotice({
+        kind: "status",
+        text: error instanceof Error ? error.message : String(error),
+        isError: true,
+      });
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const restoreOneSession = async (
+    item: RecoverableSession,
+    resume: boolean,
+  ): Promise<boolean> => {
+    const tool = tools.tools.find(
+      (candidate) =>
+        candidate.id === item.toolId && candidate.state.kind === "installed",
+    );
+    if (!tool) return false;
+    const project = projectForRecovery(item, projects.projects);
+    const existingProject = projects.projects.find(
+      (candidate) => candidate.path === item.projectPath,
+    );
+    if (existingProject) setProjectId(existingProject.id);
+    const started = await launcher.start(project, tool, {
+      resume,
+      cliSessionId: item.cliSessionId ?? undefined,
+      title: item.title ?? undefined,
+    });
+    if (started) {
+      await updateRecovery.consumeSession(item.id);
+    }
+    return started;
+  };
+  const restoreAllSessions = async () => {
+    const snapshot = updateRecovery.recovery;
+    if (!snapshot || restoringUpdates) return;
+    setRestoringUpdates(true);
+    try {
+      for (const item of snapshot.sessions) {
+        await restoreOneSession(item, true);
+      }
+    } finally {
+      setRestoringUpdates(false);
     }
   };
 
@@ -272,14 +435,12 @@ export default function App() {
         ? ""
         : state === "working"
           ? " is-working"
-          : state === "done"
-            ? " is-done"
-            : " is-running";
+          : " is-running";
     return (
       <button
         type="button"
         key={session.info.id}
-        className={`workspace-session-link${state === "done" ? " is-done" : ""}`}
+        className="workspace-session-link"
         aria-current={
           launcher.activeId === session.info.id ? "true" : undefined
         }
@@ -605,6 +766,18 @@ export default function App() {
                   ? "更新中…"
                   : "检查更新"}
             </button>
+            {preparedUpdate ? (
+              <button
+                type="button"
+                className="primary-button workspace-update-ready"
+                disabled={
+                  checkingUpdate || updateNotice?.kind === "downloading"
+                }
+                onClick={() => void triggerPreparedInstall()}
+              >
+                安装 {preparedUpdate.latestVersion ?? "更新"}
+              </button>
+            ) : null}
             <button
               type="button"
               className="ghost-button workspace-icon-action"
@@ -682,11 +855,11 @@ export default function App() {
                       : -1
                   }
                   className={`workspace-tab${
-                    sessionActivities[session.info.id] === "done"
-                      ? " is-done"
-                      : sessionActivities[session.info.id] === "working"
-                        ? " is-working"
-                        : ""
+                    session.running &&
+                    !session.statusUnknown &&
+                    sessionActivities[session.info.id] === "working"
+                      ? " is-working"
+                      : ""
                   }`}
                   title={displayPath(session.info.projectPath)}
                   onClick={() => selectSession(session)}
@@ -725,22 +898,16 @@ export default function App() {
                           ? ""
                           : sessionActivities[session.info.id] === "working"
                             ? " is-working"
-                            : sessionActivities[session.info.id] === "done"
-                              ? " is-done"
-                              : " is-running"
+                            : " is-running"
                     }`}
                     aria-hidden="true"
                   />
                   <span className="workspace-tab-label">{session.label}</span>
                   {session.running &&
                   !session.statusUnknown &&
-                  sessionActivities[session.info.id] !== "idle" ? (
-                    <span
-                      className={`workspace-tab-state is-${sessionActivities[session.info.id]}`}
-                    >
-                      {sessionActivities[session.info.id] === "working"
-                        ? "执行中"
-                        : "已完成"}
+                  sessionActivities[session.info.id] === "working" ? (
+                    <span className="workspace-tab-state is-working">
+                      输出中
                     </span>
                   ) : null}
                 </button>
@@ -764,6 +931,166 @@ export default function App() {
               ＋
             </button>
           </div>
+        ) : null}
+        {updateRecovery.error || updateRecovery.recovery ? (
+          <section
+            className="workspace-recovery-banner"
+            aria-label="更新后恢复"
+          >
+            {updateRecovery.error ? (
+              <div className="workspace-recovery-error" role="alert">
+                <span>{updateRecovery.error}</span>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => void updateRecovery.reload()}
+                >
+                  重试
+                </button>
+              </div>
+            ) : null}
+            {updateRecovery.recovery ? (
+              <>
+                <div className="workspace-recovery-header">
+                  <div>
+                    <strong>
+                      应用已更新
+                      {updateRecovery.recovery.targetVersion
+                        ? `至 ${updateRecovery.recovery.targetVersion}`
+                        : ""}
+                      ，发现更新前未结束的工作
+                    </strong>
+                    <span>
+                      可恢复更新前正在执行的 CLI 会话（保留标题与项目目录）
+                    </span>
+                  </div>
+                  <div className="workspace-recovery-header-actions">
+                    {updateRecovery.recovery.sessions.length > 0 ? (
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={
+                          restoringUpdates ||
+                          launcher.busy ||
+                          tools.loading ||
+                          !updateRecovery.recovery.sessions.some((item) =>
+                            tools.tools.some(
+                              (tool) =>
+                                tool.id === item.toolId &&
+                                tool.state.kind === "installed",
+                            ),
+                          )
+                        }
+                        onClick={() => void restoreAllSessions()}
+                      >
+                        {restoringUpdates ? "正在恢复…" : "全部恢复并继续"}
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      disabled={restoringUpdates}
+                      onClick={() => void updateRecovery.dismiss()}
+                    >
+                      暂不恢复
+                    </button>
+                  </div>
+                </div>
+                {updateRecovery.recovery.sessions.length > 0 ? (
+                  <ul className="workspace-recovery-list">
+                    {updateRecovery.recovery.sessions.map((item) => {
+                      const availableTool = tools.tools.find(
+                        (tool) =>
+                          tool.id === item.toolId &&
+                          tool.state.kind === "installed",
+                      );
+                      const label =
+                        item.title?.trim() ||
+                        `${item.toolName} · ${displayPath(item.projectPath)}`;
+                      return (
+                        <li key={item.id} className="workspace-recovery-item">
+                          <div className="workspace-recovery-meta">
+                            <strong>{label}</strong>
+                            <span title={displayPath(item.projectPath)}>
+                              {item.toolName} · {displayPath(item.projectPath)}
+                            </span>
+                          </div>
+                          <div className="workspace-recovery-item-actions">
+                            <button
+                              type="button"
+                              className="ghost-button"
+                              disabled={
+                                restoringUpdates ||
+                                launcher.busy ||
+                                tools.loading ||
+                                !availableTool
+                              }
+                              onClick={() => void restoreOneSession(item, true)}
+                            >
+                              恢复并继续
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost-button"
+                              disabled={
+                                restoringUpdates ||
+                                launcher.busy ||
+                                tools.loading ||
+                                !availableTool
+                              }
+                              onClick={() =>
+                                void restoreOneSession(item, false)
+                              }
+                            >
+                              新开终端
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : null}
+                {updateRecovery.recovery.hadActiveDispatch ? (
+                  <div className="workspace-recovery-task-note">
+                    <span>
+                      更新前任务工作台有受控任务正在执行，可前往「任务记录」核实进程并接回。
+                    </span>
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={() => {
+                        setRecordsOpen(true);
+                        setScheduleOpen(false);
+                        setFilesOpen(false);
+                      }}
+                    >
+                      打开任务记录
+                    </button>
+                  </div>
+                ) : null}
+                {updateRecovery.recovery.interruptedScheduledTaskId ? (
+                  <div className="workspace-recovery-task-note">
+                    <span>
+                      更新前定时任务（
+                      {updateRecovery.recovery.interruptedScheduledTaskId}
+                      ）被中断，可在「定时任务」中查看或立即重新运行。
+                    </span>
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={() => {
+                        setScheduleOpen(true);
+                        setRecordsOpen(false);
+                        setFilesOpen(false);
+                      }}
+                    >
+                      打开定时任务
+                    </button>
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+          </section>
         ) : null}
         {closeConfirmation ? (
           <div
@@ -989,31 +1316,50 @@ export default function App() {
                                   {historySubtitleText(record)}
                                 </span>
                               </div>
-                              <button
-                                type="button"
-                                className="ghost-button"
-                                disabled={
-                                  launcher.busy || tools.loading || !reopenTool
-                                }
-                                title={reasonTitle}
-                                onClick={() => {
-                                  if (!reopenTool) return;
-                                  const existingProject =
-                                    projects.projects.find(
-                                      (p) => p.path === record.projectPath,
-                                    );
-                                  if (existingProject) {
-                                    setProjectId(existingProject.id);
-                                  }
-                                  void launcher.start(
-                                    existingProject ??
-                                      projectFromRecord(record),
-                                    reopenTool,
-                                  );
-                                }}
-                              >
-                                再次打开
-                              </button>
+                              <div className="workspace-history-actions">
+                                {[
+                                  { label: "接续对话", resume: true },
+                                  { label: "再次打开", resume: false },
+                                ].map(({ label, resume }) => (
+                                  <button
+                                    key={label}
+                                    type="button"
+                                    className="ghost-button"
+                                    disabled={
+                                      launcher.busy ||
+                                      tools.loading ||
+                                      !reopenTool
+                                    }
+                                    title={reasonTitle}
+                                    onClick={() => {
+                                      if (!reopenTool) return;
+                                      const existingProject =
+                                        projects.projects.find(
+                                          (p) => p.path === record.projectPath,
+                                        );
+                                      if (existingProject) {
+                                        setProjectId(existingProject.id);
+                                      }
+                                      void launcher.start(
+                                        existingProject ??
+                                          projectFromRecord(record),
+                                        reopenTool,
+                                        resume
+                                          ? {
+                                              resume: true,
+                                              cliSessionId:
+                                                record.cliSessionId ??
+                                                undefined,
+                                              title: record.title ?? undefined,
+                                            }
+                                          : undefined,
+                                      );
+                                    }}
+                                  >
+                                    {label}
+                                  </button>
+                                ))}
+                              </div>
                             </li>
                           );
                         })}
@@ -1106,7 +1452,9 @@ export default function App() {
                 <div className="workspace-update-available">
                   <div className="workspace-update-head">
                     <strong>
-                      发现新版本 {updateNotice.status.latestVersion}
+                      {updateNotice.blockedAfterDownload
+                        ? `更新包 ${updateNotice.status.latestVersion ?? ""} 已就绪，当前仍有任务运行`
+                        : `发现新版本 ${updateNotice.status.latestVersion}`}
                     </strong>
                     <span className="workspace-update-channel">
                       {updateNotice.status.channel === "stable"
@@ -1114,14 +1462,31 @@ export default function App() {
                         : "测试版"}
                     </span>
                   </div>
-                  <p className="workspace-update-versions">
-                    当前 {updateNotice.status.currentVersion} →{" "}
-                    {updateNotice.status.latestVersion}
-                  </p>
+                  {updateNotice.status.currentVersion ? (
+                    <p className="workspace-update-versions">
+                      当前 {updateNotice.status.currentVersion} →{" "}
+                      {updateNotice.status.latestVersion}
+                    </p>
+                  ) : null}
                   {updateNotice.status.notes ? (
                     <pre className="workspace-update-notes">
                       {updateNotice.status.notes}
                     </pre>
+                  ) : null}
+                  {updateNotice.activity.hasActiveWork ? (
+                    <div className="workspace-update-warning">
+                      <p>
+                        更新需要退出 AgentTerm
+                        并终止运行中的进程；若现在更新，系统会在退出前保存会话，并在更新重启后提示恢复：
+                      </p>
+                      <ul>
+                        {describeUpdateActivity(updateNotice.activity).map(
+                          (line) => (
+                            <li key={line}>{line}</li>
+                          ),
+                        )}
+                      </ul>
+                    </div>
                   ) : null}
                   <div className="workspace-update-actions">
                     <button
@@ -1129,17 +1494,47 @@ export default function App() {
                       className="ghost-button"
                       onClick={() => setUpdateNotice(null)}
                     >
-                      暂不更新
+                      {updateNotice.blockedAfterDownload
+                        ? "稍后安装"
+                        : "暂不更新"}
                     </button>
-                    <button
-                      type="button"
-                      className="primary-button"
-                      onClick={() =>
-                        void handleInstallUpdate(updateNotice.status)
-                      }
-                    >
-                      立即更新
-                    </button>
+                    {updateNotice.activity.hasActiveWork &&
+                    preparedUpdate?.downloadUrl !==
+                      updateNotice.status.downloadUrl ? (
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() =>
+                          void handleDownloadUpdateOnly(updateNotice.status)
+                        }
+                      >
+                        仅下载安装包（稍后安装）
+                      </button>
+                    ) : null}
+                    {updateNotice.activity.hasActiveWork ? (
+                      <button
+                        type="button"
+                        className="danger-button"
+                        onClick={() =>
+                          void handleInstallUpdate(updateNotice.status, true)
+                        }
+                      >
+                        保存会话并立即更新
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="primary-button"
+                        onClick={() =>
+                          void handleInstallUpdate(updateNotice.status, false)
+                        }
+                      >
+                        {preparedUpdate?.downloadUrl ===
+                        updateNotice.status.downloadUrl
+                          ? "立即重启并安装"
+                          : "立即更新"}
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
