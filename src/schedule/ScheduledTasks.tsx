@@ -46,33 +46,37 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
   const [runningId, setRunningId] = useState<string | null>(null);
   const loadVersion = useRef(0);
 
-  const load = useCallback(async () => {
-    const { invoke } = await import("@tauri-apps/api/core");
+  const load = useCallback(async (errorPrefix = "") => {
     const version = ++loadVersion.current;
-    const [next, running] = await Promise.all([
-      invoke<ScheduledTask[]>("list_scheduled_tasks"),
-      invoke<string | null>("scheduled_task_running"),
-    ]);
-    if (version !== loadVersion.current) return;
-    setTasks(next);
-    setRunningId(running);
-    setError(null);
-    setLoading(false);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const [next, running] = await Promise.all([
+        invoke<ScheduledTask[]>("list_scheduled_tasks"),
+        invoke<string | null>("scheduled_task_running"),
+      ]);
+      if (version !== loadVersion.current) return;
+      setTasks(next);
+      setRunningId(running);
+      setError(null);
+    } catch (cause) {
+      if (version === loadVersion.current)
+        setError(`${errorPrefix}${errorText(cause)}`);
+    } finally {
+      if (version === loadVersion.current) setLoading(false);
+    }
   }, []);
 
   useEffect(() => {
-    void load().catch((cause) => {
-      setError(errorText(cause));
-      setLoading(false);
-    });
+    void load();
+    return () => {
+      loadVersion.current += 1;
+    };
   }, [load]);
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    const refresh = () => {
-      void load().catch((cause) => setError(errorText(cause)));
-    };
+    const refresh = () => void load();
     // Poll faster while a run is in flight so the panel shows progress and the
     // stop action promptly.
     const timer = window.setInterval(refresh, runningId ? 1_500 : 5_000);
@@ -101,19 +105,18 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
     setError(null);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      await invoke(command, args);
+      const result = await invoke(command, args);
       if (command === "run_scheduled_task_now")
         onNotice("定时任务已开始运行，可在面板中查看或停止");
-      if (command === "cancel_scheduled_task") onNotice("已请求停止定时任务");
+      if (command === "cancel_scheduled_task" && result === true)
+        onNotice("已请求停止定时任务");
     } catch (cause) {
       setError(`定时任务操作失败：${errorText(cause)}`);
       setBusy(false);
       return;
     }
     try {
-      await load();
-    } catch (cause) {
-      setError(`操作已成功，但无法刷新任务列表：${errorText(cause)}`);
+      await load("操作已成功，但无法刷新任务列表：");
     } finally {
       setBusy(false);
     }
@@ -212,7 +215,9 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
                     <button
                       type="button"
                       disabled={busy}
-                      onClick={() => void act("cancel_scheduled_task", {})}
+                      onClick={() =>
+                        void act("cancel_scheduled_task", { id: task.id })
+                      }
                     >
                       停止运行
                     </button>

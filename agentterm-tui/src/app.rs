@@ -43,6 +43,7 @@ impl App {
     /// real config.
     pub fn from_store(store: ProjectStore) -> Self {
         let tools = tools::detect(&tools::search_dirs());
+        let error = store.load_error.clone();
         let mut app = Self {
             store,
             tools,
@@ -51,12 +52,12 @@ impl App {
             tool_cursor: 0,
             prompt: Prompt::None,
             status: String::new(),
-            error: None,
+            error,
             pending_launch: None,
         };
         app.status = app.default_status();
 
-        if app.store.projects.is_empty() {
+        if app.store.projects.is_empty() && app.error.is_none() {
             app.prompt = Prompt::AddProject(String::new());
         }
         app
@@ -83,7 +84,10 @@ impl App {
     pub fn handle_key(&mut self, code: crossterm::event::KeyCode) -> bool {
         use crossterm::event::KeyCode;
 
-        self.error = None;
+        self.error = self.store.load_error.clone();
+        if self.error.is_some() {
+            return matches!(code, KeyCode::Char('q') | KeyCode::Esc);
+        }
 
         if let Prompt::AddProject(buffer) = &mut self.prompt {
             match code {
@@ -91,12 +95,16 @@ impl App {
                     let text = buffer.clone();
                     self.prompt = Prompt::None;
                     match self.store.add(&text) {
-                        Ok(()) => {
-                            let index = self.store.projects.len().saturating_sub(1);
-                            self.project_cursor = index;
-                            let _ = self.store.save();
-                            self.status = "已添加项目".to_string();
-                        }
+                        Ok(()) => match self.store.save() {
+                            Ok(()) => {
+                                self.project_cursor = self.store.projects.len().saturating_sub(1);
+                                self.status = "已添加项目".to_string();
+                            }
+                            Err(message) => {
+                                self.store.projects.pop();
+                                self.set_error(message);
+                            }
+                        },
                         Err(message) => self.set_error(message),
                     }
                 }
@@ -117,11 +125,19 @@ impl App {
             match code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     if let Some(removed) = self.store.remove(self.project_cursor) {
-                        self.status = format!("已移除 {}（文件夹保留）", removed.path.display());
-                        if self.project_cursor >= self.store.projects.len() {
-                            self.project_cursor = self.store.projects.len().saturating_sub(1);
+                        match self.store.save() {
+                            Ok(()) => {
+                                self.status =
+                                    format!("已移除 {}（文件夹保留）", removed.path.display());
+                                self.project_cursor = self
+                                    .project_cursor
+                                    .min(self.store.projects.len().saturating_sub(1));
+                            }
+                            Err(message) => {
+                                self.store.projects.insert(self.project_cursor, removed);
+                                self.set_error(message);
+                            }
                         }
-                        let _ = self.store.save();
                     }
                     self.prompt = Prompt::None;
                 }
@@ -224,8 +240,16 @@ impl App {
         let tool_id = tool.id.to_string();
         let request = launch::plan(binary, &project_path);
 
+        let previous_tool = self.store.projects[self.project_cursor].last_tool.clone();
         self.store.set_last_tool(self.project_cursor, &tool_id);
-        let _ = self.store.save();
+        // Preferred tool is only a hint: a failed save rolls back the in-memory
+        // change and reports it, but never blocks launching the CLI.
+        if let Err(error) = self.store.save() {
+            if let Some(project) = self.store.projects.get_mut(self.project_cursor) {
+                project.last_tool = previous_tool;
+            }
+            self.set_error(error);
+        }
         self.pending_launch = Some(request);
     }
 
@@ -315,6 +339,26 @@ mod tests {
         app.handle_key(KeyCode::Char('y'));
         assert!(app.store.projects.is_empty());
         assert!(folder.is_dir(), "folder must survive removal");
+    }
+
+    #[test]
+    fn project_mutations_roll_back_when_the_config_cannot_be_saved() {
+        let bound = std::path::PathBuf::from(temp_dir("save-fails")).join("projects.json");
+        let mut app = App::from_store(ProjectStore::with_path(bound.clone()));
+        // Simulate a target that becomes unwritable after the initial load.
+        std::fs::create_dir(&bound).unwrap();
+        let project = temp_dir("save-fails-project");
+
+        app.add_project_path(&project);
+        assert!(app.store.projects.is_empty());
+        assert!(app.error.as_deref().is_some_and(|e| e.contains("保存配置")));
+
+        app.store.add(&project).unwrap();
+        app.handle_key(KeyCode::Char('d'));
+        app.handle_key(KeyCode::Char('y'));
+        assert_eq!(app.store.projects.len(), 1);
+        assert_eq!(app.project_cursor, 0);
+        assert!(app.error.as_deref().is_some_and(|e| e.contains("保存配置")));
     }
 
     #[test]

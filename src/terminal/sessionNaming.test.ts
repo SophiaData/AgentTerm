@@ -33,9 +33,15 @@ describe("session naming helpers", () => {
     expect(deriveAutoTitleFromPrompt("y")).toBeNull();
     expect(deriveAutoTitleFromPrompt("yes")).toBeNull();
     expect(deriveAutoTitleFromPrompt("???")).toBeNull();
-    expect(deriveAutoTitleFromPrompt("token=abcd12345678")).toBeNull();
+    expect(deriveAutoTitleFromPrompt("token=fixture-value")).toBeNull();
+    expect(
+      deriveAutoTitleFromPrompt("AWS_SECRET_ACCESS_KEY=fixture-value"),
+    ).toBeNull();
     expect(deriveAutoTitleFromPrompt("sk-1234567890abcdef")).toBeNull();
     expect(deriveAutoTitleFromPrompt("Bearer eyJhbGciOi...")).toBeNull();
+    expect(deriveAutoTitleFromPrompt("Secretary: 整理会议纪要并发布")).toBe(
+      "Secretary: 整理会议纪要并发布",
+    );
   });
 
   it("tracks terminal input lines across escape sequences, backspaces and bracketed paste", () => {

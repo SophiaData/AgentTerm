@@ -30,7 +30,8 @@ const SENSITIVE_PATTERNS = [
   /\bgithub_pat_[a-z0-9_]{8,}/i,
   /\bakia[0-9a-z]{12,}/i,
   /\bbearer\s+\S+/i,
-  /\b(?:password|passwd|token|cookie|api_?key|secret)\s*[:=]/i,
+  /\b[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|API_?KEY)[A-Z0-9_]*=/,
+  /(?:^|[^a-z0-9_])(?:password|passwd|token|cookie|api_?key|secret)\s*[:=]/i,
   /-----begin\b/i,
 ];
 

@@ -53,6 +53,24 @@ describe("project file browser", () => {
     expect(invoke).toHaveBeenCalledTimes(2);
   });
 
+  it("reuses the same pending request when a folder is reopened", async () => {
+    const { store, invoke } = fixture();
+    const pending = deferred<DirectoryListing>();
+    invoke.mockReturnValueOnce(pending.promise);
+
+    store.toggleDirectory("SQL 文档");
+    store.toggleDirectory("SQL 文档");
+    store.toggleDirectory("SQL 文档");
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("list_project_files", {
+      projectId: "project-a",
+      relativePath: "SQL 文档",
+    });
+    pending.resolve(listing);
+    await vi.waitFor(() =>
+      expect(store.getSnapshot().directories["SQL 文档"].loaded).toBe(true),
+    );
+  });
+
   it("does not replace a newer selected file with a slow earlier response", async () => {
     const { store, invoke } = fixture();
     const first = deferred<FilePreview>();

@@ -1,6 +1,6 @@
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::session_history::{SessionHistory, SessionRecord, normalize_session_title, now_ms};
 use std::io::Read;
@@ -806,9 +806,23 @@ fn wait_for_drain(
     true
 }
 
+struct SessionReservation {
+    pending: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for SessionReservation {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+    starting: Arc<Mutex<HashSet<String>>>,
     /// Last output of sessions that have already exited, keyed by session id.
     /// Kept so a view that mounts *after* the process died can still replay the
     /// final screen and learn the process is gone (instead of seeing "running").
@@ -823,6 +837,7 @@ impl Default for SessionManager {
     fn default() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            starting: Arc::new(Mutex::new(HashSet::new())),
             finished: Arc::new(Mutex::new(HashMap::new())),
             history: Arc::new(Mutex::new(None)),
         }
@@ -885,7 +900,27 @@ impl SessionManager {
         }
     }
 
-    pub fn start(&self, app: AppHandle, request: SessionLaunch<'_>) -> Result<SessionInfo, String> {
+    fn reserve_start(&self, id: &str) -> Result<SessionReservation, String> {
+        let mut pending = self
+            .starting
+            .lock()
+            .map_err(|_| "会话管理暂时不可用，请重试".to_string())?;
+        if pending.contains(id) || self.lock()?.contains_key(id) {
+            return Err("会话已存在，请换一个会话再启动".into());
+        }
+        pending.insert(id.to_owned());
+        Ok(SessionReservation {
+            pending: Arc::clone(&self.starting),
+            id: id.to_owned(),
+        })
+    }
+
+    fn start(
+        &self,
+        app: AppHandle,
+        request: SessionLaunch<'_>,
+        reservation: Arc<SessionReservation>,
+    ) -> Result<SessionInfo, String> {
         let SessionLaunch {
             session_id,
             tool_id,
@@ -900,7 +935,6 @@ impl SessionManager {
             .iter()
             .find(|definition| definition.id == tool_id)
             .ok_or_else(|| format!("不支持的工具：{tool_id}"))?;
-
         let project_dir = normalize_project_dir(project_path)?;
 
         let binary = match resolve_binary(tool.binaries, &candidate_search_dirs()) {
@@ -916,13 +950,6 @@ impl SessionManager {
                 return Err(format!("未安装 {}，无法启动", tool.name));
             }
         };
-
-        {
-            let sessions = self.lock()?;
-            if sessions.contains_key(session_id) {
-                return Err("会话已存在，请换一个会话再启动".to_string());
-            }
-        }
 
         let spawned = spawn_pty(&binary, &project_dir, rows, cols, &tool_args, &tool_env)?;
         let SpawnedPty {
@@ -1015,6 +1042,7 @@ impl SessionManager {
 
         // Watcher thread: reports process exit and releases the session.
         std::thread::spawn(move || {
+            let _reservation = reservation;
             let reason = loop {
                 let finished = {
                     let mut guard = match sessions.lock() {
@@ -1347,6 +1375,9 @@ pub fn start_session(
     rows: u16,
     cols: u16,
 ) -> Result<SessionInfo, String> {
+    // Reserve before the MCP bridge: a duplicate must not replace or revoke
+    // the existing session's registration. Keep it through error cleanup.
+    let reservation = Arc::new(state.reserve_start(&session_id)?);
     let bridge = schedule_mcp.issue_session(&session_id, &project_path, &tool_id, None)?;
     let tool_env = bridge.environment();
     let tool_args = match bridge.command_args(&tool_id) {
@@ -1368,6 +1399,7 @@ pub fn start_session(
             tool_env,
             schedule_guard: schedule_mcp.handle(),
         },
+        Arc::clone(&reservation),
     ) {
         Ok(info) => Ok(info),
         Err(error) => {
@@ -1468,6 +1500,21 @@ mod tests {
     use std::time::Duration;
 
     use super::SessionManager;
+
+    #[test]
+    fn session_id_is_reserved_until_the_owner_releases_it() {
+        let manager = SessionManager::default();
+        let reservation = manager.reserve_start("reserved").unwrap();
+        let contender = manager.clone();
+        assert!(
+            std::thread::spawn(move || contender.reserve_start("reserved").is_err())
+                .join()
+                .unwrap()
+        );
+        assert!(manager.reserve_start("different").is_ok());
+        drop(reservation);
+        assert!(manager.reserve_start("reserved").is_ok());
+    }
 
     /// A child whose `kill` can be made to fail, for exercising the stop failure
     /// path without needing a real unkillable process (#17).

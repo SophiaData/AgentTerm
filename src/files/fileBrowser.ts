@@ -122,7 +122,8 @@ export function createFileBrowserStore(projectId: string, invoke: Invoke) {
         update({ expanded: state.expanded.filter((item) => item !== path) });
       } else {
         update({ expanded: [...state.expanded, path] });
-        if (!state.directories[path]?.loaded) void loadDirectory(path);
+        const directory = state.directories[path];
+        if (!directory?.loaded && !directory?.loading) void loadDirectory(path);
       }
     },
     closePreview() {

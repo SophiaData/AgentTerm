@@ -153,6 +153,7 @@ export function createSessionStore(invoke: Invoke) {
 
   const handleExit = (id: string, reason: string) => {
     if (!state.sessions.some((s) => s.info.id === id)) return;
+    mutationEpoch += 1;
     update({
       sessions: state.sessions.map((s) =>
         s.info.id === id
@@ -201,9 +202,8 @@ export function createSessionStore(invoke: Invoke) {
     const startedAtEpoch = mutationEpoch;
     try {
       const live = await invoke<SessionInfo[]>("list_sessions", {});
-      // A start or close that completed while this read was in flight is newer
-      // than the backend snapshot. Discard the stale reconciliation instead of
-      // resurrecting a closed tab or marking a newly started PTY as ended.
+      // A start, close or exit newer than this read invalidates the snapshot.
+      // Otherwise a slow response could resurrect an already-ended session.
       if (mutationEpoch !== startedAtEpoch) return false;
       const liveById = new Map(live.map((info) => [info.id, info]));
       const known = new Set(state.sessions.map((session) => session.info.id));
@@ -259,6 +259,7 @@ export function createSessionStore(invoke: Invoke) {
       });
       return true;
     } catch (error) {
+      if (mutationEpoch !== startedAtEpoch) return false;
       update({
         sessions: state.sessions.map((session) =>
           session.running ? { ...session, statusUnknown: true } : session,
