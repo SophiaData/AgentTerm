@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -25,7 +26,9 @@ const mocks = vi.hoisted(() => ({
     loadAddon: vi.fn(),
     dispose: vi.fn(),
     scrollToBottom: vi.fn(),
-    onData: vi.fn(() => ({ dispose: vi.fn() })),
+    onData: vi.fn<(cb: (text: string) => void) => { dispose: () => void }>(
+      () => ({ dispose: vi.fn() }),
+    ),
     attachCustomKeyEventHandler: vi.fn(),
   },
 }));
@@ -138,5 +141,56 @@ describe("terminal clipboard wiring", () => {
     fireEvent.click(screen.getByRole("button", { name: "复制" }));
     await waitFor(() => expect(mocks.writeText).toHaveBeenCalledOnce());
     expect(mocks.readText).not.toHaveBeenCalled();
+  });
+
+  it("allows dismissing a paste failure alert manually", async () => {
+    mocks.readText.mockRejectedValueOnce(new Error("no text"));
+    render(<TerminalView {...props} />);
+    await waitFor(() =>
+      expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("粘贴失败");
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("clears a paste failure alert when typing into the terminal", async () => {
+    mocks.readText.mockRejectedValueOnce(new Error("no text"));
+    render(<TerminalView {...props} />);
+    await waitFor(() => expect(mocks.terminal.onData).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+    await screen.findByRole("alert");
+    const onDataHandler = mocks.terminal.onData.mock.calls[0][0] as (
+      text: string,
+    ) => void;
+    act(() => {
+      onDataHandler("ls\r");
+    });
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("auto-dismisses a clipboard failure alert after 6 seconds", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.readText.mockRejectedValueOnce(new Error("no text"));
+      render(<TerminalView {...props} />);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+        await Promise.resolve();
+      });
+      expect(screen.getByRole("alert").textContent).toContain("粘贴失败");
+      act(() => {
+        vi.advanceTimersByTime(6000);
+      });
+      expect(screen.queryByRole("alert")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
