@@ -50,10 +50,9 @@ export default function ScheduledTasks({ onClose, onNotice }: Props) {
     const version = ++loadVersion.current;
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const [next, running] = await Promise.all([
-        invoke<ScheduledTask[]>("list_scheduled_tasks"),
-        invoke<string | null>("scheduled_task_running"),
-      ]);
+      const [next, running] = await invoke<[ScheduledTask[], string | null]>(
+        "scheduled_tasks_snapshot",
+      );
       if (version !== loadVersion.current) return;
       setTasks(next);
       setRunningId(running);

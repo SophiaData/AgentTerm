@@ -69,3 +69,33 @@ if (
   console.error("npm package must explicitly target win32 x64");
   process.exit(1);
 }
+
+// The launcher path and the npm packager's staged vendor name must agree,
+// otherwise a package built from a renamed executable cannot start.
+const launcher = read("npm/agentterm/bin/agentterm.js");
+const packager = read("scripts/package-npm.mjs");
+const launcherName = /join\(root,\s*"vendor",\s*"([^"]+)"\)/.exec(
+  launcher,
+)?.[1];
+const stagedName = /join\(packageDir,\s*"vendor",\s*"([^"]+)"\)/.exec(
+  packager,
+)?.[1];
+if (!launcherName || !stagedName || launcherName !== stagedName) {
+  console.error(
+    `npm vendor name mismatch: launcher=${launcherName}, packager=${stagedName}`,
+  );
+  process.exit(1);
+}
+
+// Release assembly must be able to carry both platforms' artifacts.
+const release = read("scripts/package-release.mjs");
+for (const token of [
+  "windows-x64-setup.exe",
+  "macos-arm64.dmg",
+  "macos-arm64-tui",
+]) {
+  if (!release.includes(token)) {
+    console.error(`release assembly is missing asset pattern: ${token}`);
+    process.exit(1);
+  }
+}

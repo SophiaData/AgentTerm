@@ -116,38 +116,41 @@ export function ProjectFilesView({
 }) {
   const [query, setQuery] = useState("");
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  const matchingPaths = new Set(
-    Object.values(state.directories)
-      .flatMap((directory) => directory.entries)
-      .filter((entry) =>
-        entry.name.toLocaleLowerCase().includes(normalizedQuery),
+  const matchingPaths = normalizedQuery
+    ? new Set(
+        Object.values(state.directories)
+          .flatMap((directory) => directory.entries)
+          .filter((entry) =>
+            entry.name.toLocaleLowerCase().includes(normalizedQuery),
+          )
+          .map((entry) => entry.path),
       )
-      .map((entry) => entry.path),
-  );
-  const visiblePaths = new Set(matchingPaths);
-  for (const path of matchingPaths) {
-    const parts = path.split("/");
-    for (let index = 1; index < parts.length; index += 1) {
-      visiblePaths.add(parts.slice(0, index).join("/"));
+    : null;
+  const visiblePaths = new Set(matchingPaths ?? []);
+  if (matchingPaths) {
+    for (const path of matchingPaths) {
+      const parts = path.split("/");
+      for (let index = 1; index < parts.length; index += 1) {
+        visiblePaths.add(parts.slice(0, index).join("/"));
+      }
     }
   }
-  const filtered = {
-    ...state,
-    directories: Object.fromEntries(
-      Object.entries(state.directories).map(([path, directory]) => [
-        path,
-        {
-          ...directory,
-          entries:
-            normalizedQuery.length === 0
-              ? directory.entries
-              : directory.entries.filter((entry) =>
-                  visiblePaths.has(entry.path),
-                ),
-        },
-      ]),
-    ),
-  };
+  const filtered = matchingPaths
+    ? {
+        ...state,
+        directories: Object.fromEntries(
+          Object.entries(state.directories).map(([path, directory]) => [
+            path,
+            {
+              ...directory,
+              entries: directory.entries.filter((entry) =>
+                visiblePaths.has(entry.path),
+              ),
+            },
+          ]),
+        ),
+      }
+    : state;
   return (
     <aside className="workspace-files" id="project-files" aria-label="项目文件">
       <div className="file-panel-heading">

@@ -271,6 +271,11 @@ fn apply_event(
                 .iter_mut()
                 .find(|existing| existing.id == id)
                 .ok_or_else(|| "会话历史记录不存在".to_string())?;
+            // First end wins: a late duplicate from the exit watcher must not
+            // overwrite the explicit stop reason or the captured output size.
+            if record.ended_at_ms.is_some() {
+                return Ok(());
+            }
             let mut updated = record.clone();
             updated.ended_at_ms = Some(ended_at_ms);
             updated.exit_reason = exit_reason;
@@ -417,6 +422,24 @@ mod tests {
         history.record_start(record("s1", 10)).unwrap();
         let error = history.record_start(record("s1", 11)).unwrap_err();
         assert!(error.contains("已存在"), "got: {error}");
+    }
+
+    #[test]
+    fn a_late_end_does_not_overwrite_the_first_exit_reason() {
+        let path = temp_store("late-end");
+        let history = SessionHistory::configure(path).unwrap();
+        history.record_start(record("s1", 10)).unwrap();
+        history
+            .record_end("s1", 20, Some("已停止".to_string()), Some(42))
+            .unwrap();
+        history
+            .record_end("s1", 30, Some("会话已结束".to_string()), None)
+            .unwrap();
+
+        let listed = history.list().unwrap();
+        assert_eq!(listed[0].exit_reason.as_deref(), Some("已停止"));
+        assert_eq!(listed[0].output_bytes, Some(42));
+        assert_eq!(listed[0].ended_at_ms, Some(20));
     }
 
     #[test]

@@ -1304,13 +1304,36 @@ impl SessionManager {
         }
 
         // Kill succeeded (or the process was already gone): now release it.
-        let session = self.lock()?.remove(session_id);
-        // Drop any finished-buffer leftover for this id so it cannot accumulate.
-        if let Ok(mut done) = self.finished.lock() {
+        // Read the byte count under the same lock: if the watcher already
+        // archived the session, fall back to that buffer instead of recording
+        // "stopped" with no byte count or dropping its replay data.
+        let (session, output_bytes) = {
+            let mut sessions = self.lock()?;
+            let session = sessions.remove(session_id);
+            let bytes = session
+                .as_ref()
+                .and_then(|session| {
+                    session
+                        .buffer
+                        .lock()
+                        .ok()
+                        .map(|buffer| buffer.data.len() as u64)
+                })
+                .or_else(|| {
+                    self.finished
+                        .lock()
+                        .ok()
+                        .and_then(|done| done.get(session_id).map(|(data, _)| data.len() as u64))
+                });
+            (session, bytes)
+        };
+        // Only clear the finished buffer when this path owned the live session;
+        // a watcher-owned archive is left for replay until it is forgotten.
+        if let (true, Ok(mut done)) = (session.is_some(), self.finished.lock()) {
             done.remove(session_id);
         }
         drop(session);
-        self.record_end(session_id, Some(reason.to_string()), None);
+        self.record_end(session_id, Some(reason.to_string()), output_bytes);
         Ok(())
     }
 
@@ -2607,6 +2630,39 @@ mod tests {
         assert_eq!(listed[0].id, "s-stop");
         assert_eq!(listed[0].exit_reason.as_deref(), Some("已停止"));
         assert!(listed[0].ended_at_ms.is_some());
+    }
+
+    #[test]
+    fn explicit_stop_keeps_output_bytes_when_the_session_is_live() {
+        let manager = SessionManager::default();
+        let path = history_store("stop-bytes");
+        manager.configure_history(path).unwrap();
+        insert_fake_session(&manager, "s-bytes", false);
+        {
+            let mut sessions = manager.sessions.lock().unwrap();
+            let session = sessions.get_mut("s-bytes").unwrap();
+            let mut buffer = session.buffer.lock().unwrap();
+            buffer.data.push_str("hello");
+            buffer.end_offset = 5;
+        }
+        manager.record_start(super::SessionRecord {
+            id: "s-bytes".to_string(),
+            tool_id: "claude".to_string(),
+            tool_name: "Claude Code".to_string(),
+            project_path: history_project(),
+            title: None,
+            started_at_ms: 10,
+            ended_at_ms: None,
+            exit_reason: None,
+            output_bytes: None,
+        });
+
+        manager.stop("s-bytes").unwrap();
+
+        let listed = manager.list_history().unwrap();
+        assert_eq!(listed[0].exit_reason.as_deref(), Some("已停止"));
+        assert_eq!(listed[0].output_bytes, Some(5));
+        assert!(manager.finished.lock().unwrap().is_empty());
     }
 
     #[test]
