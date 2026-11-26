@@ -4,6 +4,7 @@ import TerminalView from "./TerminalView";
 import { SESSION_TITLE_MAX_CHARS, normalizeManualTitle } from "./sessionNaming";
 import { sessionTitle, type SessionInfo } from "./types";
 import type { RenameResult } from "./useLauncher";
+import { activityLabel, type SessionActivity } from "./useSessionActivity";
 
 type Props = {
   session: SessionInfo;
@@ -13,6 +14,7 @@ type Props = {
   focusRequest: number;
   running: boolean;
   statusUnknown: boolean;
+  activity?: SessionActivity;
   exitReason: string | null;
   busy: boolean;
   closeError?: string | null;
@@ -24,6 +26,8 @@ type Props = {
   ) => void;
   onRename: (title: string) => Promise<RenameResult>;
   onPromptLine: (id: string, line: string) => void;
+  onOutputActivity?: (id: string) => void;
+  onUserInput?: (id: string) => void;
 };
 
 export default function SessionPanel({
@@ -34,6 +38,7 @@ export default function SessionPanel({
   focusRequest,
   running,
   statusUnknown,
+  activity = "idle",
   exitReason,
   busy,
   closeError,
@@ -42,6 +47,8 @@ export default function SessionPanel({
   onConnection,
   onRename,
   onPromptLine,
+  onOutputActivity,
+  onUserInput,
 }: Props) {
   const [confirmClose, setConfirmClose] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -134,11 +141,21 @@ export default function SessionPanel({
               {label}
             </button>
           )}
-          <span className={`badge ${running ? "badge-installed" : ""}`}>
+          <span
+            className={`badge ${
+              !running
+                ? ""
+                : statusUnknown
+                  ? "badge-attention"
+                  : activity === "working"
+                    ? "badge-working"
+                    : activity === "done"
+                      ? "badge-done"
+                      : "badge-installed"
+            }`}
+          >
             {running
-              ? statusUnknown
-                ? "状态未知"
-                : "运行中"
+              ? activityLabel(activity, running, statusUnknown)
               : exitReason
                 ? `已退出：${exitReason}`
                 : "已结束"}
@@ -204,6 +221,8 @@ export default function SessionPanel({
         onExit={onExit}
         onConnection={onConnection}
         onPromptLine={onPromptLine}
+        onOutputActivity={onOutputActivity}
+        onUserInput={onUserInput}
       />
     </section>
   );
