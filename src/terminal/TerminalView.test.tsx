@@ -109,37 +109,46 @@ afterEach(() => {
 });
 
 describe("terminal clipboard wiring", () => {
-  it("connects the copy/paste buttons and xterm key handler to native clipboard", async () => {
+  const sendKey = (
+    handler: (event: KeyboardEvent) => boolean,
+    key: string,
+    init: KeyboardEventInit = {},
+  ) =>
+    handler(
+      new KeyboardEvent("keydown", {
+        key,
+        cancelable: true,
+        ...init,
+      }),
+    );
+
+  it("connects the xterm key handler to native clipboard without redundant toolbar buttons", async () => {
     render(<TerminalView {...props} />);
     await waitFor(() =>
       expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce(),
     );
+    expect(screen.queryByRole("button", { name: "简洁模式" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "复制" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "粘贴" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "输入终端" })).toBeNull();
+    expect(screen.getByRole("button", { name: "回到底部" })).toBeTruthy();
+
     expect(mocks.readText).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "复制" }));
+    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+      .calls[0][0] as (event: KeyboardEvent) => boolean;
+    expect(sendKey(handler, "c", { ctrlKey: true })).toBe(false);
     await waitFor(() =>
       expect(mocks.writeText).toHaveBeenCalledExactlyOnceWith("合成选中文字"),
     );
-    fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+    expect(sendKey(handler, "v", { ctrlKey: true })).toBe(false);
     await waitFor(() =>
       expect(mocks.terminal.paste).toHaveBeenCalledExactlyOnceWith(
         "合成粘贴文本\n第二行",
       ),
     );
-    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
-      .calls[0][0] as (event: KeyboardEvent) => boolean;
-    expect(
-      handler(
-        new KeyboardEvent("keydown", {
-          key: "v",
-          ctrlKey: true,
-          cancelable: true,
-        }),
-      ),
-    ).toBe(false);
-    await waitFor(() => expect(mocks.terminal.paste).toHaveBeenCalledTimes(2));
   });
 
-  it("keeps copy available after exit while disabling paste", async () => {
+  it("keeps copy available after exit while ignoring paste", async () => {
     vi.mocked(connectSession).mockImplementation((_id, _bridge, callbacks) => {
       callbacks.phase("exited", null);
       return { send: vi.fn(), dispose: vi.fn(), ready: Promise.resolve() };
@@ -148,11 +157,10 @@ describe("terminal clipboard wiring", () => {
     await waitFor(() =>
       expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce(),
     );
-    expect(
-      (screen.getByRole("button", { name: "粘贴" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: "复制" }));
+    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+      .calls[0][0] as (event: KeyboardEvent) => boolean;
+    expect(sendKey(handler, "v", { ctrlKey: true })).toBe(false);
+    expect(sendKey(handler, "c", { ctrlKey: true })).toBe(false);
     await waitFor(() => expect(mocks.writeText).toHaveBeenCalledOnce());
     expect(mocks.readText).not.toHaveBeenCalled();
   });
@@ -163,7 +171,9 @@ describe("terminal clipboard wiring", () => {
     await waitFor(() =>
       expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce(),
     );
-    fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+      .calls[0][0] as (event: KeyboardEvent) => boolean;
+    sendKey(handler, "v", { ctrlKey: true });
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("粘贴失败");
     fireEvent.click(screen.getByRole("button", { name: "关闭" }));
@@ -174,7 +184,9 @@ describe("terminal clipboard wiring", () => {
     mocks.readText.mockRejectedValueOnce(new Error("no text"));
     render(<TerminalView {...props} />);
     await waitFor(() => expect(mocks.terminal.onData).toHaveBeenCalledOnce());
-    fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+      .calls[0][0] as (event: KeyboardEvent) => boolean;
+    sendKey(handler, "v", { ctrlKey: true });
     await screen.findByRole("alert");
     const onDataHandler = mocks.terminal.onData.mock.calls[0][0] as (
       text: string,
@@ -194,8 +206,10 @@ describe("terminal clipboard wiring", () => {
         await Promise.resolve();
       });
       expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce();
+      const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+        .calls[0][0] as (event: KeyboardEvent) => boolean;
       await act(async () => {
-        fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+        sendKey(handler, "v", { ctrlKey: true });
         await Promise.resolve();
       });
       expect(screen.getByRole("alert").textContent).toContain("粘贴失败");

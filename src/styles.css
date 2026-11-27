@@ -1275,21 +1275,6 @@ h2 {
   flex-direction: column;
   gap: 8px;
 }
-.terminal-view.is-compact .terminal-toolbar > span,
-.terminal-view.is-compact
-  .terminal-actions
-  .ghost-button:not(:first-child):not(.terminal-clipboard-action):not(
-    .terminal-scroll-action
-  ) {
-  display: none;
-}
-.terminal-view.is-compact .terminal-toolbar {
-  justify-content: flex-end;
-  min-height: 28px;
-}
-.terminal-view.is-compact .terminal-frame {
-  padding: 2px;
-}
 
 .terminal-toolbar,
 .terminal-actions {

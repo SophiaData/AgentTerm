@@ -69,8 +69,6 @@ export default function TerminalView({
     layout: () => void;
     reveal: () => void;
     input: () => void;
-    copy: () => Promise<void>;
-    paste: () => Promise<void>;
     invalidatePaste: () => void;
     setTheme: (themeId: ThemeId) => void;
   } | null>(null);
@@ -78,7 +76,6 @@ export default function TerminalView({
   const [problem, setProblem] = useState<string | null>(null);
   const [clipboardProblem, setClipboardProblem] = useState<string | null>(null);
   const [connection, setConnection] = useState(0);
-  const [compact, setCompact] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -273,8 +270,6 @@ export default function TerminalView({
         layout,
         reveal,
         input,
-        copy: clipboard.copy,
-        paste: clipboard.paste,
         invalidatePaste: clipboard.invalidate,
         setTheme: (nextThemeId: ThemeId) => {
           terminal.options.theme = getThemePreset(nextThemeId).terminal;
@@ -411,52 +406,18 @@ export default function TerminalView({
   }, [clipboardProblem]);
 
   return (
-    <div className={`terminal-view${compact ? " is-compact" : ""}`}>
+    <div className="terminal-view">
       <div className="terminal-toolbar">
         <span role="status">
-          {compact
-            ? "简洁模式已隐藏终端辅助栏"
-            : phase === "connecting"
-              ? "正在连接终端…"
-              : phase === "error"
-                ? "终端连接需要处理"
-                : !running || phase === "exited"
-                  ? "进程已结束，输出保留在下方"
-                  : "选中文字后 Ctrl+C 复制 · Ctrl+V 粘贴 · 未选择时 Ctrl+C 中断"}
+          {phase === "connecting"
+            ? "正在连接终端…"
+            : phase === "error"
+              ? "终端连接需要处理"
+              : !running || phase === "exited"
+                ? "进程已结束，输出保留在下方"
+                : "选中文字后 Ctrl+C 复制 · Ctrl+V 粘贴 · 未选择时 Ctrl+C 中断"}
         </span>
         <div className="terminal-actions">
-          <button
-            type="button"
-            className="ghost-button"
-            onClick={() => setCompact((value) => !value)}
-          >
-            {compact ? "完整界面" : "简洁模式"}
-          </button>
-          <button
-            type="button"
-            className="ghost-button terminal-clipboard-action"
-            title="复制选中文字 · Ctrl+Shift+C / ⌘C"
-            onClick={() => void controls.current?.copy()}
-          >
-            复制
-          </button>
-          <button
-            type="button"
-            className="ghost-button terminal-clipboard-action"
-            title="粘贴文本 · Ctrl+V / Ctrl+Shift+V / ⌘V"
-            disabled={phase !== "ready" || !running || busy}
-            onClick={() => void controls.current?.paste()}
-          >
-            粘贴
-          </button>
-          <button
-            type="button"
-            className="ghost-button"
-            disabled={phase !== "ready" || !running || busy}
-            onClick={() => controls.current?.focus()}
-          >
-            输入终端
-          </button>
           <button
             type="button"
             className="ghost-button terminal-scroll-action"
