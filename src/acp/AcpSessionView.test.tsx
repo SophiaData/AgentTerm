@@ -60,6 +60,89 @@ afterEach(() => {
 });
 
 describe("AcpSessionView", () => {
+  it("preserves edits and newly attached images while a send receipt is pending", async () => {
+    let finishSend!: () => void;
+    const receipt = new Promise<void>((resolve) => {
+      finishSend = resolve;
+    });
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "acp_snapshot")
+        return Promise.resolve({
+          phase: "ready",
+          busy: false,
+          cliSessionId: "sess_draft",
+          messages: [],
+          toolCalls: [],
+          version: 1,
+        });
+      if (command === "acp_send_prompt") return receipt;
+      return Promise.resolve();
+    });
+    render(<AcpSessionView {...baseProps} />);
+    const input = screen.getByLabelText(
+      "发送消息给 DeepSeek Harness",
+    ) as HTMLTextAreaElement;
+    await waitFor(() => expect(input.disabled).toBe(false));
+    const upload = screen.getByLabelText("上传图片附件");
+    const firstImage = new File(
+      [new Uint8Array([137, 80, 78, 71])],
+      "first.png",
+      { type: "image/png" },
+    );
+    fireEvent.change(upload, { target: { files: [firstImage] } });
+    await screen.findByLabelText("移除 first.png");
+    fireEvent.change(input, { target: { value: "第一条请求" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith(
+        "acp_send_prompt",
+        expect.objectContaining({ text: "第一条请求" }),
+      ),
+    );
+    fireEvent.change(input, { target: { value: "发送期间编辑的下一条请求" } });
+    const nextImage = new File(
+      [new Uint8Array([137, 80, 78, 71])],
+      "next.png",
+      { type: "image/png" },
+    );
+    fireEvent.change(upload, { target: { files: [nextImage] } });
+    await screen.findByLabelText("移除 next.png");
+    await act(async () => {
+      finishSend();
+      await receipt;
+    });
+    expect(input.value).toBe("发送期间编辑的下一条请求");
+    expect(screen.queryByLabelText("移除 first.png")).toBeNull();
+    expect(screen.getByLabelText("移除 next.png")).toBeTruthy();
+  });
+
+  it("keeps a failed send draft and clears only an unchanged successful submission", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "acp_snapshot")
+        return {
+          phase: "ready",
+          busy: false,
+          cliSessionId: "sess_retry",
+          messages: [],
+          toolCalls: [],
+          version: 1,
+        };
+      if (command === "acp_send_prompt") throw new Error("queue full");
+    });
+    render(<AcpSessionView {...baseProps} />);
+    const input = screen.getByLabelText(
+      "发送消息给 DeepSeek Harness",
+    ) as HTMLTextAreaElement;
+    await waitFor(() => expect(input.disabled).toBe(false));
+    fireEvent.change(input, { target: { value: "保留重试内容" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await screen.findByText("queue full");
+    expect(input.value).toBe("保留重试内容");
+    mocks.invoke.mockResolvedValue(undefined);
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(input.value).toBe(""));
+  });
+
   it("loads snapshot, streams updates, sends prompt, handles permission, and cancels turn", async () => {
     const readySnapshot: AcpSnapshot = {
       phase: "ready",

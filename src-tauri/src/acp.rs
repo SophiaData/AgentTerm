@@ -21,6 +21,7 @@ const MAX_TOOL_CALLS: usize = 200;
 const MAX_TOOL_DETAIL_CHARS: usize = 8 * 1024;
 const MAX_STDERR_CHARS: usize = 500;
 const WRITER_QUEUE_CAP: usize = 128;
+const MAX_PENDING_PERMISSIONS: usize = 32;
 const MAX_PROMPT_IMAGES: usize = 4;
 const MAX_IMAGE_BASE64_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FILE_SEARCH_SCAN: usize = 2500;
@@ -221,6 +222,7 @@ pub(crate) struct AcpState {
     pending_config_requests: HashSet<u64>,
     active_stream: Option<(String, Option<String>)>,
     pending_permission_raw_id: Option<(String, Value)>,
+    queued_permissions: VecDeque<(AcpPermissionRequest, Value)>,
     next_message_seq: u64,
     total_output_bytes: u64,
     snapshot: AcpSnapshot,
@@ -261,6 +263,7 @@ impl AcpState {
             pending_config_requests: HashSet::new(),
             active_stream: None,
             pending_permission_raw_id: None,
+            queued_permissions: VecDeque::new(),
             next_message_seq: 0,
             total_output_bytes: 0,
             snapshot: AcpSnapshot {
@@ -439,6 +442,70 @@ impl AcpState {
             });
         }
     }
+
+    fn respond_permission(
+        &mut self,
+        writer: &AcpWriter,
+        request_id: &str,
+        option_id: Option<&str>,
+    ) -> Result<(), String> {
+        let Some((expected_id, raw_id)) = self.pending_permission_raw_id.as_ref() else {
+            return Err("当前没有待处理的权限确认".to_string());
+        };
+        if expected_id != request_id {
+            return Err("权限请求已过期或编号不匹配".to_string());
+        }
+        if let Some(chosen) = option_id
+            && !self
+                .snapshot
+                .pending_permission
+                .as_ref()
+                .is_some_and(|request| {
+                    request
+                        .options
+                        .iter()
+                        .any(|option| option.option_id == chosen)
+                })
+        {
+            return Err("权限选项无效，请重新核对请求".to_string());
+        }
+        let outcome = match option_id {
+            Some(chosen) => json!({ "outcome": "selected", "optionId": chosen }),
+            None => json!({ "outcome": "cancelled" }),
+        };
+        // Keep the request available on queue rejection; the user can retry.
+        writer.send_json(&json!({
+            "jsonrpc": "2.0", "id": raw_id,
+            "result": { "outcome": outcome }
+        }))?;
+        if let Some((next, raw_id)) = self.queued_permissions.pop_front() {
+            self.pending_permission_raw_id = Some((next.request_id.clone(), raw_id));
+            self.snapshot.pending_permission = Some(next);
+        } else {
+            self.pending_permission_raw_id = None;
+            self.snapshot.pending_permission = None;
+        }
+        self.bump();
+        Ok(())
+    }
+
+    fn clear_permissions(&mut self) -> Vec<Value> {
+        let mut cancelled = Vec::new();
+        if let Some((_, raw_id)) = self.pending_permission_raw_id.take() {
+            cancelled.push(permission_cancelled(raw_id));
+        }
+        cancelled.extend(
+            self.queued_permissions
+                .drain(..)
+                .map(|(_, id)| permission_cancelled(id)),
+        );
+        self.snapshot.pending_permission = None;
+        cancelled
+    }
+}
+
+fn permission_cancelled(raw_id: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": raw_id, "result": {"outcome": {"outcome": "cancelled"}}})
 }
 
 pub struct AcpSessionHandle {
@@ -553,33 +620,10 @@ impl AcpSessionHandle {
         request_id: &str,
         option_id: Option<&str>,
     ) -> Result<(), String> {
-        let raw_id = {
-            let mut guard = self
-                .state
-                .lock()
-                .map_err(|_| "ACP 会话状态不可用".to_string())?;
-            let Some((expected_id, raw_id)) = guard.pending_permission_raw_id.take() else {
-                return Err("当前没有待处理的权限确认".to_string());
-            };
-            if expected_id != request_id {
-                guard.pending_permission_raw_id = Some((expected_id, raw_id));
-                return Err("权限请求已过期或编号不匹配".to_string());
-            }
-            guard.snapshot.pending_permission = None;
-            guard.bump();
-            raw_id
-        };
-        let outcome = match option_id {
-            Some(chosen) => json!({ "outcome": "selected", "optionId": chosen }),
-            None => json!({ "outcome": "cancelled" }),
-        };
-        self.writer.send_json(&json!({
-            "jsonrpc": "2.0",
-            "id": raw_id,
-            "result": {
-                "outcome": outcome,
-            }
-        }))
+        self.state
+            .lock()
+            .map_err(|_| "ACP 会话状态不可用".to_string())?
+            .respond_permission(&self.writer, request_id, option_id)
     }
 
     pub fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), String> {
@@ -931,10 +975,8 @@ pub(crate) fn spawn_acp_with_command(
             }
         }
 
-        let status_reason = reader_child
-            .lock()
+        let status_reason = wait_for_child_exit(&reader_child)
             .ok()
-            .and_then(|mut child| child.wait().ok())
             .map(|status| format!("{status}"))
             .unwrap_or_else(|| "已退出".to_string());
         let stderr_note = stderr_tail
@@ -946,8 +988,7 @@ pub(crate) fn spawn_acp_with_command(
             let was_connecting = guard.snapshot.phase == AcpPhase::Connecting;
             guard.snapshot.busy = false;
             guard.active_prompt_id = None;
-            guard.pending_permission_raw_id = None;
-            guard.snapshot.pending_permission = None;
+            let _ = guard.clear_permissions();
             if was_connecting && !reader_closed.load(Ordering::SeqCst) {
                 guard.snapshot.phase = AcpPhase::Error;
                 let detail = stderr_note
@@ -981,6 +1022,22 @@ pub(crate) fn spawn_acp_with_command(
         state,
         closed,
     })
+}
+
+// stdout EOF does not prove process exit. Release the handle lock between
+// checks so terminate() can still kill a process which closed stdout first.
+fn wait_for_child_exit(child: &Mutex<Child>) -> Result<std::process::ExitStatus, String> {
+    loop {
+        let status = child
+            .lock()
+            .map_err(|_| "无法访问 ACP 进程句柄".to_string())?
+            .try_wait()
+            .map_err(|error| format!("无法确认 ACP 会话状态：{error}"))?;
+        if let Some(status) = status {
+            return Ok(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 pub(crate) struct ApplyOutcome {
@@ -1062,6 +1119,7 @@ pub(crate) fn apply_server_message(state: &mut AcpState, value: &Value) -> Apply
                     state.bump();
                 }
             } else if id_num.is_some() && id_num == state.active_prompt_id {
+                outgoing.extend(state.clear_permissions());
                 state.snapshot.busy = false;
                 state.active_prompt_id = None;
                 state.active_stream = None;
@@ -1143,14 +1201,21 @@ pub(crate) fn apply_server_message(state: &mut AcpState, value: &Value) -> Apply
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            state.pending_permission_raw_id = Some((request_id.clone(), raw_id));
-            state.snapshot.pending_permission = Some(AcpPermissionRequest {
+            let request = AcpPermissionRequest {
                 request_id,
                 title,
                 description,
                 tool_call_id,
                 options,
-            });
+            };
+            if state.pending_permission_raw_id.is_none() {
+                state.pending_permission_raw_id = Some((request.request_id.clone(), raw_id));
+                state.snapshot.pending_permission = Some(request);
+            } else if state.queued_permissions.len() + 1 < MAX_PENDING_PERMISSIONS {
+                state.queued_permissions.push_back((request, raw_id));
+            } else {
+                outgoing.push(permission_cancelled(raw_id));
+            }
             state.bump();
         }
         (Some(_), true) => {
@@ -1653,6 +1718,175 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    #[ignore = "local subprocess fixture, invoked by lifecycle regression tests"]
+    fn acp_process_fixture() {
+        use std::io::{BufRead, Write};
+        match std::env::var("AGENTTERM_ACP_TEST_MODE").as_deref() {
+            Ok("wait") => std::thread::sleep(std::time::Duration::from_secs(2)),
+            Ok("handshake") => {
+                for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let result = match request["method"].as_str() {
+                        Some("initialize") => json!({"protocolVersion": 1}),
+                        Some("session/new") => json!({"sessionId": "sess_fixture"}),
+                        _ => continue,
+                    };
+                    println!(
+                        "{}",
+                        json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                    );
+                    std::io::stdout().flush().unwrap();
+                    if request["method"] == "session/new" {
+                        break;
+                    }
+                }
+            }
+            _ => panic!("fixture mode missing"),
+        }
+    }
+
+    #[test]
+    fn waiting_for_exit_leaves_child_available_for_stop() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::{Duration, Instant};
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acp::tests::acp_process_fixture",
+                "--ignored",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env("AGENTTERM_ACP_TEST_MODE", "wait")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let child = Arc::new(Mutex::new(child));
+        let watched = Arc::clone(&child);
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let result = super::wait_for_child_exit(&watched);
+            done_tx.send(result).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut stopped = false;
+        while Instant::now() < deadline {
+            if let Ok(mut process) = child.try_lock() {
+                process.kill().unwrap();
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done_rx
+            .recv_timeout(Duration::from_secs(4))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+        assert!(stopped, "exit waiter held the child lock and blocked stop");
+    }
+
+    fn permission_request(id: serde_json::Value) -> serde_json::Value {
+        json!({"jsonrpc":"2.0", "id":id, "method":"session/request_permission",
+            "params":{"options":[{"optionId":"allow", "name":"允许一次", "kind":"allow_once"}]}})
+    }
+
+    #[test]
+    fn permissions_are_answered_in_order_and_failed_send_is_retryable() {
+        let mut state = AcpState::new("dsh", "/project", None, None);
+        apply_server_message(&mut state, &permission_request(json!(42)));
+        apply_server_message(&mut state, &permission_request(json!("second")));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let writer = super::AcpWriter {
+            tx,
+            closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        // A full writer queue must retain the first request and its options.
+        writer.send_json(&json!({"occupied":true})).unwrap();
+        assert!(
+            state
+                .respond_permission(&writer, "42", Some("allow"))
+                .is_err()
+        );
+        assert_eq!(
+            state
+                .snapshot
+                .pending_permission
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "42"
+        );
+        rx.recv().unwrap();
+        assert!(
+            state
+                .respond_permission(&writer, "second", Some("allow"))
+                .is_err()
+        );
+        assert!(
+            state
+                .respond_permission(&writer, "42", Some("invented"))
+                .is_err()
+        );
+        state
+            .respond_permission(&writer, "42", Some("allow"))
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(response["id"], 42);
+        assert_eq!(response["result"]["outcome"]["optionId"], "allow");
+        assert_eq!(
+            state
+                .snapshot
+                .pending_permission
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "second"
+        );
+        state.respond_permission(&writer, "second", None).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(response["id"], "second");
+        assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+        assert!(state.snapshot.pending_permission.is_none());
+    }
+
+    #[test]
+    fn permission_overflow_and_finished_turn_get_explicit_cancellations() {
+        let mut state = AcpState::new("dsh", "/project", None, None);
+        for id in 0..super::MAX_PENDING_PERMISSIONS {
+            assert!(
+                apply_server_message(&mut state, &permission_request(json!(id)))
+                    .outgoing
+                    .is_empty()
+            );
+        }
+        let overflow = apply_server_message(&mut state, &permission_request(json!(1000)));
+        assert_eq!(
+            overflow.outgoing,
+            vec![super::permission_cancelled(json!(1000))]
+        );
+        assert_eq!(
+            state
+                .snapshot
+                .pending_permission
+                .as_ref()
+                .unwrap()
+                .request_id,
+            "0"
+        );
+        state.active_prompt_id = Some(1001);
+        let finished = apply_server_message(
+            &mut state,
+            &json!({"id":1001, "result":{"stopReason":"cancelled"}}),
+        );
+        assert_eq!(finished.outgoing.len(), super::MAX_PENDING_PERMISSIONS);
+        assert!(state.snapshot.pending_permission.is_none());
+        assert!(state.queued_permissions.is_empty());
+    }
+
+    #[test]
     fn handshake_session_open_stream_and_permission_roundtrip() {
         let mut state = AcpState::new("dsh", "E:\\AgentTerm", None, None);
 
@@ -1782,15 +2016,20 @@ mod tests {
 
     #[test]
     fn parses_config_options_and_handles_updates() {
-        let mut state = AcpState::new("dsh", r"\\?\E:\AgentTerm", None, None);
-        assert_eq!(state.project_path, r"E:\AgentTerm");
+        let (project, expected) = if cfg!(windows) {
+            (r"\\?\E:\AgentTerm", r"E:\AgentTerm")
+        } else {
+            ("/tmp/AgentTerm", "/tmp/AgentTerm")
+        };
+        let mut state = AcpState::new("dsh", project, None, None);
+        assert_eq!(state.project_path, expected);
 
         let init_ok = apply_server_message(
             &mut state,
             &json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}}),
         );
         let setup_id = init_ok.outgoing[0]["id"].as_u64().unwrap();
-        assert_eq!(init_ok.outgoing[0]["params"]["cwd"], r"E:\AgentTerm");
+        assert_eq!(init_ok.outgoing[0]["params"]["cwd"], expected);
 
         let open_ok = apply_server_message(
             &mut state,
