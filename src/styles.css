@@ -3660,3 +3660,151 @@ h2 {
   text-transform: uppercase;
   margin-bottom: 2px;
 }
+
+.acp-diff-block {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-background);
+  overflow-x: auto;
+  max-height: 240px;
+  font-family:
+    "Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.acp-diff-line {
+  padding: 1px 8px;
+  white-space: pre;
+}
+
+.acp-diff-line.is-add {
+  background: var(--color-success-tint);
+  color: var(--color-success-text);
+}
+
+.acp-diff-line.is-del {
+  background: var(--color-danger-tint);
+  color: var(--color-danger-text);
+}
+
+.acp-diff-line.is-hunk {
+  background: var(--color-accent-tint);
+  color: var(--color-primary);
+}
+
+.acp-diff-line.is-meta {
+  color: var(--color-muted);
+  font-weight: 600;
+}
+
+.acp-composer-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.acp-popup {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 8px;
+  background: var(--color-surface);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+
+.acp-popup-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--color-foreground);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.acp-popup-item.is-active,
+.acp-popup-item:hover {
+  background: var(--color-accent-tint);
+  color: var(--color-primary);
+}
+
+.acp-popup-name {
+  font-family:
+    "Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acp-popup-desc {
+  font-size: 11px;
+  color: var(--color-muted);
+  white-space: nowrap;
+}
+
+.acp-attachment-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.acp-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 6px;
+  background: var(--color-surface);
+  font-size: 11px;
+}
+
+.acp-attachment-thumb {
+  width: 24px;
+  height: 24px;
+  object-fit: cover;
+  border-radius: 3px;
+}
+
+.acp-attachment-name {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acp-attachment-remove {
+  border: 0;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.acp-composer.is-drag-over {
+  border-color: var(--color-primary);
+  background: var(--color-accent-tint);
+}
+
+.acp-attach-btn {
+  padding: 6px 10px;
+  font-size: 12px;
+}

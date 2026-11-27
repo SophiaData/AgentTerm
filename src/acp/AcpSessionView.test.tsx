@@ -391,4 +391,101 @@ describe("AcpSessionView", () => {
       }),
     );
   });
+
+  it("supports slash commands, @ file mentions, image attachments, and tool diff views", async () => {
+    const devSnapshot: AcpSnapshot = {
+      phase: "ready",
+      busy: false,
+      cliSessionId: "sess_dev",
+      messages: [
+        {
+          id: "m1",
+          role: "assistant",
+          text: "补丁示例：\n```diff\n- oldLine\n+ newLine\n```",
+        },
+      ],
+      toolCalls: [
+        {
+          id: "call-edit",
+          title: "edit_file",
+          status: "completed",
+          input: JSON.stringify({
+            file_path: "src/App.tsx",
+            old_string: "const a = 1;",
+            new_string: "const a = 2;",
+          }),
+          detail: "updated",
+        },
+      ],
+      timeline: [
+        { kind: "tool", id: "call-edit" },
+        { kind: "message", id: "m1" },
+      ],
+      availableCommands: [
+        { name: "review", description: "审查当前改动", inputHint: "[path]" },
+      ],
+      version: 1,
+    };
+    mocks.invoke.mockImplementation(
+      async (command: string, args?: Record<string, unknown>) => {
+        if (command === "acp_snapshot") return devSnapshot;
+        if (command === "acp_search_project_files") {
+          expect(args?.query).toBe("app");
+          return ["src/App.tsx", "src/App.test.tsx"];
+        }
+        return undefined;
+      },
+    );
+
+    render(<AcpSessionView {...baseProps} />);
+    await screen.findByText("- const a = 1;");
+    expect(screen.getByText("+ const a = 2;")).toBeTruthy();
+    expect(screen.getByText("- oldLine")).toBeTruthy();
+    expect(screen.getByText("+ newLine")).toBeTruthy();
+
+    const input = screen.getByLabelText(
+      "发送消息给 DeepSeek Harness",
+    ) as HTMLTextAreaElement;
+
+    // Slash command popup renders built-in + server commands and inserts /review
+    fireEvent.change(input, {
+      target: { value: "/rev", selectionStart: 4 },
+    });
+    expect(screen.getByRole("listbox", { name: "斜杠命令补全" })).toBeTruthy();
+    expect(screen.getByText("/review")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input.value).toBe("/review ");
+
+    // @ file mention searches project files and inserts @src/App.tsx
+    fireEvent.change(input, {
+      target: { value: "请检查 @app", selectionStart: 8 },
+    });
+    const filePopup = await screen.findByRole("listbox", {
+      name: "引用项目文件",
+    });
+    expect(filePopup.textContent).toContain("@src/App.tsx");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input.value).toBe("请检查 @src/App.tsx ");
+
+    // Upload image attachment via file input and send prompt with images
+    const fileInput = screen.getByLabelText("上传图片附件") as HTMLInputElement;
+    const pngBytes = new Uint8Array([137, 80, 78, 71]);
+    const file = new File([pngBytes], "screen.png", { type: "image/png" });
+    fireEvent.change(fileInput, { target: { files: [file] } });
+    await screen.findByLabelText("待发送图片");
+
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith("acp_send_prompt", {
+        sessionId: "acp-session-1",
+        text: "请检查 @src/App.tsx",
+        images: [
+          expect.objectContaining({
+            mimeType: "image/png",
+            name: "screen.png",
+          }),
+        ],
+      }),
+    );
+  });
 });

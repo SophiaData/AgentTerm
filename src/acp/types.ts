@@ -55,6 +55,18 @@ export type AcpPermissionRequest = {
   options: AcpPermissionOption[];
 };
 
+export type AcpCommandSpec = {
+  name: string;
+  description: string;
+  inputHint?: string | null;
+};
+
+export type AcpImageAttachment = {
+  mimeType: string;
+  data: string;
+  name?: string | null;
+};
+
 export type AcpSnapshot = {
   phase: AcpPhase;
   busy: boolean;
@@ -65,6 +77,7 @@ export type AcpSnapshot = {
   toolCalls: AcpToolCall[];
   timeline?: AcpTimelineEntry[];
   usage?: AcpUsage | null;
+  availableCommands?: AcpCommandSpec[];
   configOptions?: AcpConfigOption[];
   pendingPermission?: AcpPermissionRequest | null;
   version: number;

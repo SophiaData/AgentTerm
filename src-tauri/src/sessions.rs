@@ -1873,14 +1873,30 @@ impl SessionManager {
         app: &AppHandle,
         session_id: &str,
         text: &str,
+        images: &[crate::acp::AcpImageInput],
     ) -> Result<(), String> {
         let guard = self.lock_acp()?;
         let session = guard
             .get(session_id)
             .ok_or_else(|| "ACP 会话不存在或已结束".to_string())?;
-        let result = session.send_prompt(text);
+        let result = session.send_prompt(text, images);
         session.emit_snapshot(app);
         result
+    }
+
+    pub fn acp_search_project_files(
+        &self,
+        session_id: &str,
+        query: &str,
+    ) -> Result<Vec<String>, String> {
+        let project_path = {
+            let guard = self.lock_acp()?;
+            let session = guard
+                .get(session_id)
+                .ok_or_else(|| "ACP 会话不存在或已结束".to_string())?;
+            session.project_path()
+        };
+        crate::acp::search_project_files_in_dir(&project_path, query)
     }
 
     pub fn acp_cancel_turn(&self, session_id: &str) -> Result<(), String> {

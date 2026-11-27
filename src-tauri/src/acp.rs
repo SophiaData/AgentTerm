@@ -1,8 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -21,6 +21,11 @@ const MAX_TOOL_CALLS: usize = 200;
 const MAX_TOOL_DETAIL_CHARS: usize = 8 * 1024;
 const MAX_STDERR_CHARS: usize = 500;
 const WRITER_QUEUE_CAP: usize = 128;
+const MAX_PROMPT_IMAGES: usize = 4;
+const MAX_IMAGE_BASE64_BYTES: usize = 10 * 1024 * 1024;
+const MAX_FILE_SEARCH_SCAN: usize = 2500;
+const MAX_FILE_SEARCH_DEPTH: usize = 6;
+const MAX_FILE_SEARCH_RESULTS: usize = 25;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -116,6 +121,24 @@ pub struct AcpConfigOption {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AcpCommandSpec {
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpImageInput {
+    pub mime_type: String,
+    pub data: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpSnapshot {
     pub phase: AcpPhase,
     pub busy: bool,
@@ -131,6 +154,8 @@ pub struct AcpSnapshot {
     pub timeline: Vec<AcpTimelineEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AcpUsage>,
+    #[serde(default)]
+    pub available_commands: Vec<AcpCommandSpec>,
     #[serde(default)]
     pub config_options: Vec<AcpConfigOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,6 +273,7 @@ impl AcpState {
                 tool_calls: Vec::new(),
                 timeline: Vec::new(),
                 usage: None,
+                available_commands: Vec::new(),
                 config_options: Vec::new(),
                 pending_permission: None,
                 version: 1,
@@ -435,11 +461,26 @@ impl AcpSessionHandle {
             .map_err(|_| "无法读取 ACP 会话状态".to_string())
     }
 
-    pub fn send_prompt(&self, raw_text: &str) -> Result<(), String> {
+    pub fn project_path(&self) -> PathBuf {
+        self.state
+            .lock()
+            .map(|guard| PathBuf::from(&guard.project_path))
+            .unwrap_or_else(|_| strip_windows_verbatim(Path::new(&self.info.project_path)))
+    }
+
+    pub fn send_prompt(&self, raw_text: &str, images: &[AcpImageInput]) -> Result<(), String> {
         let text = raw_text.trim();
-        if text.is_empty() {
+        if text.is_empty() && images.is_empty() {
             return Err("发送内容不能为空".to_string());
         }
+        let mut prompt_blocks = validate_acp_images(images)?;
+        if !text.is_empty() {
+            prompt_blocks.push(json!({
+                "type": "text",
+                "text": text,
+            }));
+        }
+        let display_text = format_user_prompt_display(text, images);
         let (request_id, cli_session_id) = {
             let mut guard = self
                 .state
@@ -461,7 +502,7 @@ impl AcpSessionHandle {
             guard.active_prompt_id = Some(id);
             guard.snapshot.busy = true;
             guard.snapshot.error = None;
-            guard.push_message("user", text.to_string());
+            guard.push_message("user", display_text);
             (id, cli_session_id)
         };
         let payload = json!({
@@ -470,10 +511,7 @@ impl AcpSessionHandle {
             "method": "session/prompt",
             "params": {
                 "sessionId": cli_session_id,
-                "prompt": [{
-                    "type": "text",
-                    "text": text,
-                }],
+                "prompt": prompt_blocks,
             }
         });
         if let Err(error) = self.writer.send_json(&payload) {
@@ -657,8 +695,18 @@ pub fn acp_send_prompt(
     app: AppHandle,
     session_id: String,
     text: String,
+    images: Option<Vec<AcpImageInput>>,
 ) -> Result<(), String> {
-    state.acp_send_prompt(&app, &session_id, &text)
+    state.acp_send_prompt(&app, &session_id, &text, &images.unwrap_or_default())
+}
+
+#[tauri::command(async)]
+pub fn acp_search_project_files(
+    state: tauri::State<'_, SessionManager>,
+    session_id: String,
+    query: String,
+) -> Result<Vec<String>, String> {
+    state.acp_search_project_files(&session_id, &query)
 }
 
 #[tauri::command(async)]
@@ -1236,6 +1284,36 @@ fn apply_session_update(state: &mut AcpState, update: &Value) {
                 state.bump();
             }
         }
+        Some("available_commands_update") => {
+            if let Some(items) = update.get("availableCommands").and_then(Value::as_array) {
+                state.snapshot.available_commands = items
+                    .iter()
+                    .filter_map(|item| {
+                        let name = item.get("name").and_then(Value::as_str)?.trim();
+                        if name.is_empty() {
+                            return None;
+                        }
+                        let description = item
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let input_hint = item
+                            .get("input")
+                            .and_then(|input| input.get("hint"))
+                            .or_else(|| item.get("hint"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        Some(AcpCommandSpec {
+                            name: name.to_string(),
+                            description,
+                            input_hint,
+                        })
+                    })
+                    .collect();
+                state.bump();
+            }
+        }
         Some("config_option_update") => {
             if let Some(options) = parse_config_options(update.get("configOptions")) {
                 state.snapshot.config_options = options;
@@ -1401,6 +1479,172 @@ fn trim_chars_tail(text: &str, max_chars: usize) -> String {
     }
     let skip = count.saturating_sub(max_chars);
     text.chars().skip(skip).collect()
+}
+
+fn is_valid_canonical_base64(data: &str) -> bool {
+    if data.is_empty() || data.len() > MAX_IMAGE_BASE64_BYTES || !data.len().is_multiple_of(4) {
+        return false;
+    }
+    let bytes = data.as_bytes();
+    let mut padding_seen = false;
+    let mut padding_count = 0usize;
+    for &byte in bytes {
+        if byte == b'=' {
+            padding_seen = true;
+            padding_count += 1;
+            if padding_count > 2 {
+                return false;
+            }
+        } else if padding_seen || !(byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/') {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_acp_images(images: &[AcpImageInput]) -> Result<Vec<Value>, String> {
+    if images.len() > MAX_PROMPT_IMAGES {
+        return Err(format!("单次最多附带 {MAX_PROMPT_IMAGES} 张图片"));
+    }
+    let mut blocks = Vec::with_capacity(images.len());
+    for img in images {
+        let mime = img.mime_type.trim();
+        if !matches!(
+            mime,
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+        ) {
+            return Err("仅支持 PNG、JPEG、WebP 或 GIF 图片".to_string());
+        }
+        if !is_valid_canonical_base64(&img.data) {
+            return Err("图片编码格式无效或体积超出限制".to_string());
+        }
+        blocks.push(json!({
+            "type": "image",
+            "mimeType": mime,
+            "data": img.data,
+        }));
+    }
+    Ok(blocks)
+}
+
+fn format_user_prompt_display(text: &str, images: &[AcpImageInput]) -> String {
+    if images.is_empty() {
+        return text.to_string();
+    }
+    let tags: Vec<String> = images
+        .iter()
+        .enumerate()
+        .map(|(index, img)| {
+            let label = img
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("图片 {}", index + 1));
+            format!("[图片: {label}]")
+        })
+        .collect();
+    if text.is_empty() {
+        tags.join(" ")
+    } else {
+        format!("{}\n{}", tags.join(" "), text)
+    }
+}
+
+fn should_skip_search_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | "dist" | ".next" | ".venv" | ".trash" | "build"
+    )
+}
+
+fn is_symlink_or_reparse(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return true;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_type().is_symlink() || meta.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+pub(crate) fn search_project_files_in_dir(
+    root: &Path,
+    raw_query: &str,
+) -> Result<Vec<String>, String> {
+    let clean_root = strip_windows_verbatim(root);
+    if !clean_root.is_dir() {
+        return Err("项目目录不存在或不可访问".to_string());
+    }
+    let query = raw_query.trim().to_ascii_lowercase();
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    queue.push_back((clean_root.clone(), 0));
+    let mut scanned = 0usize;
+    let mut candidates: Vec<(u8, String)> = Vec::new();
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if scanned >= MAX_FILE_SEARCH_SCAN {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        children.sort();
+
+        for path in children {
+            if scanned >= MAX_FILE_SEARCH_SCAN {
+                break;
+            }
+            scanned += 1;
+            if is_symlink_or_reparse(&path) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_dir() {
+                if depth < MAX_FILE_SEARCH_DEPTH && !should_skip_search_dir(name) {
+                    queue.push_back((path, depth + 1));
+                }
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(&clean_root) else {
+                continue;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if query.is_empty() {
+                candidates.push((1, rel_str));
+                continue;
+            }
+            let rel_lower = rel_str.to_ascii_lowercase();
+            let base_lower = name.to_ascii_lowercase();
+            if base_lower.starts_with(&query) {
+                candidates.push((0, rel_str));
+            } else if rel_lower.contains(&query) {
+                candidates.push((1, rel_str));
+            }
+        }
+    }
+
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(candidates
+        .into_iter()
+        .take(MAX_FILE_SEARCH_RESULTS)
+        .map(|(_, path)| path)
+        .collect())
 }
 
 #[cfg(test)]
@@ -1865,5 +2109,73 @@ mod tests {
             }),
         );
         assert_eq!(state.snapshot.messages.len(), 3);
+    }
+
+    #[test]
+    fn parses_available_commands_and_searches_project_files_and_images() {
+        let mut state = AcpState::new("dsh", "E:\\AgentTerm", None, None);
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": [{
+                            "name": "review",
+                            "description": "审查改动",
+                            "input": { "hint": "[path]" }
+                        }]
+                    }
+                }
+            }),
+        );
+        assert_eq!(state.snapshot.available_commands.len(), 1);
+        assert_eq!(state.snapshot.available_commands[0].name, "review");
+        assert_eq!(
+            state.snapshot.available_commands[0].input_hint.as_deref(),
+            Some("[path]")
+        );
+
+        let ok_img = vec![super::AcpImageInput {
+            mime_type: "image/png".to_string(),
+            data: "AAAA".to_string(),
+            name: Some("shot.png".to_string()),
+        }];
+        let blocks = super::validate_acp_images(&ok_img).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(
+            super::format_user_prompt_display("看图", &ok_img),
+            "[图片: shot.png]\n看图"
+        );
+
+        assert!(
+            super::validate_acp_images(&[super::AcpImageInput {
+                mime_type: "image/svg+xml".to_string(),
+                data: "AAAA".to_string(),
+                name: None,
+            }])
+            .is_err()
+        );
+        assert!(
+            super::validate_acp_images(&[super::AcpImageInput {
+                mime_type: "image/png".to_string(),
+                data: "not-valid!".to_string(),
+                name: None,
+            }])
+            .is_err()
+        );
+
+        let root = std::env::temp_dir().join(format!("agentterm-acp-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("src/App.tsx"), "").unwrap();
+        std::fs::write(root.join("node_modules/pkg/ignored.ts"), "").unwrap();
+        let found = super::search_project_files_in_dir(&root, "app").unwrap();
+        assert_eq!(found, vec!["src/App.tsx"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

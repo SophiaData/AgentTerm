@@ -230,6 +230,113 @@ export function AcpCopyButton({
   );
 }
 
+export type ExtractedDiff = {
+  path?: string;
+  lines: string[];
+};
+
+function diffLineKind(line: string): "hunk" | "meta" | "add" | "del" | "ctx" {
+  if (line.startsWith("@@")) return "hunk";
+  if (
+    line.startsWith("--- ") ||
+    line.startsWith("+++ ") ||
+    line.startsWith("diff --git") ||
+    line.startsWith("*** ")
+  ) {
+    return "meta";
+  }
+  if (line.startsWith("+")) return "add";
+  if (line.startsWith("-")) return "del";
+  return "ctx";
+}
+
+export function AcpDiffBlock({ lines }: { lines: string[] }) {
+  return (
+    <div className="acp-diff-block" role="region" aria-label="代码变更对比">
+      {lines.map((line, index) => (
+        <div
+          key={`diff-${index}`}
+          className={`acp-diff-line is-${diffLineKind(line)}`}
+        >
+          {line || " "}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function buildPairDiffLines(before: string, after: string): string[] {
+  const out: string[] = [];
+  for (const line of before.replace(/\r\n?/g, "\n").split("\n")) {
+    out.push(`- ${line}`);
+  }
+  for (const line of after.replace(/\r\n?/g, "\n").split("\n")) {
+    out.push(`+ ${line}`);
+  }
+  return out;
+}
+
+export function extractToolDiff(
+  _title: string,
+  input?: string | null,
+  detail?: string | null,
+): ExtractedDiff | null {
+  if (input) {
+    try {
+      const parsed = JSON.parse(input) as Record<string, unknown>;
+      if (parsed && typeof parsed === "object") {
+        const filePath =
+          typeof parsed.file_path === "string"
+            ? parsed.file_path
+            : typeof parsed.path === "string"
+              ? parsed.path
+              : undefined;
+        const pairs: [string, string][] = [
+          ["old_string", "new_string"],
+          ["oldText", "newText"],
+          ["old_str", "new_str"],
+          ["before", "after"],
+        ];
+        for (const [oldKey, newKey] of pairs) {
+          const oldVal = parsed[oldKey];
+          const newVal = parsed[newKey];
+          if (typeof oldVal === "string" && typeof newVal === "string") {
+            return {
+              path: filePath,
+              lines: buildPairDiffLines(oldVal, newVal),
+            };
+          }
+        }
+        const patch =
+          typeof parsed.patch === "string"
+            ? parsed.patch
+            : typeof parsed.diff === "string"
+              ? parsed.diff
+              : null;
+        if (patch) {
+          return {
+            path: filePath,
+            lines: patch.replace(/\r\n?/g, "\n").split("\n"),
+          };
+        }
+      }
+    } catch {
+      // Non-JSON rawInput falls through cleanly to detail inspection.
+    }
+  }
+  if (detail) {
+    const normalized = detail.replace(/\r\n?/g, "\n");
+    const lines = normalized.split("\n");
+    const hasUnified =
+      lines.some((line) => line.startsWith("@@")) &&
+      lines.some((line) => line.startsWith("---") || line.startsWith("+++"));
+    if (hasUnified || normalized.includes("*** Begin Patch")) {
+      return { lines };
+    }
+  }
+  return null;
+}
+
 export default function AcpRichText({ text }: { text: string }) {
   const segments = splitCodeFences(text);
   return (
@@ -241,9 +348,14 @@ export default function AcpRichText({ text }: { text: string }) {
               <span>{segment.lang || "code"}</span>
               <AcpCopyButton text={segment.content} />
             </div>
-            <pre className="acp-code-pre">
-              <code>{segment.content}</code>
-            </pre>
+            {segment.lang.toLowerCase() === "diff" ||
+            segment.lang.toLowerCase() === "patch" ? (
+              <AcpDiffBlock lines={segment.content.split("\n")} />
+            ) : (
+              <pre className="acp-code-pre">
+                <code>{segment.content}</code>
+              </pre>
+            )}
           </div>
         ) : (
           <Fragment key={`seg-${index}`}>
