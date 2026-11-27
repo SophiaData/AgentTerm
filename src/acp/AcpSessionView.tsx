@@ -132,6 +132,8 @@ export default function AcpSessionView({
   const versionRef = useRef(0);
   const feedRef = useRef<HTMLDivElement | null>(null);
   const followBottomRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const scrollFrameRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const promptHistoryRef = useRef<string[]>([]);
   const historyIndexRef = useRef(-1);
@@ -154,6 +156,14 @@ export default function AcpSessionView({
   useEffect(() => {
     let disposed = false;
     versionRef.current = 0;
+    followBottomRef.current = true;
+    lastScrollTopRef.current = 0;
+    promptHistoryRef.current = [];
+    historyIndexRef.current = -1;
+    savedDraftRef.current = "";
+    setDraft("");
+    setSending(false);
+    setPendingConfigValues({});
     setSnapshot(initialSnapshot());
     setActionError(null);
     current.current.onConnection(session.id, "connecting", null);
@@ -251,15 +261,37 @@ export default function AcpSessionView({
     if (forceFollow) {
       followBottomRef.current = true;
     }
-    const feed = feedRef.current;
-    if (!feed) return;
-    feed.scrollTop = feed.scrollHeight;
-    requestAnimationFrame(() => {
+    const snapFeedToBottom = () => {
+      const feed = feedRef.current;
+      if (!feed) return;
+      feed.scrollTop = feed.scrollHeight;
+      lastScrollTopRef.current = feed.scrollTop;
+    };
+    snapFeedToBottom();
+    cancelAnimationFrame(scrollFrameRef.current);
+    scrollFrameRef.current = requestAnimationFrame(() => {
+      scrollFrameRef.current = 0;
       if (feedRef.current && followBottomRef.current) {
-        feedRef.current.scrollTop = feedRef.current.scrollHeight;
+        snapFeedToBottom();
       }
     });
   };
+
+  useEffect(() => {
+    return () => cancelAnimationFrame(scrollFrameRef.current);
+  }, []);
+
+  useEffect(() => {
+    const feed = feedRef.current;
+    if (!feed || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (visible && followBottomRef.current) {
+        scrollToBottom(false);
+      }
+    });
+    observer.observe(feed);
+    return () => observer.disconnect();
+  }, [visible]);
 
   useEffect(() => {
     if (visible && followBottomRef.current) {
@@ -267,8 +299,10 @@ export default function AcpSessionView({
     }
   }, [
     visible,
+    snapshot.busy,
     snapshot.messages,
     snapshot.toolCalls,
+    snapshot.timeline,
     snapshot.pendingPermission,
     snapshot.configOptions,
     snapshot.error,
@@ -571,8 +605,17 @@ export default function AcpSessionView({
         aria-live="polite"
         onScroll={(event) => {
           const el = event.currentTarget;
-          followBottomRef.current =
+          const nearBottom =
             el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
+          if (nearBottom) {
+            followBottomRef.current = true;
+          } else if (
+            el.scrollTop < lastScrollTopRef.current - 1 ||
+            (lastScrollTopRef.current === 0 && el.scrollTop > 0)
+          ) {
+            followBottomRef.current = false;
+          }
+          lastScrollTopRef.current = el.scrollTop;
         }}
       >
         {!feedEntries.length ? (

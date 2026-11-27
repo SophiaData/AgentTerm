@@ -313,6 +313,9 @@ impl AcpState {
         let can_append = same_stream
             && matches!(self.snapshot.messages.last(), Some(last) if last.role == role)
             && matches!(self.snapshot.timeline.last(), Some(last) if last.kind == "message");
+        if !can_append && chunk.trim().is_empty() {
+            return;
+        }
         if can_append && let Some(last) = self.snapshot.messages.last_mut() {
             last.text.push_str(chunk);
             if last.text.chars().count() > MAX_MESSAGE_CHARS {
@@ -1845,5 +1848,22 @@ mod tests {
         assert_eq!(kinds, vec!["message", "message", "tool", "message"]);
         assert_eq!(state.snapshot.usage.as_ref().map(|u| u.used), Some(12400));
         assert_eq!(state.snapshot.usage.as_ref().map(|u| u.size), Some(1000000));
+
+        // Leading whitespace-only message chunks do not spawn empty bubbles.
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "m-ws",
+                        "content": { "type": "text", "text": "   \n\t" }
+                    }
+                }
+            }),
+        );
+        assert_eq!(state.snapshot.messages.len(), 3);
     }
 }

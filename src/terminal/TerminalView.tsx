@@ -295,6 +295,7 @@ export default function TerminalView({
                   scrollToBottomHard(false, false);
                 } else {
                   terminal.scrollToBottom();
+                  syncDomViewportBottom();
                 }
               }
             });

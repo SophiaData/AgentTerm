@@ -1,4 +1,4 @@
-import { Fragment, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 
 type Segment =
   | { type: "text"; content: string }
@@ -6,7 +6,7 @@ type Segment =
 
 function splitCodeFences(source: string): Segment[] {
   const segments: Segment[] = [];
-  const lines = source.split("\n");
+  const lines = source.replace(/\r\n?/g, "\n").split("\n");
   let mode: "text" | "code" = "text";
   let fenceLang = "";
   let buffer: string[] = [];
@@ -206,6 +206,11 @@ export function AcpCopyButton({
   label?: string;
 }) {
   const [copied, setCopied] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => {
+    return () => clearTimeout(timerRef.current);
+  }, []);
 
   return (
     <button
@@ -215,7 +220,8 @@ export function AcpCopyButton({
         void copyToClipboard(text).then((ok) => {
           if (!ok) return;
           setCopied(true);
-          setTimeout(() => setCopied(false), 1600);
+          clearTimeout(timerRef.current);
+          timerRef.current = setTimeout(() => setCopied(false), 1600);
         });
       }}
     >

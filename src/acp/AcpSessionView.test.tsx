@@ -306,7 +306,7 @@ describe("AcpSessionView", () => {
         {
           id: "m3",
           role: "assistant",
-          text: "结果如下：\n```ts\nconst ok = true;\n```\n详见 `index.ts`",
+          text: "结果如下：\r\n```ts\r\nconst ok = true;\r\n```\r\n详见 `index.ts`",
         },
       ],
       toolCalls: [
