@@ -451,13 +451,26 @@ pub fn detect_tool(definition: &ToolDefinition, dirs: &[PathBuf]) -> ToolStatus 
 }
 
 pub fn detect_all(dirs: &[PathBuf]) -> Vec<ToolStatus> {
-    TOOL_DEFINITIONS
-        .iter()
-        .map(|definition| detect_tool(definition, dirs))
-        .collect()
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = TOOL_DEFINITIONS
+            .iter()
+            .map(|definition| scope.spawn(move || detect_tool(definition, dirs)))
+            .collect();
+        handles
+            .into_iter()
+            .zip(TOOL_DEFINITIONS.iter())
+            .map(|(handle, definition)| {
+                handle.join().unwrap_or(ToolStatus {
+                    id: definition.id,
+                    name: definition.name,
+                    state: ToolState::Missing,
+                })
+            })
+            .collect()
+    })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn detect_tools() -> Vec<ToolStatus> {
     detect_all(&candidate_search_dirs())
 }
