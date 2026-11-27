@@ -1,4 +1,6 @@
 import { useRef, useState } from "react";
+import AcpSessionView from "../acp/AcpSessionView";
+import { isAcpTool } from "../acp/types";
 import { displayPath } from "../projects/displayPath";
 import TerminalView from "./TerminalView";
 import { SESSION_TITLE_MAX_CHARS, normalizeManualTitle } from "./sessionNaming";
@@ -212,20 +214,36 @@ export default function SessionPanel({
           {closeError}
         </p>
       ) : null}
-      <TerminalView
-        session={session}
-        visible={visible}
-        focused={focused}
-        focusRequest={focusRequest}
-        running={running}
-        busy={busy}
-        themeId={themeId}
-        onExit={onExit}
-        onConnection={onConnection}
-        onPromptLine={onPromptLine}
-        onOutputActivity={onOutputActivity}
-        onUserInput={onUserInput}
-      />
+      {isAcpTool(session.toolId) ? (
+        <AcpSessionView
+          session={session}
+          visible={visible}
+          focused={focused}
+          focusRequest={focusRequest}
+          running={running}
+          busy={busy}
+          onExit={onExit}
+          onConnection={onConnection}
+          onPromptLine={onPromptLine}
+          onOutputActivity={onOutputActivity}
+          onUserInput={onUserInput}
+        />
+      ) : (
+        <TerminalView
+          session={session}
+          visible={visible}
+          focused={focused}
+          focusRequest={focusRequest}
+          running={running}
+          busy={busy}
+          themeId={themeId}
+          onExit={onExit}
+          onConnection={onConnection}
+          onPromptLine={onPromptLine}
+          onOutputActivity={onOutputActivity}
+          onUserInput={onUserInput}
+        />
+      )}
     </section>
   );
 }

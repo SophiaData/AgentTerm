@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::session_history::{
-    SessionHistory, SessionRecord, is_valid_uuid, normalize_session_title, now_ms,
+    SessionHistory, SessionRecord, is_valid_cli_session_id, normalize_session_title, now_ms,
 };
 use std::io::Read;
 use std::path::PathBuf;
@@ -24,7 +24,7 @@ const READ_BUFFER_SIZE: usize = 8192;
 /// Environment variables that point child tools at an unrelated parent
 /// terminal (multiplexers) or at a server port. Inheriting them makes tools
 /// like Claude Code attach to the wrong pane or try to bind a taken port.
-const ENV_BLOCKLIST: &[&str] = &[
+pub(crate) const ENV_BLOCKLIST: &[&str] = &[
     "PORT",
     "ELECTRON_RENDERER_PORT",
     "ELECTRON_RUN_AS_NODE",
@@ -318,6 +318,7 @@ pub struct SessionLaunch<'a> {
     pub cols: u16,
     pub tool_args: Vec<String>,
     pub tool_env: Vec<(String, String)>,
+    pub schedule_bridge: Option<crate::schedule_mcp::SessionBridge>,
     pub schedule_guard: ScheduleMcp,
     pub cli_session_id: Option<String>,
     pub title: Option<String>,
@@ -356,7 +357,7 @@ fn build_tool_launch_args(
     resume: bool,
 ) -> Result<(Option<String>, Vec<String>), String> {
     if let Some(id) = cli_session_id
-        && !is_valid_uuid(id)
+        && !is_valid_cli_session_id(tool_id, id)
     {
         return Err("无效的 CLI 会话恢复标识".to_string());
     }
@@ -398,6 +399,7 @@ fn build_tool_launch_args(
                 Ok((None, bridge_args))
             }
         }
+        "dsh" => Ok((cli_session_id.map(str::to_string), bridge_args)),
         _ => Err(format!("不支持的工具：{tool_id}")),
     }
 }
@@ -467,7 +469,7 @@ fn build_pty_command(
     command
 }
 
-fn strip_windows_verbatim(path: &std::path::Path) -> PathBuf {
+pub(crate) fn strip_windows_verbatim(path: &std::path::Path) -> PathBuf {
     #[cfg(windows)]
     {
         let raw = path.to_string_lossy();
@@ -728,7 +730,7 @@ fn pump_reader(
 /// reader cannot reach EOF (#15). The child is its own session leader (portable-pty
 /// calls setsid), so a negative pid targets only that terminal's processes.
 #[cfg(unix)]
-fn kill_process_group(pgid: Option<libc::pid_t>) {
+pub(crate) fn kill_process_group(pgid: Option<libc::pid_t>) {
     if let Some(pgid) = pgid
         && pgid > 1
     {
@@ -756,7 +758,7 @@ unsafe impl Sync for WinJob {}
 
 #[cfg(windows)]
 impl WinJob {
-    fn attach(process_handle: std::os::windows::io::RawHandle) -> std::io::Result<Self> {
+    pub(crate) fn attach(process_handle: std::os::windows::io::RawHandle) -> std::io::Result<Self> {
         use std::ffi::c_void;
         #[repr(C)]
         #[derive(Default)]
@@ -828,7 +830,7 @@ impl WinJob {
         Ok(Self { handle: job })
     }
 
-    fn terminate(&self) {
+    pub(crate) fn terminate(&self) {
         unsafe extern "system" {
             fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
         }
@@ -907,11 +909,13 @@ impl Drop for SessionReservation {
 #[derive(Clone)]
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+    acp_sessions: Arc<Mutex<HashMap<String, crate::acp::AcpSessionHandle>>>,
     starting: Arc<Mutex<HashSet<String>>>,
     /// Last output of sessions that have already exited, keyed by session id.
     /// Kept so a view that mounts *after* the process died can still replay the
     /// final screen and learn the process is gone (instead of seeing "running").
     finished: Arc<Mutex<HashMap<String, (String, u64)>>>,
+    finished_acp: Arc<Mutex<HashMap<String, crate::acp::AcpSnapshot>>>,
     /// Persisted identity/end-state history, configured once before commands
     /// are served. Recording is best-effort: a history write failure must not
     /// orphan a running CLI, so callers keep the session and log the failure.
@@ -922,8 +926,10 @@ impl Default for SessionManager {
     fn default() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            acp_sessions: Arc::new(Mutex::new(HashMap::new())),
             starting: Arc::new(Mutex::new(HashSet::new())),
             finished: Arc::new(Mutex::new(HashMap::new())),
+            finished_acp: Arc::new(Mutex::new(HashMap::new())),
             history: Arc::new(Mutex::new(None)),
         }
     }
@@ -934,6 +940,15 @@ impl SessionManager {
         self.sessions
             .lock()
             .map_err(|_| "会话管理暂时不可用，请重试".to_string())
+    }
+
+    fn lock_acp(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, crate::acp::AcpSessionHandle>>, String>
+    {
+        self.acp_sessions
+            .lock()
+            .map_err(|_| "ACP 会话管理暂时不可用，请重试".to_string())
     }
 
     /// Backend-only path, fixed before serving commands; never creates a
@@ -990,7 +1005,10 @@ impl SessionManager {
             .starting
             .lock()
             .map_err(|_| "会话管理暂时不可用，请重试".to_string())?;
-        if pending.contains(id) || self.lock()?.contains_key(id) {
+        if pending.contains(id)
+            || self.lock()?.contains_key(id)
+            || self.lock_acp()?.contains_key(id)
+        {
             return Err("会话已存在，请换一个会话再启动".into());
         }
         pending.insert(id.to_owned());
@@ -1014,12 +1032,13 @@ impl SessionManager {
             cols,
             tool_args,
             tool_env,
+            schedule_bridge,
             schedule_guard,
             cli_session_id,
             title,
         } = request;
         if let Some(id) = cli_session_id.as_deref()
-            && !is_valid_uuid(id)
+            && !is_valid_cli_session_id(tool_id, id)
         {
             return Err("无效的 CLI 会话标识".to_string());
         }
@@ -1047,6 +1066,105 @@ impl SessionManager {
                 return Err(format!("未安装 {}，无法启动", tool.name));
             }
         };
+
+        if tool.id == "dsh" {
+            let info = SessionInfo {
+                id: session_id.to_string(),
+                tool_id: tool.id.to_string(),
+                tool_name: tool.name.to_string(),
+                project_path: project_dir.display().to_string(),
+                title: normalized_title.clone(),
+                cli_session_id: cli_session_id.clone(),
+            };
+            let emit_id = session_id.to_string();
+            let app_emit = app.clone();
+            let bind_id = session_id.to_string();
+            let acp_sessions_bind = Arc::clone(&self.acp_sessions);
+            let history_bind = Arc::clone(&self.history);
+            let exit_id = session_id.to_string();
+            let acp_sessions_exit = Arc::clone(&self.acp_sessions);
+            let finished_acp_exit = Arc::clone(&self.finished_acp);
+            let history_exit = Arc::clone(&self.history);
+            let app_exit = app.clone();
+            let schedule_guard_exit = schedule_guard;
+            let reservation_exit = reservation;
+
+            let handle = crate::acp::spawn_acp_session(
+                info.clone(),
+                &binary,
+                &project_dir,
+                &tool_env,
+                schedule_bridge.as_ref(),
+                cli_session_id.clone(),
+                crate::acp::AcpHooks {
+                    on_emit: Box::new(move |snapshot| {
+                        let _ = app_emit.emit(&format!("acp-state-{emit_id}"), snapshot);
+                    }),
+                    on_cli_session: Box::new(move |cli_id| {
+                        if let Ok(mut guard) = acp_sessions_bind.lock()
+                            && let Some(active) = guard.get_mut(&bind_id)
+                        {
+                            active.info.cli_session_id = Some(cli_id.clone());
+                        }
+                        if let Ok(history_guard) = history_bind.lock()
+                            && let Some(history) = history_guard.as_ref()
+                            && let Err(error) = history.record_cli_session(&bind_id, &cli_id)
+                        {
+                            eprintln!(
+                                "AgentTerm could not bind CLI session id for {bind_id}: {error}"
+                            );
+                        }
+                    }),
+                    on_exit: Box::new(move |reason, final_snapshot, bytes| {
+                        let _reservation = &reservation_exit;
+                        if let Ok(mut guard) = acp_sessions_exit.lock() {
+                            guard.remove(&exit_id);
+                        }
+                        if let Some(snapshot) = final_snapshot
+                            && let Ok(mut done) = finished_acp_exit.lock()
+                        {
+                            done.insert(exit_id.clone(), snapshot);
+                        }
+                        if let Ok(history_guard) = history_exit.lock()
+                            && let Some(history) = history_guard.as_ref()
+                            && let Err(error) = history.record_end(
+                                &exit_id,
+                                now_ms(),
+                                Some(reason.clone()),
+                                Some(bytes),
+                            )
+                        {
+                            eprintln!(
+                                "AgentTerm could not persist ACP session end for {exit_id}: {error}"
+                            );
+                        }
+                        let _ = app_exit.emit(
+                            &format!("session-exit-{exit_id}"),
+                            SessionExit {
+                                id: exit_id.clone(),
+                                reason,
+                            },
+                        );
+                        schedule_guard_exit.revoke_session(&exit_id);
+                    }),
+                },
+            )?;
+            handle.emit_snapshot(&app);
+            self.lock_acp()?.insert(session_id.to_string(), handle);
+            self.record_start(SessionRecord {
+                id: session_id.to_string(),
+                tool_id: tool.id.to_string(),
+                tool_name: tool.name.to_string(),
+                project_path: info.project_path.clone(),
+                title: normalized_title,
+                cli_session_id,
+                started_at_ms: now_ms(),
+                ended_at_ms: None,
+                exit_reason: None,
+                output_bytes: None,
+            });
+            return Ok(info);
+        }
 
         let spawned = spawn_pty(&binary, &project_dir, rows, cols, &tool_args, &tool_env)?;
         let SpawnedPty {
@@ -1277,23 +1395,83 @@ impl SessionManager {
     /// Returns metadata owned by the backend for a live session. Renderer
     /// supplied labels and paths are never authoritative for task binding.
     pub fn session_info(&self, session_id: &str) -> Result<SessionInfo, String> {
-        let sessions = self.lock()?;
-        sessions
-            .get(session_id)
-            .map(|session| session.info.clone())
-            .ok_or_else(|| "会话不存在或已结束".to_string())
+        if let Some(session) = self.lock()?.get(session_id) {
+            return Ok(session.info.clone());
+        }
+        if let Some(session) = self.lock_acp()?.get(session_id) {
+            return Ok(session.info.clone());
+        }
+        Err("会话不存在或已结束".to_string())
     }
 
     /// The renderer uses this snapshot to recover tabs after a WebView reload
-    /// or renderer crash. Only live PTYs owned by this backend are returned.
+    /// or renderer crash. Only live sessions owned by this backend are returned.
     pub fn list_live(&self) -> Result<Vec<SessionInfo>, String> {
-        let sessions = self.lock()?;
-        let mut result = sessions
+        let mut result = self
+            .lock()?
             .values()
             .map(|session| session.info.clone())
             .collect::<Vec<_>>();
+        result.extend(
+            self.lock_acp()?
+                .values()
+                .map(|session| session.info.clone()),
+        );
         result.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(result)
+    }
+
+    pub fn acp_snapshot(&self, session_id: &str) -> Result<crate::acp::AcpSnapshot, String> {
+        if let Some(session) = self.lock_acp()?.get(session_id) {
+            return session.snapshot();
+        }
+        let finished = self
+            .finished_acp
+            .lock()
+            .map_err(|_| "无法读取 ACP 会话状态".to_string())?;
+        finished
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "ACP 会话不存在或已结束".to_string())
+    }
+
+    pub fn acp_send_prompt(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        let guard = self.lock_acp()?;
+        let session = guard
+            .get(session_id)
+            .ok_or_else(|| "ACP 会话不存在或已结束".to_string())?;
+        let result = session.send_prompt(text);
+        session.emit_snapshot(app);
+        result
+    }
+
+    pub fn acp_cancel_turn(&self, session_id: &str) -> Result<(), String> {
+        let guard = self.lock_acp()?;
+        let session = guard
+            .get(session_id)
+            .ok_or_else(|| "ACP 会话不存在或已结束".to_string())?;
+        session.cancel_turn()
+    }
+
+    pub fn acp_respond_permission(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        request_id: &str,
+        option_id: Option<&str>,
+    ) -> Result<(), String> {
+        let guard = self.lock_acp()?;
+        let session = guard
+            .get(session_id)
+            .ok_or_else(|| "ACP 会话不存在或已结束".to_string())?;
+        let result = session.respond_permission(request_id, option_id);
+        session.emit_snapshot(app);
+        result
     }
 
     pub fn write(&self, session_id: &str, data: &str) -> Result<(), String> {
@@ -1358,8 +1536,9 @@ impl SessionManager {
                     // allow renaming the live in-memory session instead of
                     // blocking the user; still fail closed for missing/corrupt
                     // non-live ids.
-                    let sessions = self.lock()?;
-                    if error == "会话历史记录不存在" && sessions.contains_key(session_id) {
+                    let is_live = self.lock()?.contains_key(session_id)
+                        || self.lock_acp()?.contains_key(session_id);
+                    if error == "会话历史记录不存在" && is_live {
                         normalized
                     } else {
                         return Err(error);
@@ -1367,21 +1546,38 @@ impl SessionManager {
                 }
             },
             None => {
-                let sessions = self.lock()?;
-                if !sessions.contains_key(session_id) {
+                let is_live = self.lock()?.contains_key(session_id)
+                    || self.lock_acp()?.contains_key(session_id);
+                if !is_live {
                     return Err("会话不存在或已结束".to_string());
                 }
                 normalized
             }
         };
-        let mut sessions = self.lock()?;
-        if let Some(session) = sessions.get_mut(session_id) {
+        if let Some(session) = self.lock()?.get_mut(session_id) {
+            session.info.title = Some(saved.clone());
+        }
+        if let Some(session) = self.lock_acp()?.get_mut(session_id) {
             session.info.title = Some(saved.clone());
         }
         Ok(saved)
     }
 
     fn stop_with_reason(&self, session_id: &str, reason: &str) -> Result<(), String> {
+        {
+            let acp_sessions = self.lock_acp()?;
+            if let Some(acp_session) = acp_sessions.get(session_id) {
+                acp_session.terminate()?;
+                drop(acp_sessions);
+                let removed = self.lock_acp()?.remove(session_id);
+                let output_bytes = removed.as_ref().map(|item| item.output_bytes());
+                if let (true, Ok(mut done)) = (removed.is_some(), self.finished_acp.lock()) {
+                    done.remove(session_id);
+                }
+                self.record_end(session_id, Some(reason.to_string()), output_bytes);
+                return Ok(());
+            }
+        }
         // Kill first, only then drop the record. Removing before a successful
         // kill lost the session on failure, leaving the process alive with no
         // handle to retry from (#17).
@@ -1440,12 +1636,17 @@ impl SessionManager {
         // Hold the live-session lock while releasing replay data. A caller may
         // forget an ended tab, but must never detach a running process.
         let sessions = self.lock()?;
-        if sessions.contains_key(session_id) {
+        let acp_sessions = self.lock_acp()?;
+        if sessions.contains_key(session_id) || acp_sessions.contains_key(session_id) {
             return Err("会话仍在运行，请先结束会话".to_string());
         }
         self.finished
             .lock()
             .map_err(|_| "无法释放会话输出".to_string())?
+            .remove(session_id);
+        self.finished_acp
+            .lock()
+            .map_err(|_| "无法释放 ACP 会话输出".to_string())?
             .remove(session_id);
         Ok(())
     }
@@ -1454,13 +1655,20 @@ impl SessionManager {
     /// A failed kill keeps that session in the map so the caller can retry;
     /// silently draining the map would orphan the child process.
     pub fn stop_all(&self) -> Result<(), String> {
-        let ids = self
+        let mut ids = self
             .sessions
             .lock()
             .map_err(|_| "会话管理暂时不可用，请重试".to_string())?
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        ids.extend(
+            self.acp_sessions
+                .lock()
+                .map_err(|_| "ACP 会话管理暂时不可用，请重试".to_string())?
+                .keys()
+                .cloned(),
+        );
         let mut failures = Vec::new();
         for id in ids {
             match self.stop_with_reason(&id, "应用退出") {
@@ -1482,6 +1690,11 @@ impl SessionManager {
             .lock()
             .map(|guard| guard.contains_key(session_id))
             .unwrap_or(false)
+            || self
+                .acp_sessions
+                .lock()
+                .map(|guard| guard.contains_key(session_id))
+                .unwrap_or(false)
     }
 }
 
@@ -1529,6 +1742,7 @@ pub fn start_session(
             cols,
             tool_args,
             tool_env,
+            schedule_bridge: Some(bridge),
             schedule_guard: schedule_mcp.handle(),
             cli_session_id: resolved_cli_id,
             title,
@@ -2926,7 +3140,7 @@ mod tests {
         )
         .unwrap();
         let uuid = fresh_id.expect("fresh claude session gets a UUID");
-        assert!(super::is_valid_uuid(&uuid));
+        assert!(crate::session_history::is_valid_uuid(&uuid));
         assert_eq!(
             fresh_claude,
             vec!["--session-id", &uuid, "--mcp-config", "{}"]

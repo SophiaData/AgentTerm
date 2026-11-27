@@ -1323,7 +1323,9 @@ export default function App() {
                         <strong>{tool.name}</strong>
                         <span>
                           {tool.state.kind === "installed"
-                            ? "打开原生 CLI"
+                            ? tool.id === "dsh"
+                              ? "打开 ACP 对话"
+                              : "打开原生 CLI"
                             : badgeLabel(tool.state)}
                         </span>
                       </button>
@@ -1430,9 +1432,18 @@ export default function App() {
                                     disabled={
                                       launcher.busy ||
                                       tools.loading ||
-                                      !reopenTool
+                                      !reopenTool ||
+                                      (resume &&
+                                        record.toolId === "dsh" &&
+                                        !record.cliSessionId)
                                     }
-                                    title={reasonTitle}
+                                    title={
+                                      resume &&
+                                      record.toolId === "dsh" &&
+                                      !record.cliSessionId
+                                        ? "该 ACP 会话未生成可恢复标识"
+                                        : reasonTitle
+                                    }
                                     onClick={() => {
                                       if (!reopenTool) return;
                                       const existingProject =

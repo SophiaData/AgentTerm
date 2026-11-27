@@ -39,6 +39,12 @@ pub const TOOL_DEFINITIONS: &[ToolDefinition] = &[
         binaries: &["agy"],
         version_args: &["--version"],
     },
+    ToolDefinition {
+        id: "dsh",
+        name: "DeepSeek Harness",
+        binaries: &["dsh"],
+        version_args: &["--version"],
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -226,6 +232,9 @@ fn platform_extra_dirs() -> Vec<PathBuf> {
     } else {
         dirs.push(PathBuf::from("/opt/homebrew/bin"));
         dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from(
+            "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin",
+        ));
         if let Some(home) = &home {
             dirs.push(home.join(".local/bin"));
             dirs.push(home.join(".npm-global/bin"));
@@ -240,8 +249,56 @@ fn platform_extra_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn windows_local_bin_dirs(local_data: &Path) -> [PathBuf; 2] {
-    [local_data.join("pnpm"), local_data.join("agy").join("bin")]
+fn windows_local_bin_dirs(local_data: &Path) -> [PathBuf; 3] {
+    [
+        local_data.join("pnpm"),
+        local_data.join("agy").join("bin"),
+        local_data
+            .join("Programs")
+            .join("DeepSeek Harness")
+            .join("resources")
+            .join("runtime")
+            .join("cli")
+            .join("bin"),
+    ]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectCommandSpec {
+    pub program: PathBuf,
+    pub prefix_args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Resolves Windows `dsh.cmd` bundled with DeepSeek Harness Desktop into a direct
+/// `DeepSeek Harness.exe` invocation with `ELECTRON_RUN_AS_NODE=1` so child I/O
+/// and job-object termination avoid an intermediate `cmd.exe` wrapper.
+pub fn resolve_direct_command(tool_id: &str, binary: &Path) -> Option<DirectCommandSpec> {
+    if tool_id != "dsh" || !is_windows_batch(binary) {
+        return None;
+    }
+    let bin_dir = binary.parent()?;
+    let resources_dir = bin_dir.parent()?.parent()?.parent()?;
+    let app_root = resources_dir.parent()?;
+    let exe = app_root.join("DeepSeek Harness.exe");
+    let app_asar = resources_dir.join("app.asar");
+    // Electron reads `cli.js` directly out of the `app.asar` archive file.
+    let cli = app_asar
+        .join("dsh")
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh-desktop-host")
+        .join("lib")
+        .join("cli.js");
+    if exe.is_file() && app_asar.exists() {
+        Some(DirectCommandSpec {
+            program: exe,
+            prefix_args: vec!["--expose-internals".to_string(), cli.display().to_string()],
+            env: vec![("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string())],
+        })
+    } else {
+        None
+    }
 }
 
 fn nvm_bin_dirs(home: &Path) -> Vec<PathBuf> {
@@ -312,8 +369,15 @@ fn normalize_version(token: &str) -> Option<String> {
     Some(token.to_string())
 }
 
-fn read_version(path: &Path, args: &[&str]) -> Option<String> {
-    let mut command = if is_windows_batch(path) {
+fn read_version(tool_id: &str, path: &Path, args: &[&str]) -> Option<String> {
+    let mut command = if let Some(spec) = resolve_direct_command(tool_id, path) {
+        let mut direct = Command::new(&spec.program);
+        direct.args(&spec.prefix_args).args(args);
+        for (key, value) in &spec.env {
+            direct.env(key, value);
+        }
+        direct
+    } else if is_windows_batch(path) {
         let mut wrapped = Command::new(windows_cmd_executable());
         wrapped.arg("/D").arg("/C").arg(path).args(args);
         wrapped
@@ -367,7 +431,7 @@ fn read_version(path: &Path, args: &[&str]) -> Option<String> {
 pub fn detect_tool(definition: &ToolDefinition, dirs: &[PathBuf]) -> ToolStatus {
     let state = match resolve_binary(definition.binaries, dirs) {
         ResolveResult::Found(path) => {
-            let version = read_version(&path, definition.version_args);
+            let version = read_version(definition.id, &path, definition.version_args);
             ToolState::Installed {
                 path: path.display().to_string(),
                 version,
@@ -447,12 +511,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_the_three_supported_tools() {
+    fn registry_contains_the_supported_tools() {
         let ids: Vec<&str> = TOOL_DEFINITIONS
             .iter()
             .map(|definition| definition.id)
             .collect();
-        assert_eq!(ids, vec!["claude", "codex", "agy"]);
+        assert_eq!(ids, vec!["claude", "codex", "agy", "dsh"]);
     }
 
     #[test]
@@ -661,6 +725,32 @@ mod tests {
         assert_eq!(
             resolve_binary(&["codex"], &[dir.path()]),
             ResolveResult::Found(exe_path)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolves_bundled_dsh_to_direct_electron_node_command() {
+        let root = TempDir::new("dsh-bundle");
+        let app_dir = root.path().join("DeepSeek Harness");
+        let resources_dir = app_dir.join("resources");
+        let bin_dir = resources_dir.join("runtime").join("cli").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe_path = app_dir.join("DeepSeek Harness.exe");
+        let asar_path = resources_dir.join("app.asar");
+        let cmd_path = bin_dir.join("dsh.cmd");
+        std::fs::write(&exe_path, b"MZ").unwrap();
+        std::fs::write(&asar_path, b"asar").unwrap();
+        std::fs::write(&cmd_path, "@echo off\r\n").unwrap();
+
+        let spec = super::resolve_direct_command("dsh", &cmd_path)
+            .expect("bundled dsh should resolve directly");
+        assert_eq!(spec.program, exe_path);
+        assert_eq!(spec.prefix_args[0], "--expose-internals");
+        assert!(spec.prefix_args[1].ends_with("cli.js"));
+        assert_eq!(
+            spec.env,
+            vec![("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string())]
         );
     }
 }

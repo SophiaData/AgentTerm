@@ -3216,3 +3216,222 @@ h2 {
   font-weight: 700;
   flex: none;
 }
+
+.acp-view {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
+}
+
+.acp-feed {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-background);
+}
+
+.acp-empty {
+  margin: auto;
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--color-muted);
+  font-size: 13px;
+}
+
+.acp-message {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.acp-message.is-user {
+  align-self: flex-end;
+  max-width: 85%;
+  border-color: var(--color-accent-border);
+  background: var(--color-accent-surface);
+}
+
+.acp-message.is-assistant {
+  border-color: var(--color-border);
+  background: var(--color-surface);
+}
+
+.acp-message.is-system {
+  border-color: var(--color-warning-border);
+  background: var(--color-warning-surface);
+  color: var(--color-warning-text);
+}
+
+.acp-message-role {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-muted);
+}
+
+.acp-message-body {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--color-foreground);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.acp-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.acp-tool-card {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface-subtle);
+  padding: 6px 10px;
+}
+
+.acp-tool-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--color-text-strong);
+}
+
+.acp-tool-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acp-tool-status {
+  flex: none;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  color: var(--color-muted);
+}
+
+.acp-tool-status.is-in_progress,
+.acp-tool-status.is-running {
+  border-color: var(--color-accent-border);
+  background: var(--color-accent-tint);
+  color: var(--color-primary);
+}
+
+.acp-tool-status.is-completed {
+  border-color: var(--color-success-border);
+  background: var(--color-success-tint);
+  color: var(--color-success-text);
+}
+
+.acp-tool-status.is-failed,
+.acp-tool-status.is-error {
+  border-color: var(--color-danger-border);
+  background: var(--color-danger-tint);
+  color: var(--color-danger-text);
+}
+
+.acp-tool-detail {
+  margin: 8px 0 2px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--color-background);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-x: auto;
+  max-height: 220px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.acp-permission-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--color-warning-border);
+  background: var(--color-warning-surface);
+}
+
+.acp-permission-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.acp-permission-copy strong {
+  font-size: 12px;
+  color: var(--color-warning-text);
+}
+
+.acp-permission-copy p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.acp-permission-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.acp-composer {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  padding: 8px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 8px;
+  background: var(--color-surface);
+}
+
+.acp-input {
+  flex: 1;
+  min-width: 0;
+  resize: vertical;
+  min-height: 44px;
+  max-height: 180px;
+  padding: 6px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.acp-input:focus-visible {
+  outline: 1px solid var(--color-focus-outline);
+  border-color: var(--color-focus-outline);
+}
+
+.acp-composer-actions {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}

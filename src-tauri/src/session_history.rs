@@ -26,6 +26,12 @@ pub fn normalize_session_title(raw: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+pub fn is_valid_cli_session_id(tool_id: &str, value: &str) -> bool {
+    if tool_id == "claude" {
+        return is_valid_uuid(value);
+    }
+    !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
 pub fn is_valid_uuid(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 36 {
@@ -95,6 +101,10 @@ enum HistoryEvent {
         id: String,
         title: String,
     },
+    BindCliSession {
+        id: String,
+        cli_session_id: String,
+    },
 }
 
 /// The immutable, validated storage location. Reads and writes take the
@@ -148,6 +158,13 @@ impl SessionHistory {
             title: normalized.clone(),
         })?;
         Ok(normalized)
+    }
+
+    pub fn record_cli_session(&self, id: &str, cli_session_id: &str) -> Result<(), String> {
+        self.append(HistoryEvent::BindCliSession {
+            id: id.to_string(),
+            cli_session_id: cli_session_id.to_string(),
+        })
     }
 
     /// Newest first. A read never creates or rewrites the store.
@@ -319,6 +336,20 @@ fn apply_event(
             *record = updated;
             Ok(())
         }
+        HistoryEvent::BindCliSession { id, cli_session_id } => {
+            let record = records
+                .iter_mut()
+                .find(|existing| existing.id == id)
+                .ok_or_else(|| "会话历史记录不存在".to_string())?;
+            if record.cli_session_id.as_deref() == Some(cli_session_id.as_str()) {
+                return Ok(());
+            }
+            let mut updated = record.clone();
+            updated.cli_session_id = Some(cli_session_id);
+            validate_record(&updated)?;
+            *record = updated;
+            Ok(())
+        }
     }
 }
 
@@ -327,7 +358,10 @@ fn validate_record(record: &SessionRecord) -> Result<(), String> {
         .title
         .as_deref()
         .is_none_or(|title| normalize_session_title(title).is_ok_and(|clean| clean == title));
-    let cli_session_ok = record.cli_session_id.as_deref().is_none_or(is_valid_uuid);
+    let cli_session_ok = record
+        .cli_session_id
+        .as_deref()
+        .is_none_or(|id| is_valid_cli_session_id(&record.tool_id, id));
     let reason_ok = record.exit_reason.as_deref().is_none_or(|reason| {
         !reason.is_empty() && reason.len() <= 1024 && !reason.chars().any(char::is_control)
     });
@@ -702,5 +736,25 @@ mod tests {
                 .filter_map(Result::ok)
                 .any(|entry| entry.file_name().to_string_lossy().contains(".archive-"))
         );
+    }
+
+    #[test]
+    fn binds_opaque_cli_session_id_for_dsh_across_reload() {
+        let path = temp_store("dsh-bind");
+        let history = SessionHistory::configure(path.clone()).unwrap();
+        let mut dsh = record("s-dsh", 10);
+        dsh.tool_id = "dsh".to_string();
+        dsh.tool_name = "DeepSeek Harness".to_string();
+        history.record_start(dsh).unwrap();
+        history
+            .record_cli_session("s-dsh", "sess_dsh_abc123")
+            .unwrap();
+        history
+            .record_cli_session("s-dsh", "sess_dsh_abc123")
+            .unwrap();
+
+        let listed = SessionHistory::configure(path).unwrap().list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].cli_session_id.as_deref(), Some("sess_dsh_abc123"));
     }
 }

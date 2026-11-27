@@ -1,3 +1,4 @@
+mod acp;
 mod journal;
 mod project_files;
 mod projects;
@@ -71,6 +72,10 @@ pub fn run() {
             sessions::forget_session,
             sessions::rename_session,
             sessions::session_history,
+            acp::acp_snapshot,
+            acp::acp_send_prompt,
+            acp::acp_cancel_turn,
+            acp::acp_respond_permission,
             task_commands::task_ledger_initialize,
             task_commands::task_ledger_snapshot,
             task_commands::claim_main_task,
