@@ -53,7 +53,23 @@ pub struct AcpToolCall {
     pub kind: Option<String>,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpUsage {
+    pub used: u64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpTimelineEntry {
+    pub kind: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -111,6 +127,10 @@ pub struct AcpSnapshot {
     pub exit_reason: Option<String>,
     pub messages: Vec<AcpMessage>,
     pub tool_calls: Vec<AcpToolCall>,
+    #[serde(default)]
+    pub timeline: Vec<AcpTimelineEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AcpUsage>,
     #[serde(default)]
     pub config_options: Vec<AcpConfigOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,7 +194,7 @@ pub(crate) struct AcpState {
     active_prompt_id: Option<u64>,
     setup_request_id: Option<u64>,
     pending_config_requests: HashSet<u64>,
-    current_assistant_message_key: Option<String>,
+    active_stream: Option<(String, Option<String>)>,
     pending_permission_raw_id: Option<(String, Value)>,
     next_message_seq: u64,
     total_output_bytes: u64,
@@ -214,7 +234,7 @@ impl AcpState {
             active_prompt_id: None,
             setup_request_id: None,
             pending_config_requests: HashSet::new(),
-            current_assistant_message_key: None,
+            active_stream: None,
             pending_permission_raw_id: None,
             next_message_seq: 0,
             total_output_bytes: 0,
@@ -226,6 +246,8 @@ impl AcpState {
                 exit_reason: None,
                 messages: Vec::new(),
                 tool_calls: Vec::new(),
+                timeline: Vec::new(),
+                usage: None,
                 config_options: Vec::new(),
                 pending_permission: None,
                 version: 1,
@@ -237,35 +259,60 @@ impl AcpState {
         self.snapshot.version = self.snapshot.version.saturating_add(1);
     }
 
+    fn record_timeline(&mut self, kind: &str, id: &str) {
+        self.snapshot.timeline.push(AcpTimelineEntry {
+            kind: kind.to_string(),
+            id: id.to_string(),
+        });
+    }
+
+    fn remove_timeline(&mut self, kind: &str, id: &str) {
+        self.snapshot
+            .timeline
+            .retain(|entry| !(entry.kind == kind && entry.id == id));
+    }
+
+    fn evict_oldest_message_if_full(&mut self) {
+        if self.snapshot.messages.len() >= MAX_MESSAGES {
+            let removed = self.snapshot.messages.remove(0);
+            self.remove_timeline("message", &removed.id);
+        }
+    }
+
     fn push_message(&mut self, role: &str, text: String) {
         if text.is_empty() {
             return;
         }
         self.next_message_seq = self.next_message_seq.saturating_add(1);
         self.total_output_bytes = self.total_output_bytes.saturating_add(text.len() as u64);
+        let id = format!("msg-{}", self.next_message_seq);
         let msg = AcpMessage {
-            id: format!("msg-{}", self.next_message_seq),
+            id: id.clone(),
             role: role.to_string(),
             text: trim_chars(&text, MAX_MESSAGE_CHARS),
         };
-        if self.snapshot.messages.len() >= MAX_MESSAGES {
-            self.snapshot.messages.remove(0);
-        }
+        self.evict_oldest_message_if_full();
         self.snapshot.messages.push(msg);
-        if role != "assistant" {
-            self.current_assistant_message_key = None;
-        }
+        self.record_timeline("message", &id);
+        self.active_stream = None;
         self.bump();
     }
 
-    fn append_assistant_chunk(&mut self, message_key: Option<&str>, chunk: &str) {
+    fn append_streaming_message(&mut self, role: &str, message_key: Option<&str>, chunk: &str) {
         if chunk.is_empty() {
             return;
         }
         self.total_output_bytes = self.total_output_bytes.saturating_add(chunk.len() as u64);
         let key_owned = message_key.map(str::to_string);
-        let can_append = matches!(self.snapshot.messages.last(), Some(last) if last.role == "assistant")
-            && (key_owned.is_none() || self.current_assistant_message_key == key_owned);
+        let same_stream = self
+            .active_stream
+            .as_ref()
+            .is_some_and(|(active_role, active_key)| {
+                active_role == role && (key_owned.is_none() || *active_key == key_owned)
+            });
+        let can_append = same_stream
+            && matches!(self.snapshot.messages.last(), Some(last) if last.role == role)
+            && matches!(self.snapshot.timeline.last(), Some(last) if last.kind == "message");
         if can_append && let Some(last) = self.snapshot.messages.last_mut() {
             last.text.push_str(chunk);
             if last.text.chars().count() > MAX_MESSAGE_CHARS {
@@ -273,15 +320,15 @@ impl AcpState {
             }
         } else {
             self.next_message_seq = self.next_message_seq.saturating_add(1);
-            if self.snapshot.messages.len() >= MAX_MESSAGES {
-                self.snapshot.messages.remove(0);
-            }
+            let id = format!("msg-{}", self.next_message_seq);
+            self.evict_oldest_message_if_full();
             self.snapshot.messages.push(AcpMessage {
-                id: format!("msg-{}", self.next_message_seq),
-                role: "assistant".to_string(),
+                id: id.clone(),
+                role: role.to_string(),
                 text: trim_chars_tail(chunk, MAX_MESSAGE_CHARS),
             });
-            self.current_assistant_message_key = key_owned;
+            self.record_timeline("message", &id);
+            self.active_stream = Some((role.to_string(), key_owned));
         }
         self.bump();
     }
@@ -305,14 +352,21 @@ impl AcpState {
             if !call.status.is_empty() {
                 existing.status = call.status;
             }
+            if call.input.is_some() {
+                existing.input = call.input;
+            }
             if call.detail.is_some() {
                 existing.detail = call.detail;
             }
         } else {
             if self.snapshot.tool_calls.len() >= MAX_TOOL_CALLS {
-                self.snapshot.tool_calls.remove(0);
+                let removed = self.snapshot.tool_calls.remove(0);
+                self.remove_timeline("tool", &removed.id);
             }
+            let id = call.id.clone();
             self.snapshot.tool_calls.push(call);
+            self.record_timeline("tool", &id);
+            self.active_stream = None;
         }
         self.bump();
     }
@@ -322,6 +376,7 @@ impl AcpState {
         id: &str,
         title: Option<String>,
         status: Option<String>,
+        input: Option<String>,
         detail: Option<String>,
     ) {
         if let Some(existing) = self
@@ -336,6 +391,9 @@ impl AcpState {
             if let Some(status) = status.filter(|value| !value.is_empty()) {
                 existing.status = status;
             }
+            if input.is_some() {
+                existing.input = input;
+            }
             if detail.is_some() {
                 existing.detail = detail;
             }
@@ -347,6 +405,7 @@ impl AcpState {
                 name: None,
                 kind: None,
                 status: status.unwrap_or_else(|| "in_progress".to_string()),
+                input,
                 detail,
             });
         }
@@ -954,7 +1013,7 @@ pub(crate) fn apply_server_message(state: &mut AcpState, value: &Value) -> Apply
             } else if id_num.is_some() && id_num == state.active_prompt_id {
                 state.snapshot.busy = false;
                 state.active_prompt_id = None;
-                state.current_assistant_message_key = None;
+                state.active_stream = None;
                 if let Some(err) = err_msg {
                     state.snapshot.error = Some(err.clone());
                     state.push_message("system", format!("请求失败：{err}"));
@@ -1100,7 +1159,19 @@ fn apply_session_update(state: &mut AcpState, update: &Value) {
         Some("agent_message_chunk") => {
             let message_id = update.get("messageId").and_then(Value::as_str);
             if let Some(text) = extract_content_text(update.get("content")) {
-                state.append_assistant_chunk(message_id, &text);
+                state.append_streaming_message("assistant", message_id, &text);
+            }
+        }
+        Some("agent_thought_chunk") => {
+            let message_id = update.get("messageId").and_then(Value::as_str);
+            if let Some(text) = extract_content_text(update.get("content")) {
+                state.append_streaming_message("thought", message_id, &text);
+            }
+        }
+        Some("user_message_chunk") => {
+            let message_id = update.get("messageId").and_then(Value::as_str);
+            if let Some(text) = extract_content_text(update.get("content")) {
+                state.append_streaming_message("user", message_id, &text);
             }
         }
         Some("tool_call") => {
@@ -1125,13 +1196,15 @@ fn apply_session_update(state: &mut AcpState, update: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("pending")
                 .to_string();
-            let detail = extract_tool_detail(update);
+            let input = format_json_field(update.get("rawInput"));
+            let detail = extract_tool_output(update);
             state.upsert_tool_call(AcpToolCall {
                 id: id.to_string(),
                 title,
                 name,
                 kind,
                 status,
+                input,
                 detail,
             });
         }
@@ -1147,8 +1220,18 @@ fn apply_session_update(state: &mut AcpState, update: &Value) {
                 .get("status")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let detail = extract_tool_detail(update);
-            state.update_tool_call(id, title, status, detail);
+            let input = format_json_field(update.get("rawInput"));
+            let detail = extract_tool_output(update);
+            state.update_tool_call(id, title, status, input, detail);
+        }
+        Some("usage_update") => {
+            if let (Some(used), Some(size)) = (
+                update.get("used").and_then(Value::as_u64),
+                update.get("size").and_then(Value::as_u64),
+            ) {
+                state.snapshot.usage = Some(AcpUsage { used, size });
+                state.bump();
+            }
         }
         Some("config_option_update") => {
             if let Some(options) = parse_config_options(update.get("configOptions")) {
@@ -1252,29 +1335,27 @@ fn extract_content_text(content: Option<&Value>) -> Option<String> {
     }
 }
 
-fn extract_tool_detail(update: &Value) -> Option<String> {
+fn format_json_field(raw: Option<&Value>) -> Option<String> {
+    let value = raw?;
+    if value.is_null() {
+        return None;
+    }
+    let formatted = match value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    };
+    if formatted.trim().is_empty() || formatted.trim() == "{}" {
+        None
+    } else {
+        Some(trim_chars(&formatted, MAX_TOOL_DETAIL_CHARS))
+    }
+}
+
+fn extract_tool_output(update: &Value) -> Option<String> {
     if let Some(text) = extract_content_text(update.get("content")) {
         return Some(trim_chars(&text, MAX_TOOL_DETAIL_CHARS));
     }
-    if let Some(raw_output) = update.get("rawOutput") {
-        let formatted = match raw_output {
-            Value::String(text) => text.clone(),
-            other => serde_json::to_string_pretty(other).unwrap_or_default(),
-        };
-        if !formatted.trim().is_empty() {
-            return Some(trim_chars(&formatted, MAX_TOOL_DETAIL_CHARS));
-        }
-    }
-    if let Some(raw_input) = update.get("rawInput") {
-        let formatted = match raw_input {
-            Value::String(text) => text.clone(),
-            other => serde_json::to_string_pretty(other).unwrap_or_default(),
-        };
-        if !formatted.trim().is_empty() {
-            return Some(trim_chars(&formatted, MAX_TOOL_DETAIL_CHARS));
-        }
-    }
-    None
+    format_json_field(update.get("rawOutput"))
 }
 
 fn extract_rpc_error(value: &Value) -> Option<String> {
@@ -1648,5 +1729,121 @@ mod tests {
             );
         }
         assert_eq!(state.snapshot.tool_calls.len(), MAX_TOOL_CALLS);
+    }
+
+    #[test]
+    fn streams_thoughts_usage_and_interleaved_timeline() {
+        let mut state = AcpState::new("dsh", "E:\\AgentTerm", None, None);
+        state.push_message("user", "检查配置".into());
+
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "messageId": "m-t1",
+                        "content": { "type": "text", "text": "先看" }
+                    }
+                }
+            }),
+        );
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "messageId": "m-t1",
+                        "content": { "type": "text", "text": "目录" }
+                    }
+                }
+            }),
+        );
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-bash",
+                        "title": "bash",
+                        "status": "in_progress",
+                        "rawInput": { "command": "dir" }
+                    }
+                }
+            }),
+        );
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call-bash",
+                        "status": "completed",
+                        "content": [{ "type": "text", "text": "ok.txt" }]
+                    }
+                }
+            }),
+        );
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "m-a1",
+                        "content": { "type": "text", "text": "已查看完成" }
+                    }
+                }
+            }),
+        );
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 12400,
+                        "size": 1000000
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(state.snapshot.messages.len(), 3);
+        assert_eq!(state.snapshot.messages[1].role, "thought");
+        assert_eq!(state.snapshot.messages[1].text, "先看目录");
+        assert_eq!(state.snapshot.messages[2].role, "assistant");
+        assert_eq!(
+            state.snapshot.tool_calls[0].input.as_deref(),
+            Some("{\n  \"command\": \"dir\"\n}")
+        );
+        assert_eq!(
+            state.snapshot.tool_calls[0].detail.as_deref(),
+            Some("ok.txt")
+        );
+        let kinds: Vec<&str> = state
+            .snapshot
+            .timeline
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["message", "message", "tool", "message"]);
+        assert_eq!(state.snapshot.usage.as_ref().map(|u| u.used), Some(12400));
+        assert_eq!(state.snapshot.usage.as_ref().map(|u| u.size), Some(1000000));
     }
 }

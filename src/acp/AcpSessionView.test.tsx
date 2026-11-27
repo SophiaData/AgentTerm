@@ -294,4 +294,101 @@ describe("AcpSessionView", () => {
     expect(modelSelect.disabled).toBe(false);
     expect(feed.scrollTop).toBe(500);
   });
+
+  it("renders TUI timeline, thought stream, tool input/output, markdown code, usage, Esc cancel, and prompt history", async () => {
+    const richSnapshot: AcpSnapshot = {
+      phase: "ready",
+      busy: false,
+      cliSessionId: "sess_tui",
+      messages: [
+        { id: "m1", role: "user", text: "第一条命令" },
+        { id: "m2", role: "thought", text: "分析仓库结构" },
+        {
+          id: "m3",
+          role: "assistant",
+          text: "结果如下：\n```ts\nconst ok = true;\n```\n详见 `index.ts`",
+        },
+      ],
+      toolCalls: [
+        {
+          id: "call-1",
+          title: "read_file",
+          status: "completed",
+          input: '{"path":"index.ts"}',
+          detail: "export const ok = true;",
+        },
+      ],
+      timeline: [
+        { kind: "message", id: "m1" },
+        { kind: "message", id: "m2" },
+        { kind: "tool", id: "call-1" },
+        { kind: "message", id: "m3" },
+      ],
+      usage: { used: 12400, size: 1000000 },
+      version: 1,
+    };
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "acp_snapshot") return richSnapshot;
+      return undefined;
+    });
+
+    render(<AcpSessionView {...baseProps} />);
+    await waitFor(() =>
+      expect(screen.getByLabelText("上下文占用").textContent).toBe(
+        "上下文 12.4k / 1000k (1%)",
+      ),
+    );
+
+    const feed = document.querySelector(".acp-feed") as HTMLDivElement;
+    const childClasses = Array.from(feed.children).map((el) => el.className);
+    expect(childClasses).toEqual([
+      "acp-message is-user",
+      "acp-thought-card",
+      "acp-tool-card",
+      "acp-message is-assistant",
+    ]);
+    expect(screen.getByText("const ok = true;")).toBeTruthy();
+    expect(screen.getByText('{"path":"index.ts"}')).toBeTruthy();
+    expect(screen.getByText("export const ok = true;")).toBeTruthy();
+
+    const input = screen.getByLabelText(
+      "发送消息给 DeepSeek Harness",
+    ) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "检查版本" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith("acp_send_prompt", {
+        sessionId: "acp-session-1",
+        text: "检查版本",
+      }),
+    );
+
+    // ArrowUp recalls sent prompt when input cursor is at 0
+    input.setSelectionRange(0, 0);
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    expect(input.value).toBe("检查版本");
+
+    // ArrowDown returns to empty draft
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(input.value).toBe("");
+
+    // Escape cancels active busy turn
+    const emitState = mocks.listeners.get("acp-state-acp-session-1");
+    act(() => {
+      emitState?.({
+        payload: {
+          ...richSnapshot,
+          busy: true,
+          version: 2,
+        },
+      });
+    });
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith("acp_cancel_turn", {
+        sessionId: "acp-session-1",
+      }),
+    );
+  });
 });

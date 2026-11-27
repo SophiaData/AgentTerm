@@ -6,7 +6,8 @@ import {
 } from "react";
 import type { ConnectionPhase } from "../terminal/sessionTransport";
 import type { SessionExit, SessionInfo } from "../terminal/types";
-import type { AcpSnapshot } from "./types";
+import AcpRichText, { AcpCopyButton } from "./AcpRichText";
+import type { AcpMessage, AcpSnapshot, AcpToolCall, AcpUsage } from "./types";
 
 type Props = {
   session: SessionInfo;
@@ -41,6 +42,59 @@ function toolStatusLabel(status: string): string {
     default:
       return status;
   }
+}
+
+function formatTokens(count: number): string {
+  if (count >= 1000) {
+    return `${(count / 1000).toFixed(count >= 100_000 ? 0 : 1)}k`;
+  }
+  return String(count);
+}
+
+function formatUsageLabel(usage?: AcpUsage | null): string | null {
+  if (!usage || usage.size <= 0) return null;
+  const pct = Math.min(100, Math.round((usage.used / usage.size) * 100));
+  return `上下文 ${formatTokens(usage.used)} / ${formatTokens(usage.size)} (${pct}%)`;
+}
+
+type FeedEntry =
+  { kind: "message"; item: AcpMessage } | { kind: "tool"; item: AcpToolCall };
+
+function resolveFeedEntries(snapshot: AcpSnapshot): FeedEntry[] {
+  if (snapshot.timeline && snapshot.timeline.length > 0) {
+    const messageMap = new Map(snapshot.messages.map((m) => [m.id, m]));
+    const toolMap = new Map(snapshot.toolCalls.map((t) => [t.id, t]));
+    const seenMessages = new Set<string>();
+    const seenTools = new Set<string>();
+    const entries: FeedEntry[] = [];
+    for (const ref of snapshot.timeline) {
+      if (ref.kind === "message") {
+        const msg = messageMap.get(ref.id);
+        if (msg && !seenMessages.has(msg.id)) {
+          seenMessages.add(msg.id);
+          entries.push({ kind: "message", item: msg });
+        }
+      } else {
+        const call = toolMap.get(ref.id);
+        if (call && !seenTools.has(call.id)) {
+          seenTools.add(call.id);
+          entries.push({ kind: "tool", item: call });
+        }
+      }
+    }
+    for (const msg of snapshot.messages) {
+      if (!seenMessages.has(msg.id))
+        entries.push({ kind: "message", item: msg });
+    }
+    for (const call of snapshot.toolCalls) {
+      if (!seenTools.has(call.id)) entries.push({ kind: "tool", item: call });
+    }
+    return entries;
+  }
+  return [
+    ...snapshot.messages.map((item): FeedEntry => ({ kind: "message", item })),
+    ...snapshot.toolCalls.map((item): FeedEntry => ({ kind: "tool", item })),
+  ];
 }
 
 function initialSnapshot(): AcpSnapshot {
@@ -79,6 +133,9 @@ export default function AcpSessionView({
   const feedRef = useRef<HTMLDivElement | null>(null);
   const followBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const promptHistoryRef = useRef<string[]>([]);
+  const historyIndexRef = useRef(-1);
+  const savedDraftRef = useRef("");
   const current = useRef({
     onExit,
     onConnection,
@@ -230,6 +287,12 @@ export default function AcpSessionView({
   async function sendPrompt() {
     const text = draft.trim();
     if (!text || !canSend) return;
+    const history = promptHistoryRef.current;
+    if (history[history.length - 1] !== text) {
+      history.push(text);
+    }
+    historyIndexRef.current = -1;
+    savedDraftRef.current = "";
     followBottomRef.current = true;
     setSending(true);
     setActionError(null);
@@ -300,6 +363,11 @@ export default function AcpSessionView({
   }
 
   function handleKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Escape" && snapshot.busy && running) {
+      event.preventDefault();
+      void cancelTurn();
+      return;
+    }
     if (
       event.key === "Enter" &&
       !event.shiftKey &&
@@ -307,8 +375,51 @@ export default function AcpSessionView({
     ) {
       event.preventDefault();
       void sendPrompt();
+      return;
+    }
+    const history = promptHistoryRef.current;
+    if (history.length === 0 || event.nativeEvent.isComposing) return;
+    const textarea = event.currentTarget;
+    if (
+      event.key === "ArrowUp" &&
+      !event.shiftKey &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      textarea.selectionStart === 0 &&
+      textarea.selectionEnd === 0
+    ) {
+      event.preventDefault();
+      if (historyIndexRef.current === -1) {
+        savedDraftRef.current = draft;
+        historyIndexRef.current = history.length - 1;
+      } else if (historyIndexRef.current > 0) {
+        historyIndexRef.current -= 1;
+      }
+      setDraft(history[historyIndexRef.current] ?? "");
+    } else if (
+      event.key === "ArrowDown" &&
+      !event.shiftKey &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      historyIndexRef.current >= 0 &&
+      textarea.selectionStart === draft.length &&
+      textarea.selectionEnd === draft.length
+    ) {
+      event.preventDefault();
+      if (historyIndexRef.current < history.length - 1) {
+        historyIndexRef.current += 1;
+        setDraft(history[historyIndexRef.current] ?? "");
+      } else {
+        historyIndexRef.current = -1;
+        setDraft(savedDraftRef.current);
+      }
     }
   }
+
+  const usageLabel = formatUsageLabel(snapshot.usage);
+  const feedEntries = resolveFeedEntries(snapshot);
 
   const statusText =
     snapshot.phase === "connecting"
@@ -318,14 +429,33 @@ export default function AcpSessionView({
         : !running || snapshot.phase === "exited"
           ? "ACP 会话已结束，对话记录保留在下方"
           : snapshot.busy
-            ? "Agent 正在思考与执行工具…"
-            : "ACP 已就绪 · Enter 发送 · Shift+Enter 换行";
+            ? "Agent 正在思考与执行工具…（Esc 停止）"
+            : "ACP 已就绪 · Enter 发送 · Shift+Enter 换行 · ↑↓ 历史指令";
 
   return (
-    <div className="acp-view" aria-label="ACP 会话面板">
+    <div
+      className="acp-view"
+      aria-label="ACP 会话面板"
+      onKeyDown={(event) => {
+        if (
+          event.key === "Escape" &&
+          snapshot.busy &&
+          running &&
+          !(event.target instanceof HTMLSelectElement)
+        ) {
+          event.preventDefault();
+          void cancelTurn();
+        }
+      }}
+    >
       <div className="terminal-toolbar">
         <span role="status">{statusText}</span>
         <div className="terminal-actions">
+          {usageLabel ? (
+            <span className="acp-usage-badge" aria-label="上下文占用">
+              {usageLabel}
+            </span>
+          ) : null}
           {snapshot.busy && running ? (
             <button
               type="button"
@@ -445,7 +575,7 @@ export default function AcpSessionView({
             el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
         }}
       >
-        {!snapshot.messages.length && !snapshot.toolCalls.length ? (
+        {!feedEntries.length ? (
           <div className="acp-empty">
             {snapshot.phase === "connecting" ? (
               <p>正在初始化 DeepSeek Harness ACP 会话…</p>
@@ -458,39 +588,92 @@ export default function AcpSessionView({
           </div>
         ) : null}
 
-        {snapshot.messages.map((message) => (
-          <article
-            key={message.id}
-            className={`acp-message is-${message.role}`}
-          >
-            <header className="acp-message-role">
-              {message.role === "user"
-                ? "你"
-                : message.role === "assistant"
-                  ? session.toolName
-                  : "系统"}
-            </header>
-            <div className="acp-message-body">{message.text}</div>
-          </article>
-        ))}
-
-        {snapshot.toolCalls.length ? (
-          <section className="acp-tools" aria-label="工具调用记录">
-            {snapshot.toolCalls.map((call) => (
-              <details key={call.id} className="acp-tool-card">
+        {feedEntries.map((entry, entryIdx) => {
+          if (entry.kind === "tool") {
+            const call = entry.item;
+            return (
+              <details
+                key={`tool-${call.id}`}
+                className="acp-tool-card"
+                open={
+                  call.status === "in_progress" ||
+                  call.status === "running" ||
+                  call.status === "failed"
+                }
+              >
                 <summary className="acp-tool-summary">
                   <span className="acp-tool-title">{call.title}</span>
                   <span className={`acp-tool-status is-${call.status}`}>
                     {toolStatusLabel(call.status)}
                   </span>
                 </summary>
-                {call.detail ? (
-                  <pre className="acp-tool-detail">{call.detail}</pre>
+                {call.input || call.detail ? (
+                  <div className="acp-tool-body">
+                    {call.input ? (
+                      <div className="acp-tool-section">
+                        <div className="acp-tool-section-label">输入</div>
+                        <pre className="acp-tool-detail">{call.input}</pre>
+                      </div>
+                    ) : null}
+                    {call.detail ? (
+                      <div className="acp-tool-section">
+                        <div className="acp-tool-section-label">输出</div>
+                        <pre className="acp-tool-detail">{call.detail}</pre>
+                      </div>
+                    ) : null}
+                  </div>
                 ) : null}
               </details>
-            ))}
-          </section>
-        ) : null}
+            );
+          }
+
+          const message = entry.item;
+          if (message.role === "thought") {
+            const isActiveThought =
+              snapshot.busy && entryIdx === feedEntries.length - 1;
+            return (
+              <details
+                key={`msg-${message.id}`}
+                className="acp-thought-card"
+                open={isActiveThought}
+              >
+                <summary className="acp-thought-summary">
+                  <span>{isActiveThought ? "正在思考…" : "思考过程"}</span>
+                </summary>
+                <div className="acp-thought-body">
+                  <AcpRichText text={message.text} />
+                </div>
+              </details>
+            );
+          }
+
+          return (
+            <article
+              key={`msg-${message.id}`}
+              className={`acp-message is-${message.role}`}
+            >
+              <header className="acp-message-header">
+                <span className="acp-message-role">
+                  {message.role === "user"
+                    ? "你"
+                    : message.role === "assistant"
+                      ? session.toolName
+                      : "系统"}
+                </span>
+                {message.role === "assistant" ? (
+                  <AcpCopyButton text={message.text} />
+                ) : null}
+              </header>
+              {message.role === "assistant" ? (
+                <div className="acp-message-body is-rich">
+                  <AcpRichText text={message.text} />
+                </div>
+              ) : (
+                <div className="acp-message-body">{message.text}</div>
+              )}
+            </article>
+          );
+        })}
       </div>
 
       {snapshot.pendingPermission ? (
