@@ -61,11 +61,12 @@ describe("session history helpers", () => {
   });
 
   it("filters out live sessions and limits displayed recent entries", () => {
-    const records = Array.from({ length: 8 }, (_, index) =>
+    const records = Array.from({ length: 24 }, (_, index) =>
       makeRecord({ id: `s-${index}` }),
     );
     const active = new Set(["s-0", "s-2"]);
-    expect(recentClosedHistory(records, active).map((r) => r.id)).toEqual([
+    expect(recentClosedHistory(records, active)).toHaveLength(20);
+    expect(recentClosedHistory(records, active, 5).map((r) => r.id)).toEqual([
       "s-1",
       "s-3",
       "s-4",

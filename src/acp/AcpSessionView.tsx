@@ -69,11 +69,15 @@ export default function AcpSessionView({
   const [snapshot, setSnapshot] = useState<AcpSnapshot>(initialSnapshot);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [pendingConfigValues, setPendingConfigValues] = useState<
+    Record<string, string>
+  >({});
   const [actionError, setActionError] = useState<string | null>(null);
   const [respondingPerm, setRespondingPerm] = useState(false);
 
   const versionRef = useRef(0);
   const feedRef = useRef<HTMLDivElement | null>(null);
+  const followBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const current = useRef({
     onExit,
@@ -102,6 +106,23 @@ export default function AcpSessionView({
       const changed = next.version > versionRef.current;
       versionRef.current = next.version;
       setSnapshot(next);
+      if (changed) {
+        setPendingConfigValues((prev) => {
+          const keys = Object.keys(prev);
+          if (keys.length === 0) return prev;
+          if (next.error) return {};
+          const remaining: Record<string, string> = {};
+          for (const key of keys) {
+            const matched = next.configOptions?.find((opt) => opt.id === key);
+            if (matched && matched.currentValue !== prev[key]) {
+              remaining[key] = prev[key];
+            }
+          }
+          return Object.keys(remaining).length === keys.length
+            ? prev
+            : remaining;
+        });
+      }
       current.current.onConnection(session.id, next.phase, next.error ?? null);
       if (fromLiveEvent && changed && (next.busy || next.messages.length > 0)) {
         current.current.onOutputActivity?.(session.id, "acp-update");
@@ -169,11 +190,34 @@ export default function AcpSessionView({
     }
   }, [visible, focused, focusRequest, snapshot.phase]);
 
-  useEffect(() => {
+  const scrollToBottom = (forceFollow = false) => {
+    if (forceFollow) {
+      followBottomRef.current = true;
+    }
     const feed = feedRef.current;
     if (!feed) return;
     feed.scrollTop = feed.scrollHeight;
-  }, [snapshot.messages, snapshot.toolCalls, snapshot.pendingPermission]);
+    requestAnimationFrame(() => {
+      if (feedRef.current && followBottomRef.current) {
+        feedRef.current.scrollTop = feedRef.current.scrollHeight;
+      }
+    });
+  };
+
+  useEffect(() => {
+    if (visible && followBottomRef.current) {
+      scrollToBottom(false);
+    }
+  }, [
+    visible,
+    snapshot.messages,
+    snapshot.toolCalls,
+    snapshot.pendingPermission,
+    snapshot.configOptions,
+    snapshot.error,
+    actionError,
+    snapshot.phase,
+  ]);
 
   const canSend =
     running &&
@@ -186,6 +230,7 @@ export default function AcpSessionView({
   async function sendPrompt() {
     const text = draft.trim();
     if (!text || !canSend) return;
+    followBottomRef.current = true;
     setSending(true);
     setActionError(null);
     current.current.onUserInput?.(session.id);
@@ -194,6 +239,7 @@ export default function AcpSessionView({
       const { invoke } = await import("@tauri-apps/api/core");
       await invoke("acp_send_prompt", { sessionId: session.id, text });
       setDraft("");
+      scrollToBottom(true);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -227,6 +273,29 @@ export default function AcpSessionView({
       setActionError(error instanceof Error ? error.message : String(error));
     } finally {
       setRespondingPerm(false);
+    }
+  }
+
+  const switchingConfig = Object.keys(pendingConfigValues).length > 0;
+
+  async function changeConfigOption(configId: string, value: string) {
+    if (pendingConfigValues[configId] !== undefined) return;
+    setPendingConfigValues((prev) => ({ ...prev, [configId]: value }));
+    setActionError(null);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("acp_set_config_option", {
+        sessionId: session.id,
+        configId,
+        value,
+      });
+    } catch (error) {
+      setPendingConfigValues((prev) => {
+        const next = { ...prev };
+        delete next[configId];
+        return next;
+      });
+      setActionError(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -269,16 +338,89 @@ export default function AcpSessionView({
           <button
             type="button"
             className="ghost-button"
-            onClick={() => {
-              if (feedRef.current) {
-                feedRef.current.scrollTop = feedRef.current.scrollHeight;
-              }
-            }}
+            onClick={() => scrollToBottom(true)}
           >
             回到底部
           </button>
         </div>
       </div>
+
+      {snapshot.configOptions?.length ? (
+        <div className="acp-config-bar" role="group" aria-label="ACP 会话配置">
+          {snapshot.configOptions.map((option) => {
+            const activeValue =
+              pendingConfigValues[option.id] ?? option.currentValue;
+            const hasActiveChoice = option.choices.some(
+              (choice) => choice.value === activeValue,
+            );
+            const ungrouped = option.choices.filter((c) => !c.group);
+            const groupOrder: string[] = [];
+            const byGroup = new Map<string, typeof option.choices>();
+            for (const choice of option.choices) {
+              if (!choice.group) continue;
+              if (!byGroup.has(choice.group)) {
+                groupOrder.push(choice.group);
+                byGroup.set(choice.group, []);
+              }
+              byGroup.get(choice.group)!.push(choice);
+            }
+            return (
+              <label key={option.id} className="acp-config-item">
+                <span>
+                  {option.category === "model"
+                    ? "模型"
+                    : option.category === "thought_level"
+                      ? "思考强度"
+                      : option.name}
+                </span>
+                <select
+                  className="acp-config-select"
+                  aria-label={option.name}
+                  value={activeValue}
+                  disabled={
+                    !running ||
+                    busy ||
+                    switchingConfig ||
+                    snapshot.phase !== "ready" ||
+                    snapshot.busy
+                  }
+                  onChange={(event) =>
+                    void changeConfigOption(option.id, event.target.value)
+                  }
+                >
+                  {!hasActiveChoice && activeValue ? (
+                    <option key={`cur-${activeValue}`} value={activeValue}>
+                      {activeValue}
+                    </option>
+                  ) : null}
+                  {ungrouped.map((choice) => (
+                    <option
+                      key={`opt-${choice.value}`}
+                      value={choice.value}
+                      title={choice.description ?? undefined}
+                    >
+                      {choice.name}
+                    </option>
+                  ))}
+                  {groupOrder.map((group) => (
+                    <optgroup key={`grp-${group}`} label={group}>
+                      {byGroup.get(group)!.map((choice) => (
+                        <option
+                          key={`opt-${choice.value}`}
+                          value={choice.value}
+                          title={choice.description ?? undefined}
+                        >
+                          {choice.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+              </label>
+            );
+          })}
+        </div>
+      ) : null}
 
       {snapshot.error || actionError ? (
         <div className="terminal-problem" role="alert">
@@ -293,7 +435,16 @@ export default function AcpSessionView({
         </div>
       ) : null}
 
-      <div className="acp-feed" ref={feedRef} aria-live="polite">
+      <div
+        className="acp-feed"
+        ref={feedRef}
+        aria-live="polite"
+        onScroll={(event) => {
+          const el = event.currentTarget;
+          followBottomRef.current =
+            el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
+        }}
+      >
         {!snapshot.messages.length && !snapshot.toolCalls.length ? (
           <div className="acp-empty">
             {snapshot.phase === "connecting" ? (

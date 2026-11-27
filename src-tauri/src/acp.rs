@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -77,6 +78,28 @@ pub struct AcpPermissionRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AcpConfigChoice {
+    pub value: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub current_value: String,
+    pub choices: Vec<AcpConfigChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpSnapshot {
     pub phase: AcpPhase,
     pub busy: bool,
@@ -88,6 +111,8 @@ pub struct AcpSnapshot {
     pub exit_reason: Option<String>,
     pub messages: Vec<AcpMessage>,
     pub tool_calls: Vec<AcpToolCall>,
+    #[serde(default)]
+    pub config_options: Vec<AcpConfigOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<AcpPermissionRequest>,
     pub version: u64,
@@ -148,6 +173,7 @@ pub(crate) struct AcpState {
     next_request_id: u64,
     active_prompt_id: Option<u64>,
     setup_request_id: Option<u64>,
+    pending_config_requests: HashSet<u64>,
     current_assistant_message_key: Option<String>,
     pending_permission_raw_id: Option<(String, Value)>,
     next_message_seq: u64,
@@ -162,6 +188,9 @@ impl AcpState {
         resume_id: Option<String>,
         bridge: Option<&SessionBridge>,
     ) -> Self {
+        let clean_project_path = strip_windows_verbatim(Path::new(project_path))
+            .display()
+            .to_string();
         let mcp_servers = bridge
             .map(|entry| {
                 vec![json!({
@@ -177,13 +206,14 @@ impl AcpState {
             .unwrap_or_default();
         Self {
             tool_id: tool_id.to_string(),
-            project_path: project_path.to_string(),
+            project_path: clean_project_path,
             resume_id: resume_id.clone(),
             mcp_servers,
             retried_without_mcp: false,
             next_request_id: 2,
             active_prompt_id: None,
             setup_request_id: None,
+            pending_config_requests: HashSet::new(),
             current_assistant_message_key: None,
             pending_permission_raw_id: None,
             next_message_seq: 0,
@@ -196,6 +226,7 @@ impl AcpState {
                 exit_reason: None,
                 messages: Vec::new(),
                 tool_calls: Vec::new(),
+                config_options: Vec::new(),
                 pending_permission: None,
                 version: 1,
             },
@@ -451,6 +482,55 @@ impl AcpSessionHandle {
         }))
     }
 
+    pub fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), String> {
+        let config_id = config_id.trim();
+        if config_id.is_empty() || value.is_empty() {
+            return Err("配置参数不能为空".to_string());
+        }
+        let (request_id, cli_session_id) = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "ACP 会话状态不可用".to_string())?;
+            if guard.snapshot.phase != AcpPhase::Ready {
+                return Err("ACP 会话尚未就绪".to_string());
+            }
+            if guard.snapshot.busy {
+                return Err("当前轮次仍在执行，请稍后再切换配置".to_string());
+            }
+            let cli_session_id = guard
+                .snapshot
+                .cli_session_id
+                .clone()
+                .ok_or_else(|| "ACP 会话标识尚未建立".to_string())?;
+            let id = guard.next_request_id;
+            guard.next_request_id = guard.next_request_id.saturating_add(1);
+            guard.pending_config_requests.insert(id);
+            guard.snapshot.error = None;
+            guard.bump();
+            (id, cli_session_id)
+        };
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "session/set_config_option",
+            "params": {
+                "sessionId": cli_session_id,
+                "configId": config_id,
+                "value": value,
+            }
+        });
+        if let Err(error) = self.writer.send_json(&payload) {
+            if let Ok(mut guard) = self.state.lock() {
+                guard.pending_config_requests.remove(&request_id);
+                guard.snapshot.error = Some(error.clone());
+                guard.bump();
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn terminate(&self) -> Result<(), String> {
         self.closed.store(true, Ordering::SeqCst);
         let cli_id = self
@@ -536,6 +616,17 @@ pub fn acp_respond_permission(
     option_id: Option<String>,
 ) -> Result<(), String> {
     state.acp_respond_permission(&app, &session_id, &request_id, option_id.as_deref())
+}
+
+#[tauri::command(async)]
+pub fn acp_set_config_option(
+    state: tauri::State<'_, SessionManager>,
+    app: AppHandle,
+    session_id: String,
+    config_id: String,
+    value: String,
+) -> Result<(), String> {
+    state.acp_set_config_option(&app, &session_id, &config_id, &value)
 }
 
 pub struct AcpHooks {
@@ -851,6 +942,11 @@ pub(crate) fn apply_server_message(state: &mut AcpState, value: &Value) -> Apply
                         state.snapshot.cli_session_id = Some(cli_id.clone());
                         bound_cli_session = Some(cli_id);
                     }
+                    if let Some(options) = parse_config_options(
+                        value.get("result").and_then(|res| res.get("configOptions")),
+                    ) {
+                        state.snapshot.config_options = options;
+                    }
                     state.snapshot.phase = AcpPhase::Ready;
                     state.snapshot.error = None;
                     state.bump();
@@ -862,6 +958,20 @@ pub(crate) fn apply_server_message(state: &mut AcpState, value: &Value) -> Apply
                 if let Some(err) = err_msg {
                     state.snapshot.error = Some(err.clone());
                     state.push_message("system", format!("请求失败：{err}"));
+                }
+                state.bump();
+            } else if let Some(req_id) = id_num
+                && state.pending_config_requests.remove(&req_id)
+            {
+                if let Some(err) = err_msg {
+                    state.snapshot.error = Some(format!("切换配置失败：{err}"));
+                } else {
+                    if let Some(options) = parse_config_options(
+                        value.get("result").and_then(|res| res.get("configOptions")),
+                    ) {
+                        state.snapshot.config_options = options;
+                    }
+                    state.snapshot.error = None;
                 }
                 state.bump();
             }
@@ -1040,8 +1150,82 @@ fn apply_session_update(state: &mut AcpState, update: &Value) {
             let detail = extract_tool_detail(update);
             state.update_tool_call(id, title, status, detail);
         }
+        Some("config_option_update") => {
+            if let Some(options) = parse_config_options(update.get("configOptions")) {
+                state.snapshot.config_options = options;
+                state.bump();
+            }
+        }
         _ => {}
     }
+}
+
+fn parse_config_options(raw: Option<&Value>) -> Option<Vec<AcpConfigOption>> {
+    let items = raw?.as_array()?;
+    let mut parsed = Vec::new();
+    for item in items {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(current_value) = item.get("currentValue").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_string();
+        let category = item
+            .get("category")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut choices = Vec::new();
+        if let Some(options) = item.get("options").and_then(Value::as_array) {
+            for entry in options {
+                if let Some(group_items) = entry.get("options").and_then(Value::as_array) {
+                    let group_label = entry
+                        .get("name")
+                        .or_else(|| entry.get("group"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    for sub in group_items {
+                        if let Some(choice) = parse_config_choice(sub, group_label.as_deref()) {
+                            choices.push(choice);
+                        }
+                    }
+                } else if let Some(choice) = parse_config_choice(entry, None) {
+                    choices.push(choice);
+                }
+            }
+        }
+        parsed.push(AcpConfigOption {
+            id: id.to_string(),
+            name,
+            category,
+            current_value: current_value.to_string(),
+            choices,
+        });
+    }
+    Some(parsed)
+}
+
+fn parse_config_choice(value: &Value, group: Option<&str>) -> Option<AcpConfigChoice> {
+    let val = value.get("value").and_then(Value::as_str)?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(val)
+        .to_string();
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(AcpConfigChoice {
+        value: val.to_string(),
+        name,
+        group: group.map(str::to_string),
+        description,
+    })
 }
 
 fn extract_content_text(content: Option<&Value>) -> Option<String> {
@@ -1266,6 +1450,157 @@ mod tests {
         );
         assert_eq!(unknown.outgoing.len(), 1);
         assert_eq!(unknown.outgoing[0]["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn parses_config_options_and_handles_updates() {
+        let mut state = AcpState::new("dsh", r"\\?\E:\AgentTerm", None, None);
+        assert_eq!(state.project_path, r"E:\AgentTerm");
+
+        let init_ok = apply_server_message(
+            &mut state,
+            &json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}}),
+        );
+        let setup_id = init_ok.outgoing[0]["id"].as_u64().unwrap();
+        assert_eq!(init_ok.outgoing[0]["params"]["cwd"], r"E:\AgentTerm");
+
+        let open_ok = apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": setup_id,
+                "result": {
+                    "sessionId": "sess_cfg_1",
+                    "configOptions": [{
+                        "id": "model",
+                        "name": "Model",
+                        "category": "model",
+                        "currentValue": "[\"deepseek-official\",\"deepseek-v4-flash\"]",
+                        "options": [{
+                            "group": "magpie",
+                            "name": "Magpie",
+                            "options": [{
+                                "value": "[\"magpie\",\"dsh-fe/deepseek-v4-flash\"]",
+                                "name": "DeepSeek V4 Flash · dsh-fe"
+                            }]
+                        }]
+                    }]
+                }
+            }),
+        );
+        let snap = open_ok.emitted_snapshot.unwrap();
+        assert_eq!(snap.config_options.len(), 1);
+        assert_eq!(snap.config_options[0].choices.len(), 1);
+        assert_eq!(
+            snap.config_options[0].choices[0].group.as_deref(),
+            Some("Magpie")
+        );
+
+        state.pending_config_requests.insert(10);
+        let set_ok = apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "result": {
+                    "configOptions": [{
+                        "id": "model",
+                        "name": "Model",
+                        "category": "model",
+                        "currentValue": "[\"magpie\",\"dsh-fe/deepseek-v4-flash\"]",
+                        "options": []
+                    }]
+                }
+            }),
+        );
+        assert_eq!(
+            set_ok.emitted_snapshot.unwrap().config_options[0].current_value,
+            "[\"magpie\",\"dsh-fe/deepseek-v4-flash\"]"
+        );
+
+        // config_option_update notification updates configOptions in snapshot
+        let updated = apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [{
+                            "id": "reasoning_effort",
+                            "name": "Reasoning effort",
+                            "category": "thought_level",
+                            "currentValue": "max",
+                            "options": [{"value": "max", "name": "Max"}]
+                        }]
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            updated.emitted_snapshot.unwrap().config_options[0].current_value,
+            "max"
+        );
+
+        // config option error updates snapshot.error and clears pending request id
+        state.pending_config_requests.insert(11);
+        let set_err = apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "error": { "code": -32602, "message": "invalid model" }
+            }),
+        );
+        assert!(
+            set_err
+                .emitted_snapshot
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("切换配置失败")
+        );
+        assert!(!state.pending_config_requests.contains(&11));
+
+        let handle_state = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let (tx, _rx) = std::sync::mpsc::sync_channel(4);
+        let dummy_child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/C", "exit 0"][..]
+            } else {
+                &[]
+            })
+            .spawn()
+            .unwrap();
+        let handle = super::AcpSessionHandle {
+            info: crate::sessions::SessionInfo {
+                id: "s-cfg".into(),
+                tool_id: "dsh".into(),
+                tool_name: "DeepSeek Harness".into(),
+                project_path: r"E:\AgentTerm".into(),
+                title: None,
+                cli_session_id: Some("sess_cfg_1".into()),
+            },
+            #[cfg(unix)]
+            pgid: None,
+            #[cfg(windows)]
+            job: None,
+            child: std::sync::Arc::new(std::sync::Mutex::new(dummy_child)),
+            writer: super::AcpWriter {
+                tx,
+                closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+            state: std::sync::Arc::clone(&handle_state),
+            closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        assert!(handle.set_config_option("", "x").is_err());
+        handle_state.lock().unwrap().snapshot.busy = true;
+        assert!(handle.set_config_option("model", "x").is_err());
+        handle_state.lock().unwrap().snapshot.busy = false;
+        handle_state.lock().unwrap().snapshot.phase = AcpPhase::Connecting;
+        assert!(handle.set_config_option("model", "x").is_err());
+        let _ = handle.terminate();
     }
 
     #[test]

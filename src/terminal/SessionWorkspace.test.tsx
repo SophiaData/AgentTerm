@@ -54,6 +54,8 @@ describe("terminal split presentation", () => {
     expect(html).toContain('aria-valuenow="50"');
     expect(html).toContain('aria-orientation="vertical"');
     expect(html).toContain("点击修改名称");
+    expect(html).toContain('data-agent="claude"');
+    expect(html).toContain(">Claude<");
   });
 
   it("single view removes the divider but retains the other mounted terminals", () => {

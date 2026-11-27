@@ -67,6 +67,7 @@ export default function TerminalView({
     focus: () => void;
     scroll: () => void;
     layout: () => void;
+    reveal: () => void;
     input: () => void;
     copy: () => Promise<void>;
     paste: () => Promise<void>;
@@ -129,6 +130,44 @@ export default function TerminalView({
         if (current.current.visible && localPhase === "ready") terminal.focus();
       };
       let lastSize = "";
+      let followBottom = true;
+      let isResizing = false;
+      let scrollFrame = 0;
+      let revealFrame = 0;
+      const syncDomViewportBottom = () => {
+        const host = hostRef.current;
+        if (!host) return;
+        for (const selector of [
+          ".xterm-viewport",
+          ".xterm-scrollable-element",
+        ]) {
+          const el = host.querySelector<HTMLElement>(selector);
+          if (el) {
+            el.scrollTop = el.scrollHeight;
+          }
+        }
+      };
+      const scrollToBottomHard = (forceFollow = false, withRefresh = true) => {
+        if (disposed) return;
+        if (forceFollow) followBottom = true;
+        const activeBuffer = terminal.buffer?.active;
+        if (
+          activeBuffer &&
+          typeof terminal.scrollLines === "function" &&
+          activeBuffer.viewportY !== activeBuffer.baseY
+        ) {
+          terminal.scrollLines(activeBuffer.baseY - activeBuffer.viewportY);
+        }
+        terminal.scrollToBottom();
+        syncDomViewportBottom();
+        if (
+          withRefresh &&
+          typeof terminal.refresh === "function" &&
+          terminal.rows > 0
+        ) {
+          terminal.refresh(0, terminal.rows - 1);
+        }
+      };
       const resize = () => {
         const host = hostRef.current;
         if (
@@ -139,7 +178,15 @@ export default function TerminalView({
           host.clientWidth < 160
         )
           return;
-        fit.fit();
+        isResizing = true;
+        try {
+          fit.fit();
+        } finally {
+          isResizing = false;
+        }
+        if (followBottom) {
+          scrollToBottomHard(false, false);
+        }
         const { rows, cols } = terminal;
         if (
           !Number.isFinite(rows) ||
@@ -170,6 +217,32 @@ export default function TerminalView({
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(resize, 60);
       };
+      const reveal = () => {
+        layout();
+        cancelAnimationFrame(revealFrame);
+        revealFrame = requestAnimationFrame(() => {
+          revealFrame = 0;
+          if (disposed || !current.current.visible) return;
+          resize();
+          if (followBottom) {
+            scrollToBottomHard(false, true);
+          }
+        });
+      };
+      cleanups.push(() => {
+        cancelAnimationFrame(scrollFrame);
+        cancelAnimationFrame(revealFrame);
+      });
+      if (typeof terminal.onScroll === "function") {
+        const scrollSub = terminal.onScroll(() => {
+          if (disposed || !current.current.visible || isResizing) return;
+          const activeBuffer = terminal.buffer?.active;
+          if (activeBuffer) {
+            followBottom = activeBuffer.viewportY >= activeBuffer.baseY;
+          }
+        });
+        cleanups.push(() => scrollSub.dispose());
+      }
       const clipboard = createTerminalClipboard({
         terminal,
         readText: clipboardApi.readText,
@@ -187,8 +260,18 @@ export default function TerminalView({
       cleanups.push(clipboard.dispose);
       controls.current = {
         focus,
-        scroll: () => terminal.scrollToBottom(),
+        scroll: () => {
+          scrollToBottomHard(true, true);
+          cancelAnimationFrame(scrollFrame);
+          scrollFrame = requestAnimationFrame(() => {
+            scrollFrame = 0;
+            if (!disposed && current.current.visible) {
+              scrollToBottomHard(true, false);
+            }
+          });
+        },
         layout,
+        reveal,
         input,
         copy: clipboard.copy,
         paste: clipboard.paste,
@@ -207,7 +290,19 @@ export default function TerminalView({
         {
           output: (text) => {
             if (disposed) return;
-            terminal.write(text);
+            terminal.write(text, () => {
+              if (!disposed && followBottom && current.current.visible) {
+                const activeBuffer = terminal.buffer?.active;
+                if (
+                  activeBuffer &&
+                  activeBuffer.viewportY < activeBuffer.baseY
+                ) {
+                  scrollToBottomHard(false, false);
+                } else {
+                  terminal.scrollToBottom();
+                }
+              }
+            });
             if (localPhase === "ready" && text) {
               current.current.onOutputActivity?.(session.id, text);
             }
@@ -226,6 +321,9 @@ export default function TerminalView({
                 requestAnimationFrame(() => {
                   if (disposed) return;
                   resize();
+                  if (followBottom && current.current.visible) {
+                    scrollToBottomHard(false, true);
+                  }
                   if (current.current.focused) focus();
                 }),
               );
@@ -281,13 +379,19 @@ export default function TerminalView({
     };
   }, [session.id, connection]);
 
+  const prevVisibleRef = useRef(visible);
   useEffect(() => {
     controls.current?.invalidatePaste();
     controls.current?.input();
-    if (visible) {
-      controls.current?.layout();
-    }
   }, [visible, focused, running, busy]);
+
+  useEffect(() => {
+    const wasVisible = prevVisibleRef.current;
+    prevVisibleRef.current = visible;
+    if (visible && !wasVisible) {
+      controls.current?.reveal();
+    }
+  }, [visible]);
 
   useEffect(() => {
     controls.current?.setTheme(themeId);
@@ -355,7 +459,7 @@ export default function TerminalView({
           </button>
           <button
             type="button"
-            className="ghost-button"
+            className="ghost-button terminal-scroll-action"
             onClick={() => controls.current?.scroll()}
           >
             回到底部
@@ -387,11 +491,13 @@ export default function TerminalView({
           </button>
         </div>
       ) : null}
-      <div
-        className="terminal-host"
-        ref={hostRef}
-        aria-label="CLI 输入与输出"
-      />
+      <div className="terminal-frame">
+        <div
+          className="terminal-host"
+          ref={hostRef}
+          aria-label="CLI 输入与输出"
+        />
+      </div>
     </div>
   );
 }

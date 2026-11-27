@@ -31,6 +31,12 @@ const mocks = vi.hoisted(() => ({
     loadAddon: vi.fn(),
     dispose: vi.fn(),
     scrollToBottom: vi.fn(),
+    scrollLines: vi.fn(),
+    refresh: vi.fn(),
+    buffer: { active: { viewportY: 12, baseY: 20 } },
+    onScroll: vi.fn<(cb: () => void) => { dispose: () => void }>(() => ({
+      dispose: vi.fn(),
+    })),
     onData: vi.fn<(cb: (text: string) => void) => { dispose: () => void }>(
       () => ({ dispose: vi.fn() }),
     ),
@@ -214,5 +220,61 @@ describe("terminal clipboard wiring", () => {
       ),
     );
     expect(connectSession).toHaveBeenCalledOnce();
+  });
+
+  it("forces buffer, DOM viewport, and refresh to bottom on button click and tab reveal", async () => {
+    const rafQueue: FrameRequestCallback[] = [];
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        rafQueue.push(cb);
+        return rafQueue.length;
+      }),
+    );
+    const flushRaf = () => {
+      let guard = 0;
+      while (rafQueue.length > 0 && guard < 10) {
+        guard += 1;
+        const batch = rafQueue.splice(0, rafQueue.length);
+        for (const cb of batch) cb(0);
+      }
+    };
+
+    mocks.terminal.buffer = { active: { viewportY: 5, baseY: 18 } };
+    const { container, rerender } = render(
+      <TerminalView {...props} visible={false} />,
+    );
+    await waitFor(() => expect(mocks.terminal.onScroll).toHaveBeenCalledOnce());
+    flushRaf();
+
+    const host = container.querySelector(".terminal-host")!;
+    const viewport = document.createElement("div");
+    viewport.className = "xterm-viewport";
+    Object.defineProperty(viewport, "scrollHeight", {
+      value: 480,
+      configurable: true,
+    });
+    viewport.scrollTop = 40;
+    host.appendChild(viewport);
+
+    fireEvent.click(screen.getByRole("button", { name: "回到底部" }));
+    expect(mocks.terminal.scrollLines).toHaveBeenCalledWith(13);
+    expect(mocks.terminal.scrollToBottom).toHaveBeenCalled();
+    expect(viewport.scrollTop).toBe(480);
+
+    mocks.terminal.refresh.mockClear();
+    mocks.terminal.scrollLines.mockClear();
+    mocks.terminal.scrollToBottom.mockClear();
+    mocks.terminal.buffer = { active: { viewportY: 5, baseY: 18 } };
+    viewport.scrollTop = 10;
+
+    rerender(<TerminalView {...props} visible={true} />);
+    await waitFor(() => expect(rafQueue.length).toBeGreaterThan(0));
+    flushRaf();
+
+    expect(mocks.terminal.scrollLines).toHaveBeenCalledWith(13);
+    expect(mocks.terminal.scrollToBottom).toHaveBeenCalled();
+    expect(mocks.terminal.refresh).toHaveBeenCalled();
+    expect(viewport.scrollTop).toBe(480);
   });
 });

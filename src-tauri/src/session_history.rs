@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::journal;
 
-pub const HISTORY_LIMIT: usize = 50;
-const HISTORY_BYTES: u64 = 2 * 1024 * 1024;
+pub const HISTORY_LIMIT: usize = 200;
+const HISTORY_BYTES: u64 = 4 * 1024 * 1024;
 pub const SESSION_TITLE_MAX_CHARS: usize = 60;
 const SESSION_TITLE_MAX_BYTES: usize = 240;
 
@@ -30,7 +30,13 @@ pub fn is_valid_cli_session_id(tool_id: &str, value: &str) -> bool {
     if tool_id == "claude" {
         return is_valid_uuid(value);
     }
-    !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 pub fn is_valid_uuid(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -232,7 +238,10 @@ impl SessionHistory {
             .iter()
             .map(|record| record.id.clone())
             .collect::<std::collections::HashSet<_>>();
-        apply_event(&mut records, &mut seen, event.clone())?;
+        let changed = apply_event(&mut records, &mut seen, event.clone())?;
+        if !changed {
+            return Ok(());
+        }
         let revision = revision.checked_add(1).ok_or_else(invalid_store)?;
         let line = serde_json::to_vec(&HistoryLine {
             schema: 2,
@@ -262,7 +271,7 @@ impl SessionHistory {
                 compact_revision = revision;
             }
             if compacted.len() as u64 > HISTORY_BYTES {
-                return Err("会话历史有效记录本身超过 2 MiB".into());
+                return Err("会话历史有效记录本身超过 4 MiB".into());
             }
             journal::replace_and_archive(&self.path, &compacted).map_err(storage_error)?;
             return Ok(());
@@ -288,7 +297,7 @@ fn apply_event(
     records: &mut Vec<SessionRecord>,
     seen: &mut std::collections::HashSet<String>,
     event: HistoryEvent,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     match event {
         HistoryEvent::Start { record } => {
             validate_record(&record)?;
@@ -296,7 +305,7 @@ fn apply_event(
                 return Err("会话历史已存在同一条记录".to_string());
             }
             records.push(record);
-            Ok(())
+            Ok(true)
         }
         HistoryEvent::End {
             id,
@@ -311,7 +320,7 @@ fn apply_event(
             // First end wins: a late duplicate from the exit watcher must not
             // overwrite the explicit stop reason or the captured output size.
             if record.ended_at_ms.is_some() {
-                return Ok(());
+                return Ok(false);
             }
             let mut updated = record.clone();
             updated.ended_at_ms = Some(ended_at_ms);
@@ -319,7 +328,7 @@ fn apply_event(
             updated.output_bytes = output_bytes;
             validate_record(&updated)?;
             *record = updated;
-            Ok(())
+            Ok(true)
         }
         HistoryEvent::Rename { id, title } => {
             let normalized = normalize_session_title(&title)?;
@@ -334,7 +343,7 @@ fn apply_event(
             updated.title = Some(normalized);
             validate_record(&updated)?;
             *record = updated;
-            Ok(())
+            Ok(true)
         }
         HistoryEvent::BindCliSession { id, cli_session_id } => {
             let record = records
@@ -342,13 +351,13 @@ fn apply_event(
                 .find(|existing| existing.id == id)
                 .ok_or_else(|| "会话历史记录不存在".to_string())?;
             if record.cli_session_id.as_deref() == Some(cli_session_id.as_str()) {
-                return Ok(());
+                return Ok(false);
             }
             let mut updated = record.clone();
             updated.cli_session_id = Some(cli_session_id);
             validate_record(&updated)?;
             *record = updated;
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -508,18 +517,19 @@ mod tests {
     }
 
     #[test]
-    fn cap_keeps_newest_fifty() {
+    fn cap_keeps_newest_history_limit() {
         let path = temp_store("cap");
         let history = SessionHistory::configure(path).unwrap();
-        for index in 0..55 {
+        let total = super::HISTORY_LIMIT + 5;
+        for index in 0..total {
             history
                 .record_start(record(&format!("s{index}"), index as u64 + 1))
                 .unwrap();
         }
         let listed = history.list().unwrap();
-        assert_eq!(listed.len(), 50);
-        assert_eq!(listed[0].id, "s54");
-        assert_eq!(listed[49].id, "s5");
+        assert_eq!(listed.len(), super::HISTORY_LIMIT);
+        assert_eq!(listed[0].id, format!("s{}", total - 1));
+        assert_eq!(listed[super::HISTORY_LIMIT - 1].id, "s5");
     }
 
     #[test]
@@ -670,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_session_id_roundtrips_and_rejects_non_uuid() {
+    fn cli_session_id_roundtrips_and_rejects_non_uuid_and_shell_metacharacters() {
         let path = temp_store("cli-session-id");
         let history = SessionHistory::configure(path.clone()).unwrap();
         let mut valid = record("s-uuid", 10);
@@ -680,6 +690,22 @@ mod tests {
         let mut invalid = record("s-bad-uuid", 20);
         invalid.cli_session_id = Some("not-a-uuid".to_string());
         assert!(history.record_start(invalid).is_err());
+
+        for dangerous in [
+            "-flag-injection",
+            "abc&whoami",
+            "abc|calc",
+            "abc%PATH%",
+            "abc;rm",
+        ] {
+            let mut bad_codex = record("s-bad-codex", 30);
+            bad_codex.tool_id = "codex".to_string();
+            bad_codex.cli_session_id = Some(dangerous.to_string());
+            assert!(
+                history.record_start(bad_codex).is_err(),
+                "expected rejection for {dangerous}"
+            );
+        }
 
         let listed = SessionHistory::configure(path).unwrap().list().unwrap();
         assert_eq!(listed.len(), 1);
@@ -695,7 +721,7 @@ mod tests {
         let root = if cfg!(windows) { "C:\\" } else { "/" };
         let mut bytes = Vec::new();
         let mut newest = 0;
-        for revision in 1..=400 {
+        for revision in 1..=1200 {
             let mut item = record(&format!("history-{revision}"), revision);
             item.tool_name = "Claude Code ".to_string() + &"x".repeat(240);
             item.project_path = root.to_string() + &"y".repeat(4000);

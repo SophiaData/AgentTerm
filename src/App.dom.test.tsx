@@ -502,4 +502,111 @@ describe("App interactions", () => {
       },
     );
   });
+
+  it("shows up to 20 history items by default, allows expanding, and gates resume on cliSessionId for all tools", async () => {
+    const { start } = mockLauncher(vi.fn(), []);
+    vi.spyOn(toolsModule, "useTools").mockReturnValue({
+      tools: [
+        {
+          id: "claude",
+          name: "Claude Code",
+          state: { kind: "installed", path: "claude.exe", version: "2.1.336" },
+        },
+        {
+          id: "codex",
+          name: "Codex",
+          state: { kind: "installed", path: "codex.cmd", version: "0.172.0" },
+        },
+      ],
+      loading: false,
+      error: null,
+      refresh: vi.fn(),
+    });
+    const records = Array.from({ length: 22 }, (_, index) => ({
+      id: `h-${index}`,
+      toolId: index === 1 ? "codex" : "claude",
+      toolName: index === 1 ? "Codex" : "Claude Code",
+      projectPath: "E:\\AgentTerm",
+      title: `历史会话 ${index}`,
+      cliSessionId:
+        index === 2
+          ? null
+          : `01234567-89ab-4cde-8123-${String(index).padStart(12, "0")}`,
+      startedAtMs: 10_000 - index * 100,
+      endedAtMs: 10_050 - index * 100,
+      exitReason: "已停止",
+      outputBytes: 100,
+    }));
+    vi.spyOn(historyModule, "useSessionHistory").mockReturnValue({
+      records,
+      loading: false,
+      error: null,
+      reload: vi.fn(),
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(screen.getAllByRole("button", { name: "接续对话" })).toHaveLength(
+      20,
+    );
+    const resumeButtons = screen.getAllByRole("button", {
+      name: "接续对话",
+    }) as HTMLButtonElement[];
+    expect(resumeButtons[0].disabled).toBe(false);
+    expect(resumeButtons[1].disabled).toBe(false);
+    expect(resumeButtons[2].disabled).toBe(true);
+
+    await user.click(resumeButtons[1]);
+    expect(start).toHaveBeenCalledWith(
+      { id: "project-1", name: "AgentTerm", path: "E:\\AgentTerm" },
+      expect.objectContaining({ id: "codex" }),
+      {
+        resume: true,
+        cliSessionId: "01234567-89ab-4cde-8123-000000000001",
+        title: "历史会话 1",
+      },
+    );
+
+    await user.click(screen.getByRole("button", { name: "展开全部（22）" }));
+    expect(screen.getAllByRole("button", { name: "接续对话" })).toHaveLength(
+      22,
+    );
+    const historyList = document.querySelector(".workspace-history-list");
+    expect(historyList).toBeTruthy();
+    const historyTags = Array.from(
+      historyList!.querySelectorAll(".session-agent-tag"),
+    ).map((el) => el.textContent);
+    expect(historyTags).toContain("Codex");
+    expect(historyTags).toContain("Claude");
+
+    await user.click(screen.getByRole("button", { name: "收起" }));
+    expect(screen.getAllByRole("button", { name: "接续对话" })).toHaveLength(
+      20,
+    );
+    expect(screen.getByRole("button", { name: "展开全部（22）" })).toBeTruthy();
+  });
+
+  it("renders agent tags on active sidebar links and workspace tabs", () => {
+    mockLauncher(vi.fn(), [
+      {
+        ...session,
+        info: {
+          ...session.info,
+          id: "s-dsh",
+          toolId: "dsh",
+          toolName: "DeepSeek Harness",
+        },
+        label: "自定义标题",
+      },
+    ]);
+    render(<App />);
+    const sidebarTag = document.querySelector(
+      ".workspace-session-link .session-agent-tag",
+    );
+    const tabTag = document.querySelector(".workspace-tab .session-agent-tag");
+    expect(sidebarTag?.textContent).toBe("DSH");
+    expect(tabTag?.textContent).toBe("DSH");
+    expect(screen.getAllByText("自定义标题").length).toBeGreaterThanOrEqual(2);
+  });
 });

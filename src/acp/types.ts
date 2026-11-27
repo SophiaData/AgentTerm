@@ -1,5 +1,20 @@
 export type AcpPhase = "connecting" | "ready" | "exited" | "error";
 
+export type AcpConfigChoice = {
+  value: string;
+  name: string;
+  group?: string | null;
+  description?: string | null;
+};
+
+export type AcpConfigOption = {
+  id: string;
+  name: string;
+  category?: string | null;
+  currentValue: string;
+  choices: AcpConfigChoice[];
+};
+
 export type AcpMessage = {
   id: string;
   role: "user" | "assistant" | "system";
@@ -37,6 +52,7 @@ export type AcpSnapshot = {
   exitReason?: string | null;
   messages: AcpMessage[];
   toolCalls: AcpToolCall[];
+  configOptions?: AcpConfigOption[];
   pendingPermission?: AcpPermissionRequest | null;
   version: number;
 };

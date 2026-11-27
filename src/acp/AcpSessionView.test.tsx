@@ -67,6 +67,26 @@ describe("AcpSessionView", () => {
       cliSessionId: "sess_123",
       messages: [],
       toolCalls: [],
+      configOptions: [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          currentValue: '["deepseek-official","deepseek-v4-flash"]',
+          choices: [
+            {
+              value: '["deepseek-official","deepseek-v4-flash"]',
+              name: "deepseek-v4-flash",
+              group: "DeepSeek",
+            },
+            {
+              value: '["magpie","dsh-fe/deepseek-v4-flash"]',
+              name: "DeepSeek V4 Flash · dsh-fe",
+              group: "Magpie",
+            },
+          ],
+        },
+      ],
       version: 2,
     };
     mocks.invoke.mockImplementation(async (command: string) => {
@@ -81,6 +101,20 @@ describe("AcpSessionView", () => {
         "ready",
         null,
       ),
+    );
+
+    const modelSelect = screen.getByLabelText("Model") as HTMLSelectElement;
+    expect(modelSelect.querySelector('optgroup[label="Magpie"]')).toBeTruthy();
+    expect(modelSelect.disabled).toBe(false);
+    fireEvent.change(modelSelect, {
+      target: { value: '["magpie","dsh-fe/deepseek-v4-flash"]' },
+    });
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith("acp_set_config_option", {
+        sessionId: "acp-session-1",
+        configId: "model",
+        value: '["magpie","dsh-fe/deepseek-v4-flash"]',
+      }),
     );
 
     const input = screen.getByLabelText("发送消息给 DeepSeek Harness");
@@ -159,5 +193,105 @@ describe("AcpSessionView", () => {
         sessionId: "acp-session-1",
       }),
     );
+
+    const feed = document.querySelector(".acp-feed") as HTMLDivElement;
+    Object.defineProperty(feed, "scrollHeight", {
+      value: 500,
+      configurable: true,
+    });
+    Object.defineProperty(feed, "clientHeight", {
+      value: 200,
+      configurable: true,
+    });
+    feed.scrollTop = 100;
+    fireEvent.scroll(feed);
+    fireEvent.click(screen.getByRole("button", { name: "回到底部" }));
+    expect(feed.scrollTop).toBe(500);
+  });
+
+  it("pauses auto-scroll when scrolled up and disables config selects while busy", async () => {
+    const readySnapshot: AcpSnapshot = {
+      phase: "ready",
+      busy: false,
+      cliSessionId: "sess_scroll",
+      messages: [{ id: "m1", role: "user", text: "第一句" }],
+      toolCalls: [],
+      configOptions: [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          currentValue: '["magpie","dsh-fe/deepseek-v4-flash"]',
+          choices: [
+            {
+              value: '["magpie","dsh-fe/deepseek-v4-flash"]',
+              name: "DeepSeek V4 Flash · dsh-fe",
+              group: "Magpie",
+            },
+          ],
+        },
+      ],
+      version: 1,
+    };
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "acp_snapshot") return readySnapshot;
+      return undefined;
+    });
+
+    render(<AcpSessionView {...baseProps} />);
+    const modelSelect = (await screen.findByLabelText(
+      "Model",
+    )) as HTMLSelectElement;
+    expect(modelSelect.disabled).toBe(false);
+
+    const feed = document.querySelector(".acp-feed") as HTMLDivElement;
+    Object.defineProperty(feed, "scrollHeight", {
+      value: 500,
+      configurable: true,
+    });
+    Object.defineProperty(feed, "clientHeight", {
+      value: 200,
+      configurable: true,
+    });
+    feed.scrollTop = 100;
+    fireEvent.scroll(feed);
+
+    const emitState = mocks.listeners.get("acp-state-acp-session-1");
+    expect(emitState).toBeTruthy();
+    act(() => {
+      emitState?.({
+        payload: {
+          ...readySnapshot,
+          busy: true,
+          messages: [
+            ...readySnapshot.messages,
+            { id: "m2", role: "assistant", text: "流式输出中" },
+          ],
+          version: 2,
+        },
+      });
+    });
+
+    expect(modelSelect.disabled).toBe(true);
+    expect(feed.scrollTop).toBe(100);
+
+    fireEvent.click(screen.getByRole("button", { name: "回到底部" }));
+    expect(feed.scrollTop).toBe(500);
+
+    act(() => {
+      emitState?.({
+        payload: {
+          ...readySnapshot,
+          busy: false,
+          messages: [
+            ...readySnapshot.messages,
+            { id: "m2", role: "assistant", text: "流式输出完成" },
+          ],
+          version: 3,
+        },
+      });
+    });
+    expect(modelSelect.disabled).toBe(false);
+    expect(feed.scrollTop).toBe(500);
   });
 });
