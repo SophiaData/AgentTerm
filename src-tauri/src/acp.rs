@@ -1,0 +1,1317 @@
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use tauri::{AppHandle, Emitter};
+
+use crate::schedule_mcp::SessionBridge;
+use crate::session_history::is_valid_cli_session_id;
+#[cfg(windows)]
+use crate::sessions::WinJob;
+use crate::sessions::{ENV_BLOCKLIST, SessionInfo, SessionManager, strip_windows_verbatim};
+use crate::tools::{is_windows_batch, resolve_direct_command, windows_cmd_executable};
+
+const MAX_MESSAGES: usize = 400;
+const MAX_MESSAGE_CHARS: usize = 64 * 1024;
+const MAX_TOOL_CALLS: usize = 200;
+const MAX_TOOL_DETAIL_CHARS: usize = 8 * 1024;
+const MAX_STDERR_CHARS: usize = 500;
+const WRITER_QUEUE_CAP: usize = 128;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AcpPhase {
+    Connecting,
+    Ready,
+    Exited,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpMessage {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpToolCall {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpPermissionOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpPermissionRequest {
+    pub request_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    pub options: Vec<AcpPermissionOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSnapshot {
+    pub phase: AcpPhase,
+    pub busy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_reason: Option<String>,
+    pub messages: Vec<AcpMessage>,
+    pub tool_calls: Vec<AcpToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_permission: Option<AcpPermissionRequest>,
+    pub version: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct AcpWriter {
+    tx: mpsc::SyncSender<String>,
+    closed: Arc<AtomicBool>,
+}
+
+impl AcpWriter {
+    fn spawn(mut stdin: ChildStdin) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<String>(WRITER_QUEUE_CAP);
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_worker = Arc::clone(&closed);
+        std::thread::spawn(move || {
+            while let Ok(line) = rx.recv() {
+                if closed_worker.load(Ordering::SeqCst) {
+                    break;
+                }
+                if stdin.write_all(line.as_bytes()).is_err()
+                    || stdin.write_all(b"\n").is_err()
+                    || stdin.flush().is_err()
+                {
+                    closed_worker.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            closed_worker.store(true, Ordering::SeqCst);
+        });
+        Self { tx, closed }
+    }
+
+    fn send_json(&self, value: &Value) -> Result<(), String> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("ACP 会话已关闭，无法发送请求".to_string());
+        }
+        let serialized =
+            serde_json::to_string(value).map_err(|_| "无法序列化 ACP 请求".to_string())?;
+        self.tx.try_send(serialized).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => "ACP 请求队列已满，请稍后再试".to_string(),
+            mpsc::TrySendError::Disconnected(_) => "ACP 会话写入通道已关闭".to_string(),
+        })
+    }
+
+    fn block(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+pub(crate) struct AcpState {
+    tool_id: String,
+    project_path: String,
+    resume_id: Option<String>,
+    mcp_servers: Vec<Value>,
+    retried_without_mcp: bool,
+    next_request_id: u64,
+    active_prompt_id: Option<u64>,
+    setup_request_id: Option<u64>,
+    current_assistant_message_key: Option<String>,
+    pending_permission_raw_id: Option<(String, Value)>,
+    next_message_seq: u64,
+    total_output_bytes: u64,
+    snapshot: AcpSnapshot,
+}
+
+impl AcpState {
+    fn new(
+        tool_id: &str,
+        project_path: &str,
+        resume_id: Option<String>,
+        bridge: Option<&SessionBridge>,
+    ) -> Self {
+        let mcp_servers = bridge
+            .map(|entry| {
+                vec![json!({
+                    "type": "http",
+                    "name": crate::schedule_mcp::TOOL_NAME,
+                    "url": entry.endpoint(),
+                    "headers": [{
+                        "name": "Authorization",
+                        "value": format!("Bearer {}", entry.token()),
+                    }]
+                })]
+            })
+            .unwrap_or_default();
+        Self {
+            tool_id: tool_id.to_string(),
+            project_path: project_path.to_string(),
+            resume_id: resume_id.clone(),
+            mcp_servers,
+            retried_without_mcp: false,
+            next_request_id: 2,
+            active_prompt_id: None,
+            setup_request_id: None,
+            current_assistant_message_key: None,
+            pending_permission_raw_id: None,
+            next_message_seq: 0,
+            total_output_bytes: 0,
+            snapshot: AcpSnapshot {
+                phase: AcpPhase::Connecting,
+                busy: false,
+                cli_session_id: resume_id,
+                error: None,
+                exit_reason: None,
+                messages: Vec::new(),
+                tool_calls: Vec::new(),
+                pending_permission: None,
+                version: 1,
+            },
+        }
+    }
+
+    fn bump(&mut self) {
+        self.snapshot.version = self.snapshot.version.saturating_add(1);
+    }
+
+    fn push_message(&mut self, role: &str, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.next_message_seq = self.next_message_seq.saturating_add(1);
+        self.total_output_bytes = self.total_output_bytes.saturating_add(text.len() as u64);
+        let msg = AcpMessage {
+            id: format!("msg-{}", self.next_message_seq),
+            role: role.to_string(),
+            text: trim_chars(&text, MAX_MESSAGE_CHARS),
+        };
+        if self.snapshot.messages.len() >= MAX_MESSAGES {
+            self.snapshot.messages.remove(0);
+        }
+        self.snapshot.messages.push(msg);
+        if role != "assistant" {
+            self.current_assistant_message_key = None;
+        }
+        self.bump();
+    }
+
+    fn append_assistant_chunk(&mut self, message_key: Option<&str>, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.total_output_bytes = self.total_output_bytes.saturating_add(chunk.len() as u64);
+        let key_owned = message_key.map(str::to_string);
+        let can_append = matches!(self.snapshot.messages.last(), Some(last) if last.role == "assistant")
+            && (key_owned.is_none() || self.current_assistant_message_key == key_owned);
+        if can_append && let Some(last) = self.snapshot.messages.last_mut() {
+            last.text.push_str(chunk);
+            if last.text.chars().count() > MAX_MESSAGE_CHARS {
+                last.text = trim_chars_tail(&last.text, MAX_MESSAGE_CHARS);
+            }
+        } else {
+            self.next_message_seq = self.next_message_seq.saturating_add(1);
+            if self.snapshot.messages.len() >= MAX_MESSAGES {
+                self.snapshot.messages.remove(0);
+            }
+            self.snapshot.messages.push(AcpMessage {
+                id: format!("msg-{}", self.next_message_seq),
+                role: "assistant".to_string(),
+                text: trim_chars_tail(chunk, MAX_MESSAGE_CHARS),
+            });
+            self.current_assistant_message_key = key_owned;
+        }
+        self.bump();
+    }
+
+    fn upsert_tool_call(&mut self, call: AcpToolCall) {
+        if let Some(existing) = self
+            .snapshot
+            .tool_calls
+            .iter_mut()
+            .find(|item| item.id == call.id)
+        {
+            if !call.title.is_empty() {
+                existing.title = call.title;
+            }
+            if call.name.is_some() {
+                existing.name = call.name;
+            }
+            if call.kind.is_some() {
+                existing.kind = call.kind;
+            }
+            if !call.status.is_empty() {
+                existing.status = call.status;
+            }
+            if call.detail.is_some() {
+                existing.detail = call.detail;
+            }
+        } else {
+            if self.snapshot.tool_calls.len() >= MAX_TOOL_CALLS {
+                self.snapshot.tool_calls.remove(0);
+            }
+            self.snapshot.tool_calls.push(call);
+        }
+        self.bump();
+    }
+
+    fn update_tool_call(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        status: Option<String>,
+        detail: Option<String>,
+    ) {
+        if let Some(existing) = self
+            .snapshot
+            .tool_calls
+            .iter_mut()
+            .find(|item| item.id == id)
+        {
+            if let Some(title) = title.filter(|value| !value.is_empty()) {
+                existing.title = title;
+            }
+            if let Some(status) = status.filter(|value| !value.is_empty()) {
+                existing.status = status;
+            }
+            if detail.is_some() {
+                existing.detail = detail;
+            }
+            self.bump();
+        } else {
+            self.upsert_tool_call(AcpToolCall {
+                id: id.to_string(),
+                title: title.unwrap_or_else(|| "工具调用".to_string()),
+                name: None,
+                kind: None,
+                status: status.unwrap_or_else(|| "in_progress".to_string()),
+                detail,
+            });
+        }
+    }
+}
+
+pub struct AcpSessionHandle {
+    pub info: SessionInfo,
+    #[cfg(unix)]
+    pgid: Option<libc::pid_t>,
+    #[cfg(windows)]
+    job: Option<WinJob>,
+    child: Arc<Mutex<Child>>,
+    writer: AcpWriter,
+    state: Arc<Mutex<AcpState>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl AcpSessionHandle {
+    pub fn snapshot(&self) -> Result<AcpSnapshot, String> {
+        self.state
+            .lock()
+            .map(|guard| guard.snapshot.clone())
+            .map_err(|_| "无法读取 ACP 会话状态".to_string())
+    }
+
+    pub fn send_prompt(&self, raw_text: &str) -> Result<(), String> {
+        let text = raw_text.trim();
+        if text.is_empty() {
+            return Err("发送内容不能为空".to_string());
+        }
+        let (request_id, cli_session_id) = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "ACP 会话状态不可用".to_string())?;
+            if guard.snapshot.phase != AcpPhase::Ready {
+                return Err("ACP 会话尚未就绪".to_string());
+            }
+            if guard.snapshot.busy {
+                return Err("当前轮次仍在执行，请等待完成或先停止".to_string());
+            }
+            let cli_session_id = guard
+                .snapshot
+                .cli_session_id
+                .clone()
+                .ok_or_else(|| "ACP 会话标识尚未建立".to_string())?;
+            let id = guard.next_request_id;
+            guard.next_request_id = guard.next_request_id.saturating_add(1);
+            guard.active_prompt_id = Some(id);
+            guard.snapshot.busy = true;
+            guard.snapshot.error = None;
+            guard.push_message("user", text.to_string());
+            (id, cli_session_id)
+        };
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": cli_session_id,
+                "prompt": [{
+                    "type": "text",
+                    "text": text,
+                }],
+            }
+        });
+        if let Err(error) = self.writer.send_json(&payload) {
+            if let Ok(mut guard) = self.state.lock() {
+                guard.snapshot.busy = false;
+                guard.active_prompt_id = None;
+                guard.snapshot.error = Some(error.clone());
+                guard.bump();
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn cancel_turn(&self) -> Result<(), String> {
+        let cli_session_id = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| "ACP 会话状态不可用".to_string())?;
+            guard
+                .snapshot
+                .cli_session_id
+                .clone()
+                .ok_or_else(|| "ACP 会话尚未就绪".to_string())?
+        };
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {
+                "sessionId": cli_session_id,
+            }
+        });
+        self.writer.send_json(&payload)
+    }
+
+    pub fn respond_permission(
+        &self,
+        request_id: &str,
+        option_id: Option<&str>,
+    ) -> Result<(), String> {
+        let raw_id = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "ACP 会话状态不可用".to_string())?;
+            let Some((expected_id, raw_id)) = guard.pending_permission_raw_id.take() else {
+                return Err("当前没有待处理的权限确认".to_string());
+            };
+            if expected_id != request_id {
+                guard.pending_permission_raw_id = Some((expected_id, raw_id));
+                return Err("权限请求已过期或编号不匹配".to_string());
+            }
+            guard.snapshot.pending_permission = None;
+            guard.bump();
+            raw_id
+        };
+        let outcome = match option_id {
+            Some(chosen) => json!({ "outcome": "selected", "optionId": chosen }),
+            None => json!({ "outcome": "cancelled" }),
+        };
+        self.writer.send_json(&json!({
+            "jsonrpc": "2.0",
+            "id": raw_id,
+            "result": {
+                "outcome": outcome,
+            }
+        }))
+    }
+
+    pub fn terminate(&self) -> Result<(), String> {
+        self.closed.store(true, Ordering::SeqCst);
+        let cli_id = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|guard| guard.snapshot.cli_session_id.clone());
+        if let Some(cli_id) = cli_id {
+            let _ = self.writer.send_json(&json!({
+                "jsonrpc": "2.0",
+                "id": 999_999,
+                "method": "session/close",
+                "params": { "sessionId": cli_id }
+            }));
+        }
+        self.writer.block();
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| "无法访问 ACP 进程句柄".to_string())?;
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => child
+                .kill()
+                .map_err(|error| format!("无法结束 ACP 会话：{error}"))?,
+            Err(error) => return Err(format!("无法确认 ACP 会话状态：{error}")),
+        }
+        #[cfg(unix)]
+        crate::sessions::kill_process_group(self.pgid);
+        #[cfg(windows)]
+        if let Some(job) = self.job.as_ref() {
+            job.terminate();
+        }
+        Ok(())
+    }
+
+    pub fn output_bytes(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|guard| guard.total_output_bytes)
+            .unwrap_or(0)
+    }
+
+    pub fn emit_snapshot(&self, app: &AppHandle) {
+        if let Ok(snapshot) = self.snapshot() {
+            let _ = app.emit(&format!("acp-state-{}", self.info.id), snapshot);
+        }
+    }
+}
+
+#[tauri::command(async)]
+pub fn acp_snapshot(
+    state: tauri::State<'_, SessionManager>,
+    session_id: String,
+) -> Result<AcpSnapshot, String> {
+    state.acp_snapshot(&session_id)
+}
+
+#[tauri::command(async)]
+pub fn acp_send_prompt(
+    state: tauri::State<'_, SessionManager>,
+    app: AppHandle,
+    session_id: String,
+    text: String,
+) -> Result<(), String> {
+    state.acp_send_prompt(&app, &session_id, &text)
+}
+
+#[tauri::command(async)]
+pub fn acp_cancel_turn(
+    state: tauri::State<'_, SessionManager>,
+    session_id: String,
+) -> Result<(), String> {
+    state.acp_cancel_turn(&session_id)
+}
+
+#[tauri::command(async)]
+pub fn acp_respond_permission(
+    state: tauri::State<'_, SessionManager>,
+    app: AppHandle,
+    session_id: String,
+    request_id: String,
+    option_id: Option<String>,
+) -> Result<(), String> {
+    state.acp_respond_permission(&app, &session_id, &request_id, option_id.as_deref())
+}
+
+pub struct AcpHooks {
+    pub on_emit: Box<dyn Fn(&AcpSnapshot) + Send + Sync>,
+    pub on_cli_session: Box<dyn Fn(String) + Send + Sync>,
+    pub on_exit: Box<dyn Fn(String, Option<AcpSnapshot>, u64) + Send + Sync>,
+}
+
+pub fn build_acp_command(
+    tool_id: &str,
+    binary: &Path,
+    cwd: &Path,
+    additional_env: &[(String, String)],
+) -> Command {
+    let clean_binary = strip_windows_verbatim(binary);
+    let clean_cwd = strip_windows_verbatim(cwd);
+    let mut command = if let Some(spec) = resolve_direct_command(tool_id, &clean_binary) {
+        let mut cmd = Command::new(&spec.program);
+        cmd.args(&spec.prefix_args).args(["--profile", "acp"]);
+        for (key, value) in spec.env {
+            cmd.env(key, value);
+        }
+        cmd
+    } else if is_windows_batch(&clean_binary) {
+        let mut wrapped = Command::new(windows_cmd_executable());
+        wrapped
+            .arg("/D")
+            .arg("/C")
+            .arg(&clean_binary)
+            .args(["--profile", "acp"]);
+        wrapped
+    } else {
+        let mut cmd = Command::new(&clean_binary);
+        cmd.args(["--profile", "acp"]);
+        cmd
+    };
+    command.current_dir(clean_cwd);
+    for (key, _) in std::env::vars() {
+        if ENV_BLOCKLIST.contains(&key.as_str())
+            && !(tool_id == "dsh" && key == "ELECTRON_RUN_AS_NODE")
+        {
+            command.env_remove(&key);
+        }
+    }
+    for (key, value) in additional_env {
+        command.env(key, value);
+    }
+    command
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
+pub fn spawn_acp_session(
+    info: SessionInfo,
+    binary: &Path,
+    cwd: &Path,
+    tool_env: &[(String, String)],
+    bridge: Option<&SessionBridge>,
+    resume_cli_id: Option<String>,
+    hooks: AcpHooks,
+) -> Result<AcpSessionHandle, String> {
+    let command = build_acp_command(&info.tool_id, binary, cwd, tool_env);
+    spawn_acp_with_command(info, command, bridge, resume_cli_id, hooks)
+}
+
+pub(crate) fn spawn_acp_with_command(
+    info: SessionInfo,
+    mut command: Command,
+    bridge: Option<&SessionBridge>,
+    resume_cli_id: Option<String>,
+    hooks: AcpHooks,
+) -> Result<AcpSessionHandle, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("无法启动 ACP 进程：{error}"))?;
+    #[cfg(windows)]
+    let job = {
+        use std::os::windows::io::AsRawHandle;
+        WinJob::attach(child.as_raw_handle()).ok()
+    };
+    #[cfg(unix)]
+    let pgid = Some(child.id() as libc::pid_t);
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "无法打开 ACP 标准输入".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法打开 ACP 标准输出".to_string())?;
+    let stderr = child.stderr.take();
+
+    let writer = AcpWriter::spawn(stdin);
+    let state = Arc::new(Mutex::new(AcpState::new(
+        &info.tool_id,
+        &info.project_path,
+        resume_cli_id,
+        bridge,
+    )));
+    let closed = Arc::new(AtomicBool::new(false));
+    let child_arc = Arc::new(Mutex::new(child));
+
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    if let Some(mut stderr_pipe) = stderr {
+        let stderr_tail_writer = Arc::clone(&stderr_tail);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let mut acc = String::new();
+            while let Ok(read) = stderr_pipe.read(&mut buf) {
+                if read == 0 {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&buf[..read]);
+                acc.push_str(&text);
+                if acc.chars().count() > MAX_STDERR_CHARS {
+                    acc = trim_chars_tail(&acc, MAX_STDERR_CHARS);
+                }
+                if let Ok(mut guard) = stderr_tail_writer.lock() {
+                    *guard = acc.trim().to_string();
+                }
+            }
+        });
+    }
+
+    let init_payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": {
+                    "readTextFile": false,
+                    "writeTextFile": false
+                },
+                "terminal": false
+            },
+            "clientInfo": {
+                "name": "agentterm",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        }
+    });
+    writer.send_json(&init_payload)?;
+
+    let reader_state = Arc::clone(&state);
+    let reader_writer = writer.clone();
+    let reader_child = Arc::clone(&child_arc);
+    let reader_closed = Arc::clone(&closed);
+    std::thread::spawn(move || {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(Ok(line)) = lines.next() {
+            if reader_closed.load(Ordering::SeqCst) {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            let outcome = {
+                let Ok(mut guard) = reader_state.lock() else {
+                    break;
+                };
+                apply_server_message(&mut guard, &value)
+            };
+            for outgoing in outcome.outgoing {
+                let _ = reader_writer.send_json(&outgoing);
+            }
+            if let Some(cli_id) = outcome.bound_cli_session {
+                (hooks.on_cli_session)(cli_id);
+            }
+            if let Some(snapshot) = outcome.emitted_snapshot {
+                (hooks.on_emit)(&snapshot);
+            }
+        }
+
+        let status_reason = reader_child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.wait().ok())
+            .map(|status| format!("{status}"))
+            .unwrap_or_else(|| "已退出".to_string());
+        let stderr_note = stderr_tail
+            .lock()
+            .ok()
+            .filter(|text| !text.is_empty())
+            .map(|text| text.clone());
+        let (final_snapshot, bytes) = if let Ok(mut guard) = reader_state.lock() {
+            let was_connecting = guard.snapshot.phase == AcpPhase::Connecting;
+            guard.snapshot.busy = false;
+            guard.active_prompt_id = None;
+            guard.pending_permission_raw_id = None;
+            guard.snapshot.pending_permission = None;
+            if was_connecting && !reader_closed.load(Ordering::SeqCst) {
+                guard.snapshot.phase = AcpPhase::Error;
+                let detail = stderr_note
+                    .as_deref()
+                    .map(|msg| format!("：{msg}"))
+                    .unwrap_or_default();
+                guard.snapshot.error = Some(format!("ACP 会话在握手完成前退出{detail}"));
+            } else {
+                guard.snapshot.phase = AcpPhase::Exited;
+            }
+            guard.snapshot.exit_reason = Some(status_reason.clone());
+            guard.bump();
+            (Some(guard.snapshot.clone()), guard.total_output_bytes)
+        } else {
+            (None, 0)
+        };
+        if let Some(snapshot) = final_snapshot.as_ref() {
+            (hooks.on_emit)(snapshot);
+        }
+        (hooks.on_exit)(status_reason, final_snapshot, bytes);
+    });
+
+    Ok(AcpSessionHandle {
+        info,
+        #[cfg(unix)]
+        pgid,
+        #[cfg(windows)]
+        job,
+        child: child_arc,
+        writer,
+        state,
+        closed,
+    })
+}
+
+pub(crate) struct ApplyOutcome {
+    pub emitted_snapshot: Option<AcpSnapshot>,
+    pub outgoing: Vec<Value>,
+    pub bound_cli_session: Option<String>,
+}
+
+pub(crate) fn apply_server_message(state: &mut AcpState, value: &Value) -> ApplyOutcome {
+    let mut outgoing = Vec::new();
+    let mut bound_cli_session = None;
+    let initial_version = state.snapshot.version;
+
+    let method = value.get("method").and_then(Value::as_str);
+    let has_id = value.get("id").is_some() && !value["id"].is_null();
+
+    match (method, has_id) {
+        (None, true) => {
+            let id_num = value["id"].as_u64();
+            let err_msg = extract_rpc_error(value);
+            if id_num == Some(1) {
+                if let Some(err) = err_msg {
+                    state.snapshot.phase = AcpPhase::Error;
+                    state.snapshot.error = Some(format!("ACP 握手失败：{err}"));
+                    state.bump();
+                } else {
+                    let req_id = state.next_request_id;
+                    state.next_request_id = state.next_request_id.saturating_add(1);
+                    state.setup_request_id = Some(req_id);
+                    outgoing.push(build_session_open_request(
+                        req_id,
+                        &state.project_path,
+                        state.resume_id.as_deref(),
+                        &state.mcp_servers,
+                    ));
+                }
+            } else if id_num.is_some() && id_num == state.setup_request_id {
+                if let Some(err) = err_msg {
+                    if !state.retried_without_mcp && !state.mcp_servers.is_empty() {
+                        state.retried_without_mcp = true;
+                        let req_id = state.next_request_id;
+                        state.next_request_id = state.next_request_id.saturating_add(1);
+                        state.setup_request_id = Some(req_id);
+                        state.push_message(
+                            "system",
+                            format!("未能挂载定时任务 MCP，已降级为普通 ACP 会话（{err}）"),
+                        );
+                        outgoing.push(build_session_open_request(
+                            req_id,
+                            &state.project_path,
+                            state.resume_id.as_deref(),
+                            &[],
+                        ));
+                    } else {
+                        state.snapshot.phase = AcpPhase::Error;
+                        state.snapshot.error = Some(format!("无法创建或恢复 ACP 会话：{err}"));
+                        state.bump();
+                    }
+                } else {
+                    let returned_id = value
+                        .get("result")
+                        .and_then(|res| res.get("sessionId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| state.resume_id.clone());
+                    if let Some(cli_id) = returned_id
+                        && is_valid_cli_session_id(&state.tool_id, &cli_id)
+                    {
+                        state.snapshot.cli_session_id = Some(cli_id.clone());
+                        bound_cli_session = Some(cli_id);
+                    }
+                    state.snapshot.phase = AcpPhase::Ready;
+                    state.snapshot.error = None;
+                    state.bump();
+                }
+            } else if id_num.is_some() && id_num == state.active_prompt_id {
+                state.snapshot.busy = false;
+                state.active_prompt_id = None;
+                state.current_assistant_message_key = None;
+                if let Some(err) = err_msg {
+                    state.snapshot.error = Some(err.clone());
+                    state.push_message("system", format!("请求失败：{err}"));
+                }
+                state.bump();
+            }
+        }
+        (Some("session/update"), false) => {
+            if let Some(update) = value.get("params").and_then(|p| p.get("update")) {
+                apply_session_update(state, update);
+            }
+        }
+        (Some("session/request_permission"), true) => {
+            let raw_id = value["id"].clone();
+            let params = value.get("params").unwrap_or(&Value::Null);
+            let request_id = match &raw_id {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            let title = params
+                .get("title")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    params
+                        .get("toolCall")
+                        .and_then(|tc| tc.get("title"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("需要确认工具操作权限")
+                .to_string();
+            let description = params
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let tool_call_id = params
+                .get("toolCall")
+                .and_then(|tc| tc.get("toolCallId"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let options = params
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            let option_id = item.get("optionId").and_then(Value::as_str)?;
+                            let name = item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or(option_id);
+                            let kind = item
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or("allow_once");
+                            Some(AcpPermissionOption {
+                                option_id: option_id.to_string(),
+                                name: name.to_string(),
+                                kind: kind.to_string(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            state.pending_permission_raw_id = Some((request_id.clone(), raw_id));
+            state.snapshot.pending_permission = Some(AcpPermissionRequest {
+                request_id,
+                title,
+                description,
+                tool_call_id,
+                options,
+            });
+            state.bump();
+        }
+        (Some(_), true) => {
+            outgoing.push(json!({
+                "jsonrpc": "2.0",
+                "id": value["id"].clone(),
+                "error": {
+                    "code": -32601,
+                    "message": "Method not supported by AgentTerm ACP client"
+                }
+            }));
+        }
+        _ => {}
+    }
+
+    let emitted_snapshot =
+        (state.snapshot.version != initial_version).then(|| state.snapshot.clone());
+    ApplyOutcome {
+        emitted_snapshot,
+        outgoing,
+        bound_cli_session,
+    }
+}
+
+fn build_session_open_request(
+    req_id: u64,
+    cwd: &str,
+    resume_id: Option<&str>,
+    mcp_servers: &[Value],
+) -> Value {
+    if let Some(session_id) = resume_id {
+        json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "session/resume",
+            "params": {
+                "sessionId": session_id,
+                "cwd": cwd,
+                "mcpServers": mcp_servers,
+            }
+        })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "session/new",
+            "params": {
+                "cwd": cwd,
+                "mcpServers": mcp_servers,
+            }
+        })
+    }
+}
+
+fn apply_session_update(state: &mut AcpState, update: &Value) {
+    match update.get("sessionUpdate").and_then(Value::as_str) {
+        Some("agent_message_chunk") => {
+            let message_id = update.get("messageId").and_then(Value::as_str);
+            if let Some(text) = extract_content_text(update.get("content")) {
+                state.append_assistant_chunk(message_id, &text);
+            }
+        }
+        Some("tool_call") => {
+            let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
+                return;
+            };
+            let title = update
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("工具调用")
+                .to_string();
+            let name = update
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let kind = update
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let status = update
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending")
+                .to_string();
+            let detail = extract_tool_detail(update);
+            state.upsert_tool_call(AcpToolCall {
+                id: id.to_string(),
+                title,
+                name,
+                kind,
+                status,
+                detail,
+            });
+        }
+        Some("tool_call_update") => {
+            let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
+                return;
+            };
+            let title = update
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let status = update
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let detail = extract_tool_detail(update);
+            state.update_tool_call(id, title, status, detail);
+        }
+        _ => {}
+    }
+}
+
+fn extract_content_text(content: Option<&Value>) -> Option<String> {
+    let content = content?;
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(map) => map.get("text").and_then(Value::as_str).map(str::to_string),
+        Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    out.push_str(text);
+                } else if let Some(inner) = item
+                    .get("content")
+                    .and_then(|c| c.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    out.push_str(inner);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }
+        _ => None,
+    }
+}
+
+fn extract_tool_detail(update: &Value) -> Option<String> {
+    if let Some(text) = extract_content_text(update.get("content")) {
+        return Some(trim_chars(&text, MAX_TOOL_DETAIL_CHARS));
+    }
+    if let Some(raw_output) = update.get("rawOutput") {
+        let formatted = match raw_output {
+            Value::String(text) => text.clone(),
+            other => serde_json::to_string_pretty(other).unwrap_or_default(),
+        };
+        if !formatted.trim().is_empty() {
+            return Some(trim_chars(&formatted, MAX_TOOL_DETAIL_CHARS));
+        }
+    }
+    if let Some(raw_input) = update.get("rawInput") {
+        let formatted = match raw_input {
+            Value::String(text) => text.clone(),
+            other => serde_json::to_string_pretty(other).unwrap_or_default(),
+        };
+        if !formatted.trim().is_empty() {
+            return Some(trim_chars(&formatted, MAX_TOOL_DETAIL_CHARS));
+        }
+    }
+    None
+}
+
+fn extract_rpc_error(value: &Value) -> Option<String> {
+    let err = value.get("error")?;
+    if err.is_null() {
+        return None;
+    }
+    let details = err
+        .get("data")
+        .and_then(|data| {
+            data.get("details")
+                .or_else(|| data.get("message"))
+                .and_then(Value::as_str)
+        })
+        .filter(|text| !text.trim().is_empty());
+    let message = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("未知 ACP 错误");
+    Some(match details {
+        Some(detail) if detail != message => format!("{message}: {detail}"),
+        _ => message.to_string(),
+    })
+}
+
+fn trim_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn trim_chars_tail(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let skip = count.saturating_sub(max_chars);
+    text.chars().skip(skip).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AcpPhase, AcpState, MAX_MESSAGES, MAX_TOOL_CALLS, apply_server_message};
+    use serde_json::json;
+
+    #[test]
+    fn handshake_session_open_stream_and_permission_roundtrip() {
+        let mut state = AcpState::new("dsh", "E:\\AgentTerm", None, None);
+
+        // 1. initialize response triggers session/new
+        let init_ok = apply_server_message(
+            &mut state,
+            &json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}}),
+        );
+        assert_eq!(init_ok.outgoing.len(), 1);
+        assert_eq!(init_ok.outgoing[0]["method"], "session/new");
+        assert_eq!(init_ok.outgoing[0]["params"]["cwd"], "E:\\AgentTerm");
+        let setup_id = init_ok.outgoing[0]["id"].as_u64().unwrap();
+
+        // 2. session/new response binds cliSessionId and enters Ready
+        let open_ok = apply_server_message(
+            &mut state,
+            &json!({"jsonrpc": "2.0", "id": setup_id, "result": {"sessionId": "sess_abc123"}}),
+        );
+        assert_eq!(open_ok.bound_cli_session.as_deref(), Some("sess_abc123"));
+        let snap = open_ok.emitted_snapshot.unwrap();
+        assert_eq!(snap.phase, AcpPhase::Ready);
+        assert_eq!(snap.cli_session_id.as_deref(), Some("sess_abc123"));
+
+        // 3. streaming assistant chunks merge cleanly per messageId
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sess_abc123",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "m-1",
+                        "content": { "type": "text", "text": "你好" }
+                    }
+                }
+            }),
+        );
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sess_abc123",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "m-1",
+                        "content": { "type": "text", "text": "，正在检查。" }
+                    }
+                }
+            }),
+        );
+        assert_eq!(state.snapshot.messages.len(), 1);
+        assert_eq!(state.snapshot.messages[0].text, "你好，正在检查。");
+
+        // 4. tool_call + tool_call_update
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sess_abc123",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-1",
+                        "title": "读取 package.json",
+                        "name": "read_file",
+                        "kind": "read",
+                        "status": "pending"
+                    }
+                }
+            }),
+        );
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sess_abc123",
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call-1",
+                        "status": "completed",
+                        "rawOutput": "ok"
+                    }
+                }
+            }),
+        );
+        assert_eq!(state.snapshot.tool_calls.len(), 1);
+        assert_eq!(state.snapshot.tool_calls[0].status, "completed");
+        assert_eq!(state.snapshot.tool_calls[0].detail.as_deref(), Some("ok"));
+
+        // 5. permission request captures raw id and options
+        apply_server_message(
+            &mut state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "sess_abc123",
+                    "title": "允许运行命令？",
+                    "toolCall": { "toolCallId": "call-2" },
+                    "options": [
+                        { "optionId": "allow-once", "name": "允许一次", "kind": "allow_once" },
+                        { "optionId": "reject-once", "name": "拒绝", "kind": "reject_once" }
+                    ]
+                }
+            }),
+        );
+        let perm = state.snapshot.pending_permission.as_ref().unwrap();
+        assert_eq!(perm.request_id, "42");
+        assert_eq!(perm.options.len(), 2);
+
+        // 6. unknown server request gets JSON-RPC method not found reply
+        let unknown = apply_server_message(
+            &mut state,
+            &json!({"jsonrpc": "2.0", "id": 99, "method": "fs/read_text_file", "params": {}}),
+        );
+        assert_eq!(unknown.outgoing.len(), 1);
+        assert_eq!(unknown.outgoing[0]["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn resume_sends_session_resume_with_existing_cli_id() {
+        let mut state = AcpState::new(
+            "dsh",
+            "E:\\AgentTerm",
+            Some("sess_existing_1".to_string()),
+            None,
+        );
+        let outcome = apply_server_message(
+            &mut state,
+            &json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}}),
+        );
+        assert_eq!(outcome.outgoing[0]["method"], "session/resume");
+        assert_eq!(
+            outcome.outgoing[0]["params"]["sessionId"],
+            "sess_existing_1"
+        );
+    }
+
+    #[test]
+    fn bounds_messages_and_tool_calls() {
+        let mut state = AcpState::new("dsh", "E:\\AgentTerm", None, None);
+        for index in 0..(MAX_MESSAGES + 25) {
+            state.push_message("user", format!("msg-{index}"));
+        }
+        assert_eq!(state.snapshot.messages.len(), MAX_MESSAGES);
+
+        for index in 0..(MAX_TOOL_CALLS + 25) {
+            apply_server_message(
+                &mut state,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": format!("call-{index}"),
+                            "title": "op",
+                            "status": "pending"
+                        }
+                    }
+                }),
+            );
+        }
+        assert_eq!(state.snapshot.tool_calls.len(), MAX_TOOL_CALLS);
+    }
+}

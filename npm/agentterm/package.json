@@ -1,6 +1,6 @@
 {
   "name": "agentterm",
-  "version": "0.2.0-rc.17",
+  "version": "0.2.0-rc.18",
   "description": "Desktop workspace for Claude Code, Codex, and Agy",
   "bin": {
     "agentterm": "bin/agentterm.js"

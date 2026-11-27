@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter};
 
 const REQUEST_LIMIT: usize = 64 * 1024;
 const AI_CONFIG_LIMIT: u64 = 1024 * 1024;
-const TOOL_NAME: &str = "agentterm_scheduler";
+pub(crate) const TOOL_NAME: &str = "agentterm_scheduler";
 const CHANGED_EVENT: &str = "scheduled-tasks-changed";
 const SCHEDULE_TOKEN_ENV: &str = "AGENTTERM_SCHEDULE_TOKEN";
 const MAX_CONNECTIONS: usize = 32;
@@ -63,14 +63,17 @@ impl SessionBridge {
                     ),
                 ])
             }
-            "agy" => Ok(Vec::new()),
+            "agy" | "dsh" => Ok(Vec::new()),
             _ => Err("不支持的工具".into()),
         }
     }
 
-    #[cfg(test)]
-    fn endpoint(&self) -> &str {
+    pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     pub fn environment(&self) -> Vec<(String, String)> {

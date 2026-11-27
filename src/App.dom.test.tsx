@@ -433,4 +433,73 @@ describe("App interactions", () => {
     );
     expect(swProps.latest?.themeId).toBe("light");
   });
+
+  it("shows DeepSeek Harness ACP action and gates resume on cliSessionId", async () => {
+    const { start } = mockLauncher(vi.fn(), []);
+    vi.spyOn(toolsModule, "useTools").mockReturnValue({
+      tools: [
+        {
+          id: "dsh",
+          name: "DeepSeek Harness",
+          state: { kind: "installed", path: "dsh.cmd", version: "0.2.2-rc.5" },
+        },
+      ],
+      loading: false,
+      error: null,
+      refresh: vi.fn(),
+    });
+    vi.spyOn(historyModule, "useSessionHistory").mockReturnValue({
+      records: [
+        {
+          id: "h-dsh-ok",
+          toolId: "dsh",
+          toolName: "DeepSeek Harness",
+          projectPath: "E:\\AgentTerm",
+          title: "ACP 历史会话",
+          cliSessionId: "sess_abc123",
+          startedAtMs: 1000,
+          endedAtMs: 2000,
+          exitReason: "已停止",
+          outputBytes: 120,
+        },
+        {
+          id: "h-dsh-no-id",
+          toolId: "dsh",
+          toolName: "DeepSeek Harness",
+          projectPath: "E:\\AgentTerm",
+          title: "未绑定会话",
+          cliSessionId: null,
+          startedAtMs: 900,
+          endedAtMs: 950,
+          exitReason: "异常退出",
+          outputBytes: 0,
+        },
+      ],
+      loading: false,
+      error: null,
+      reload: vi.fn(),
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(
+      screen.getByRole("button", { name: /DeepSeek Harness.*打开 ACP 对话/ }),
+    ).toBeTruthy();
+
+    const resumeButtons = screen.getAllByRole("button", { name: "接续对话" });
+    expect((resumeButtons[0] as HTMLButtonElement).disabled).toBe(false);
+    expect((resumeButtons[1] as HTMLButtonElement).disabled).toBe(true);
+
+    await user.click(resumeButtons[0]);
+    expect(start).toHaveBeenCalledWith(
+      { id: "project-1", name: "AgentTerm", path: "E:\\AgentTerm" },
+      expect.objectContaining({ id: "dsh" }),
+      {
+        resume: true,
+        cliSessionId: "sess_abc123",
+        title: "ACP 历史会话",
+      },
+    );
+  });
 });
