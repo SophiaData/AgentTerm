@@ -16,9 +16,16 @@
 本地验证：`AcpSessionView.test.tsx` 6 passed（单 worker）、TypeScript、定向 ESLint、
 Rust fmt、差异检查及 `verify_project.py` 通过。临时去掉草稿版本保护后，
 新增用例 1 failed / 5 skipped；恢复后 6 passed。没有执行本地完整 Rust 编译。
-完整 `pnpm check` / `run_quality.py` 由本次修复 PR 的 GitHub 三端质量门执行，结果待回填。
+应用提交 `a748ad7e43bd7f9cb334886f387e1f649afec0b9` 的
+[GitHub 三端质量门 46043783477](https://github.com/SophiaData/AgentTerm/actions/runs/46043783477)
+全部成功，三端均完整执行 `pnpm check` / `run_quality.py` 的 14 项检查。
+前端各 23 文件 / 196 passed；Rust 后端 Windows 252、macOS 254、Linux 255 passed，
+各 4 ignored；TUI 分别 18、20、20 passed；模板契约各 15 项通过。
+新增停止、登记竞态、审批与历史关联回归均在三端通过。
+[修复草稿 PR #104](https://github.com/SophiaData/AgentTerm/pull/104) 基于 PR #103 分支；
+后续仅文档提交不改变上述应用代码，最终 head 的自动检查在 PR 页面核对。
 
-主代理已串行审查实际差异；这不是独立评审或独立 cc PASS。新增 ignored 用例仅作为
+主代理串行审查实际差异与对应证据通过；这不是独立评审或独立 cc PASS。新增 ignored 用例仅作为
 父测试调用的本地子进程入口。测试使用合成数据，不读取真实 CLI 对话。
 历史绑定仍依赖目录与时间候选，有歧义时保留未绑定；不声称能证明进程级来源。
 真实 CLI、桌面交互、打包与安装未验；本轮不合并、不发布。
