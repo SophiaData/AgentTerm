@@ -76,6 +76,7 @@ export default function TerminalView({
   const [problem, setProblem] = useState<string | null>(null);
   const [clipboardProblem, setClipboardProblem] = useState<string | null>(null);
   const [connection, setConnection] = useState(0);
+  const [scrolledUp, setScrolledUp] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -144,9 +145,20 @@ export default function TerminalView({
           }
         }
       };
+      const syncScrollState = () => {
+        const activeBuffer = terminal.buffer?.active;
+        const atBottom =
+          !activeBuffer || activeBuffer.viewportY >= activeBuffer.baseY;
+        followBottom = atBottom;
+        setScrolledUp(!atBottom);
+      };
+      syncScrollState();
       const scrollToBottomHard = (forceFollow = false, withRefresh = true) => {
         if (disposed) return;
-        if (forceFollow) followBottom = true;
+        if (forceFollow) {
+          followBottom = true;
+          setScrolledUp(false);
+        }
         const activeBuffer = terminal.buffer?.active;
         if (
           activeBuffer &&
@@ -233,10 +245,7 @@ export default function TerminalView({
       if (typeof terminal.onScroll === "function") {
         const scrollSub = terminal.onScroll(() => {
           if (disposed || !current.current.visible || isResizing) return;
-          const activeBuffer = terminal.buffer?.active;
-          if (activeBuffer) {
-            followBottom = activeBuffer.viewportY >= activeBuffer.baseY;
-          }
+          syncScrollState();
         });
         cleanups.push(() => scrollSub.dispose());
       }
@@ -408,26 +417,17 @@ export default function TerminalView({
 
   return (
     <div className="terminal-view">
-      <div className="terminal-toolbar">
-        <span role="status">
-          {phase === "connecting"
-            ? "正在连接终端…"
-            : phase === "error"
-              ? "终端连接需要处理"
-              : !running || phase === "exited"
-                ? "进程已结束，输出保留在下方"
-                : "选中文字后 Ctrl+C 复制 · Ctrl+V 粘贴 · 未选择时 Ctrl+C 中断"}
-        </span>
-        <div className="terminal-actions">
-          <button
-            type="button"
-            className="ghost-button terminal-scroll-action"
-            onClick={() => controls.current?.scroll()}
-          >
-            回到底部
-          </button>
+      {phase !== "ready" || !running ? (
+        <div className="terminal-toolbar">
+          <span role="status">
+            {phase === "connecting"
+              ? "正在连接终端…"
+              : phase === "error"
+                ? "终端连接需要处理"
+                : "进程已结束，输出保留在下方"}
+          </span>
         </div>
-      </div>
+      ) : null}
       {clipboardProblem ? (
         <div className="terminal-problem" role="alert">
           <span>{clipboardProblem}</span>
@@ -453,12 +453,25 @@ export default function TerminalView({
           </button>
         </div>
       ) : null}
-      <div className="terminal-frame">
+      <div
+        className="terminal-frame"
+        title="选中文字后 Ctrl+C 复制 · Ctrl+V 粘贴 · 未选择时 Ctrl+C 中断"
+      >
         <div
           className="terminal-host"
           ref={hostRef}
           aria-label="CLI 输入与输出"
         />
+        {scrolledUp ? (
+          <button
+            type="button"
+            className="acp-float-scroll"
+            aria-label="回到底部"
+            onClick={() => controls.current?.scroll()}
+          >
+            ↓ 回到底部
+          </button>
+        ) : null}
       </div>
     </div>
   );

@@ -85,6 +85,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.initOptions = null;
   mocks.terminal.options = { disableStdin: true };
+  mocks.terminal.buffer = { active: { viewportY: 20, baseY: 20 } };
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -131,7 +132,8 @@ describe("terminal clipboard wiring", () => {
     expect(screen.queryByRole("button", { name: "复制" })).toBeNull();
     expect(screen.queryByRole("button", { name: "粘贴" })).toBeNull();
     expect(screen.queryByRole("button", { name: "输入终端" })).toBeNull();
-    expect(screen.getByRole("button", { name: "回到底部" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "回到底部" })).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
 
     expect(mocks.readText).not.toHaveBeenCalled();
     const handler = mocks.terminal.attachCustomKeyEventHandler.mock
@@ -275,6 +277,7 @@ describe("terminal clipboard wiring", () => {
     expect(mocks.terminal.scrollLines).toHaveBeenCalledWith(13);
     expect(mocks.terminal.scrollToBottom).toHaveBeenCalled();
     expect(viewport.scrollTop).toBe(480);
+    expect(screen.queryByRole("button", { name: "回到底部" })).toBeNull();
 
     mocks.terminal.refresh.mockClear();
     mocks.terminal.scrollLines.mockClear();

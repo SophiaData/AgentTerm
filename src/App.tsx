@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -158,19 +159,31 @@ export default function App() {
     ? projects.projects.find((p) => p.path === currentSession.info.projectPath)
     : selectedProject;
   const projectBusy = projects.loading || projects.busy || launcher.busy;
-  const activeSessionIds = new Set(launcher.sessions.map((s) => s.info.id));
-  const closedHistory = recentClosedHistory(
-    history.records,
-    activeSessionIds,
-    history.records.length,
+  const activeSessionIds = useMemo(
+    () => new Set(launcher.sessions.map((s) => s.info.id)),
+    [launcher.sessions],
   );
-  const recentHistory = historyExpanded
-    ? closedHistory
-    : closedHistory.slice(0, 20);
-  const runningCount = launcher.sessions.filter(
-    (s) => s.running && !s.statusUnknown,
-  ).length;
-  const unknownCount = launcher.sessions.filter((s) => s.statusUnknown).length;
+  const closedHistory = useMemo(
+    () =>
+      recentClosedHistory(
+        history.records,
+        activeSessionIds,
+        history.records.length,
+      ),
+    [history.records, activeSessionIds],
+  );
+  const recentHistory = useMemo(
+    () => (historyExpanded ? closedHistory : closedHistory.slice(0, 20)),
+    [historyExpanded, closedHistory],
+  );
+  const runningCount = useMemo(
+    () => launcher.sessions.filter((s) => s.running && !s.statusUnknown).length,
+    [launcher.sessions],
+  );
+  const unknownCount = useMemo(
+    () => launcher.sessions.filter((s) => s.statusUnknown).length,
+    [launcher.sessions],
+  );
   const hasSidePanel =
     recordsOpen || scheduleOpen || (filesOpen && !!fileProject);
   const historyReloaded = useRef(false);

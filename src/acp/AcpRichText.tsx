@@ -1,4 +1,11 @@
-import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  memo,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 type Segment =
   | { type: "text"; content: string }
@@ -337,7 +344,7 @@ export function extractToolDiff(
   return null;
 }
 
-export default function AcpRichText({ text }: { text: string }) {
+const AcpRichText = memo(function AcpRichText({ text }: { text: string }) {
   const segments = splitCodeFences(text);
   return (
     <div className="acp-rich">
@@ -365,4 +372,6 @@ export default function AcpRichText({ text }: { text: string }) {
       )}
     </div>
   );
-}
+});
+
+export default AcpRichText;
