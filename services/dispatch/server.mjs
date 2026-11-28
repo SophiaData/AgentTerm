@@ -84,17 +84,35 @@ export async function startServer({
       }
       if (request.method === "POST" && request.url === "/v1/claim") {
         const input = await body(request);
-        return json(200, { task: store.claim(input.deviceId, input.projects) });
+        return json(200, {
+          task: store.claim(
+            input.deviceId,
+            input.projects,
+            input.protocolVersion,
+          ),
+        });
       }
       const match =
-        /^\/v1\/tasks\/([a-zA-Z0-9_-]+)(?:\/(approve|start|heartbeat|result|accept|summary|abandon))?$/.exec(
+        /^\/v1\/tasks\/([a-zA-Z0-9_-]+)(?:\/(approve|start|heartbeat|result|accept|summary|abandon|agreements|agreement-begin|agreement-save|agreement-fail|agreement-regenerate|agreement-approve))?$/.exec(
           request.url,
         );
       demand(match, "接口不存在");
       const [, id, action] = match;
       if (request.method === "GET" && !action) return json(200, store.get(id));
+      if (request.method === "GET" && action === "agreements")
+        return json(200, { agreements: store.agreementHistory(id) });
       demand(request.method === "POST" && action, "接口不存在");
       const input = await body(request);
+      if (action === "agreement-begin")
+        return json(200, store.beginAgreement(id, input));
+      if (action === "agreement-save")
+        return json(200, store.saveAgreement(id, input));
+      if (action === "agreement-fail")
+        return json(200, store.failAgreement(id, input));
+      if (action === "agreement-regenerate")
+        return json(200, store.regenerateAgreement(id, input));
+      if (action === "agreement-approve")
+        return json(200, store.approveAgreement(id, input));
       if (action === "approve")
         return json(200, store.approve(id, input.specHash));
       if (action === "start") return json(200, store.start(id, input));

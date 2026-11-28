@@ -17,6 +17,8 @@ import { Worker, executeTask, workerLock } from "./worker.mjs";
 import { run, askDsh, standaloneEnvironment } from "./process.mjs";
 import { coordinate, watch } from "./coordinator.mjs";
 
+import { confirmAgreement } from "./fixtures/agreements.mjs";
+
 const fixtureRoot = fileURLToPath(new URL("./fixtures/", import.meta.url));
 function root() {
   return mkdtempSync(join(tmpdir(), "agentterm-dispatch-test-"));
@@ -34,13 +36,15 @@ function spec(requestId = "request-1") {
 }
 function approve(store, input = spec()) {
   const task = store.submit(input);
-  return store.approve(task.id, task.specHash);
+  return confirmAgreement(store, task);
 }
-function result() {
+function result(task) {
   return {
     state: "awaiting_review",
     commit: "b".repeat(40),
     checks: [{ passed: true }],
+    agreementHash: task.approvedAgreementHash,
+    agreementRevision: task.agreementRevision,
   };
 }
 const projects = { demo: { repository: "/synthetic" } };
@@ -68,15 +72,15 @@ test("任务建议幂等、人工确认绑定摘要，离线队列跨服务重�
   const proposed = store.submit(spec());
   assert.equal(store.submit(spec()).id, proposed.id);
   assert.throws(() => store.submit({ ...spec(), goal: "另一个任务" }));
-  assert.equal(store.claim("device", ["demo"]), null);
+  assert.equal(store.claim("device", ["demo"], 2), null);
   assert.throws(() => store.approve(proposed.id, "stale"));
-  store.approve(proposed.id, proposed.specHash);
+  confirmAgreement(store, proposed);
   store.close();
   store = new TaskStore(file);
-  const claimed = store.claim("device", ["demo"]);
+  const claimed = store.claim("device", ["demo"], 2);
   assert.equal(claimed.id, proposed.id);
-  assert.equal(store.claim("device", ["demo"]).attemptId, claimed.attemptId);
-  assert.equal(store.claim("other-device", ["demo"]), null);
+  assert.equal(store.claim("device", ["demo"], 2).attemptId, claimed.attemptId);
+  assert.equal(store.claim("other-device", ["demo"], 2), null);
   store.close();
 });
 
@@ -86,17 +90,17 @@ test("领取在两个数据库连接间互斥，心跳不使终态回退", () =>
     two = new TaskStore(file);
   approve(one);
   approve(one, spec("second"));
-  const task = one.claim("one", ["demo"]);
-  assert.equal(two.claim("two", ["demo"]), null);
+  const task = one.claim("one", ["demo"], 2);
+  assert.equal(two.claim("two", ["demo"], 2), null);
   const identity = { deviceId: "one", attemptId: task.attemptId };
-  const finished = one.finish(task.id, { ...identity, result: result() });
+  const finished = one.finish(task.id, { ...identity, result: result(task) });
   assert.equal(
     two.heartbeat(task.id, { ...identity, state: "running" }).state,
     "awaiting_review",
   );
   assert.throws(() => one.accept(task.id, "old"));
   one.accept(task.id, finished.resultHash);
-  assert.equal(two.claim("two", ["demo"]).requestId, "second");
+  assert.equal(two.claim("two", ["demo"], 2).requestId, "second");
   one.close();
   two.close();
 });
@@ -104,11 +108,11 @@ test("领取在两个数据库连接间互斥，心跳不使终态回退", () =>
 test("旧身份与冲突结果被拒绝；相同回执重传幂等", () => {
   const store = new TaskStore(join(root(), "server.sqlite"));
   approve(store);
-  const task = store.claim("device", ["demo"]);
+  const task = store.claim("device", ["demo"], 2);
   const input = {
     deviceId: "device",
     attemptId: task.attemptId,
-    result: result(),
+    result: result(task),
   };
   assert.throws(() => store.finish(task.id, { ...input, attemptId: "old" }));
   const first = store.finish(task.id, input);
@@ -135,7 +139,7 @@ test("放弃须先取得原生停止证明，旧回执重传不影响下一任�
   try {
     approve(service.store);
     approve(service.store, spec("next"));
-    const task = service.store.claim("device", ["demo"]);
+    const task = service.store.claim("device", ["demo"], 2);
     const finished = service.store.finish(task.id, {
       ...task,
       result: { state: "failed" },
@@ -148,7 +152,7 @@ test("放弃须先取得原生停止证明，旧回执重传不影响下一任�
       api(`/v1/tasks/${task.id}/abandon`, { resultHash: finished.resultHash }),
       /尚未停止/,
     );
-    assert.equal(service.store.claim("other", ["demo"]), null);
+    assert.equal(service.store.claim("other", ["demo"], 2), null);
     stopped = true;
     assert.equal(
       (
@@ -158,7 +162,7 @@ test("放弃须先取得原生停止证明，旧回执重传不影响下一任�
       ).state,
       "abandoned",
     );
-    assert.equal(service.store.claim("other", ["demo"]).requestId, "next");
+    assert.equal(service.store.claim("other", ["demo"], 2).requestId, "next");
     await api(`/v1/tasks/${task.id}/abandon`, {
       resultHash: finished.resultHash,
     });
@@ -173,7 +177,7 @@ test("执行端启动意图 CAS，重复投递不会重复取得执行资格", (
   const directory = root(),
     server = new TaskStore(join(directory, "s.sqlite"));
   approve(server);
-  const task = server.claim("device", ["demo"]);
+  const task = server.claim("device", ["demo"], 2);
   const one = new WorkerStore(join(directory, "w.sqlite")),
     two = new WorkerStore(join(directory, "w.sqlite"));
   one.record(task);
@@ -190,8 +194,12 @@ test("服务端启动许可只发一次，心跳不消耗许可，重启后仍�
   const file = join(root(), "s.sqlite");
   let store = new TaskStore(file);
   approve(store);
-  const task = store.claim("device", ["demo"]);
-  const identity = { deviceId: "device", attemptId: task.attemptId };
+  const task = store.claim("device", ["demo"], 2);
+  const identity = {
+    deviceId: "device",
+    attemptId: task.attemptId,
+    agreementHash: task.approvedAgreementHash,
+  };
   store.heartbeat(task.id, { ...identity, state: "running" });
   assert.equal(store.get(task.id).state, "assigned");
   assert.equal(store.start(task.id, identity).granted, true);
@@ -217,15 +225,16 @@ test("本机记录缺失而服务端已发启动许可时，禁止再启动执�
     deviceId: "device",
     projects,
     bridge: async () => {},
-    execute: async () => {
+    execute: async (task) => {
       starts++;
-      return result();
+      return result(task);
     },
   });
   try {
     approve(service.store);
-    const task = service.store.claim("device", ["demo"]);
+    const task = service.store.claim("device", ["demo"], 2);
     service.store.start(task.id, {
+      agreementHash: task.approvedAgreementHash,
       deviceId: "device",
       attemptId: task.attemptId,
     });
@@ -298,9 +307,9 @@ test("回传成功但回执丢失：重启后只补传，不再执行", async ()
     deviceId: "device",
     projects,
     bridge,
-    execute: async () => {
+    execute: async (task) => {
       starts++;
-      return result();
+      return result(task);
     },
   };
   let worker = new Worker(options);
@@ -342,7 +351,7 @@ test("完成回执丢失后先人工验收，补传不会再次占用或执行",
     bridge: async () => {
       bridgeCalls++;
     },
-    execute: async () => result(),
+    execute: async (task) => result(task),
   });
   try {
     const task = approve(service.store),
@@ -377,10 +386,10 @@ test("执行过程中服务断线，本地结果保留，服务恢复后补传",
     deviceId: "device",
     projects,
     bridge: async () => {},
-    execute: async () => {
+    execute: async (task) => {
       starts++;
       await service.close();
-      return result();
+      return result(task);
     },
   });
   const task = approve(service.store);
@@ -411,21 +420,21 @@ test("启动前后崩溃留下不确定状态，只转待核实，禁止重跑",
     deviceId: "device",
     projects,
     bridge: async () => {},
-    execute: async () => {
+    execute: async (task) => {
       starts++;
-      return result();
+      return result(task);
     },
   });
   try {
     approve(service.store);
-    const task = service.store.claim("device", ["demo"]);
+    const task = service.store.claim("device", ["demo"], 2);
     worker.store.record(task);
     worker.store.start(task.attemptId, "dead-worker");
     await worker.tick();
     await worker.tick();
     assert.equal(starts, 0);
     assert.equal(service.store.get(task.id).state, "recovery_required");
-    assert.equal(service.store.claim("other", ["demo"]), null);
+    assert.equal(service.store.claim("other", ["demo"], 2), null);
   } finally {
     worker.close();
     await service.close();
@@ -480,12 +489,12 @@ test("DSH 协调提交与结果汇总，重复请求不重复规划", async () =
     const task = await coordinate(config, spec(), ask);
     assert.equal((await coordinate(config, spec(), ask)).id, task.id);
     assert.equal(calls, 1);
-    service.store.approve(task.id, task.specHash);
-    const claimed = service.store.claim("device", ["demo"]);
+    confirmAgreement(service.store, task);
+    const claimed = service.store.claim("device", ["demo"], 2);
     service.store.finish(task.id, {
       deviceId: "device",
       attemptId: claimed.attemptId,
-      result: result(),
+      result: result(claimed),
     });
     const notices = [];
     await watch(config, task.id, new AbortController().signal, ask, (message) =>
@@ -536,6 +545,8 @@ test("真实 Git 独立目录、执行器完成事件与验收结果绑定提交
     assert.equal(action, "exec");
     const isAgent = request.binary === "fixture-agent";
     if (isAgent) {
+      assert.ok(request.input.includes(task.approvedAgreementHash));
+      assert.ok(request.input.includes(task.agreement.documents.interfaces));
       assert.equal(
         request.args[request.args.indexOf("--sandbox") + 1],
         "workspace-write",
@@ -572,8 +583,14 @@ test("真实 Git 独立目录、执行器完成事件与验收结果绑定提交
     ],
   };
   task.executionHash = projectFingerprint(config);
+  const contracts = new TaskStore(join(directory, "contracts.sqlite"));
+  const approved = confirmAgreement(contracts, contracts.submit(task));
+  Object.assign(task, approved, { attemptId: "attempt" });
+  contracts.close();
   const finished = await executeTask(task, config, bridge);
   assert.equal(finished.state, "awaiting_review");
+  assert.equal(finished.agreementHash, task.approvedAgreementHash);
+  assert.equal(finished.agreementRevision, 1);
   assert.notEqual(finished.commit, base);
   assert.deepEqual(finished.changedFiles, ["src/value.txt"]);
   assert.equal(readFileSync(join(repo, "src/value.txt"), "utf8"), "before\n");

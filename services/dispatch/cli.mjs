@@ -52,7 +52,9 @@ if (!configFile || command === "--help") {
     } else if (command === "coordinate") {
       const input = JSON.parse(readFileSync(resolve(inputFile), "utf8"));
       const task = await coordinate(config, input);
-      console.log(`任务 ${task.id} 已保存，请在 ${config.url} 确认开工。`);
+      console.log(
+        `任务 ${task.id} 已保存，请在 ${config.url} 先确认拆分方案，再确认约定开工。`,
+      );
       await watch(config, task.id, abort.signal);
     } else if (command === "watch") {
       await watch(config, inputFile, abort.signal);

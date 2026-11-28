@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, lstatSync, existsSync } from "node:fs";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { createServer } from "node:net";
-import { demand, digest, WorkerStore, projectFingerprint } from "./store.mjs";
+import {
+  demand,
+  digest,
+  WorkerStore,
+  projectFingerprint,
+  requireAgreement,
+} from "./store.mjs";
 import { client } from "./server.mjs";
 import { nativeBridge, safeDirectory } from "./process.mjs";
 
@@ -87,6 +93,7 @@ export function validateProject(config) {
 // Caller persists launch intent before invoking this function. The native
 // companion owns Job Objects/process groups and the shared desktop task slot.
 export async function executeTask(task, config, bridge) {
+  requireAgreement(task);
   demand(
     task.executionHash === (config.approvedHash || projectFingerprint(config)),
     "执行配置与已批准建议不一致，请重新确认",
@@ -154,9 +161,13 @@ export async function executeTask(task, config, bridge) {
     `目标：${task.goal}`,
     `范围：${task.scope}`,
     `DSH 计划：${task.plan}`,
+    task.agreement
+      ? `必须遵守已确认约定第 ${task.agreementRevision} 版（${task.approvedAgreementHash}）：\n${JSON.stringify(task.agreement.documents)}`
+      : "",
     `允许修改路径：${config.allowedPaths.join(", ")}。不得读写凭据。`,
     "在当前独立目录完成最小改动。不要启动遗留后台服务。返回完成情况；程序会独立运行验收。",
   ].join("\n");
+  demand(Buffer.byteLength(prompt) <= 30000, "执行输入过长，请缩短方案和约定");
   const output = await exec(
     config.codex,
     [
@@ -267,6 +278,12 @@ export async function executeTask(task, config, bridge) {
     workspace,
     checks,
     changedFiles: [...changed],
+    ...(task.agreement
+      ? {
+          agreementHash: task.approvedAgreementHash,
+          agreementRevision: task.agreementRevision,
+        }
+      : {}),
   };
 }
 
@@ -322,6 +339,7 @@ export class Worker {
     const { task } = await this.api("/v1/claim", {
       deviceId: this.deviceId,
       projects: Object.keys(this.projects),
+      protocolVersion: 2,
     });
     if (!task || !["assigned", "running"].includes(task.state)) return;
     this.store.record(task);
@@ -339,6 +357,7 @@ export class Worker {
     const permit = await this.api(`/v1/tasks/${task.id}/start`, {
       deviceId: this.deviceId,
       attemptId: task.attemptId,
+      agreementHash: task.approvedAgreementHash,
     });
     if (!permit.granted) {
       this.store.finish(task.attemptId, {
