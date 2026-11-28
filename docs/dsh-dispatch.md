@@ -1,6 +1,6 @@
-# DSH 本机协调：第一阶段
+# DSH 本机协调与开工约定
 
-状态：实现与 Windows 合成项目闭环已通过，待用户项目验收；三端检查证据见 [测试记录](testing.md)。协调者固定 DSH；本机服务与执行端通过 HTTP 分离，当前只监听
+状态：第一阶段及真实小任务已验收并合入 PR #105；本次增加开工约定，检查与实际验收范围见 [测试记录](testing.md)。协调者固定 DSH；本机服务与执行端通过 HTTP 分离，当前只监听
 127.0.0.1，不宣称已经部署服务器或具备远程鉴权。本阶段一个项目任务同时执行，
 网络重试只补传领取/回执，不创建新的执行尝试。
 
@@ -9,9 +9,11 @@
 任务包含稳定 requestId、projectId、固定 Git baseCommit、goal、scope、DSH plan、executionHash。
 executionHash 绑定本机执行器、模型、路径范围与验收命令，配置变化后旧任务拒绝执行。
 服务器不接收任意命令或本机路径。仓库路径、执行器和验收命令由本机项目登记配置提供。
-DSH 通过 ACP 分析任务，生成待确认建议；用户确认建议摘要后才能进入 queued。
+DSH 通过 ACP 根据任务描述生成前后端拆分建议。新任务先确认建议摘要，进入 planning；
+Claude Code 生成三份约定后进入 agreement_review，再确认约定才进入 queued。
 
-proposed → queued → assigned → running → awaiting_review / failed / recovery_required。
+新任务：proposed → planning → drafting → agreement_review → queued → assigned → running → awaiting_review / failed / recovery_required。
+生成失败进入 planning_failed；中断保留 drafting，等待人工重新生成。
 执行结果通过验收命令也只进入 awaiting_review；人工确认结果后 accepted。
 失败和待核实保持占用，本阶段不自动返工或重派；三轮返工属于下一阶段。
 先停止 worker，再由用户点击核实放弃；原生组件确认全部执行具有持久停止证明后才能
@@ -47,6 +49,8 @@ attemptId，断线不回收、不自动过期重派。执行端在创建进程�
    不需要在 D 盘编译。开发者也可以在 E 盘 target 目录构建
    `cargo build --manifest-path src-tauri/Cargo.toml --bin agentterm-dispatch-bridge`。
 2. 把 `services/dispatch/config.example.json` 复制到自己的运行目录，填写真实路径。
+   `claude` 填已安装的 Claude Code 原生路径（Windows 为 exe）；沿用其现有账号和模型，
+   不改全局配置。版本需支持 `--safe-mode`、`--tools`、`--strict-mcp-config` 等当前调用参数。
    配置不包含凭据；不要复制 CLI 的登录文件。仓库、workspaceRoot 必须已存在且互不嵌套。
    `codex` 必须指向原生 exe，不能填 npm 的 cmd/ps1 包装；`model: "default"` 使用本机账号默认模型，
    也可显式填写本机支持的模型。配置摘要绑定该选择，默认选择下实际模型由 CLI 当前配置决定。
@@ -80,12 +84,37 @@ attemptId，断线不回收、不自动过期重派。执行端在创建进程�
    node services/dispatch/cli.mjs coordinate E:/AgentTerm-dispatch/config.json E:/AgentTerm-dispatch/task.json
    ```
 
-5. DSH 生成建议，打开 `http://127.0.0.1:47321/` 核对并确认开工。
+5. DSH 生成拆分建议，打开 `http://127.0.0.1:47321/` 点击“确认拆分方案，生成约定”。
+   保持 coordinate/watch 运行，Claude Code 返回接口约定、前后端任务清单、验收清单。
+   核对三份内容后点击“确认三份约定并开工”；缺少任何一份或未确认均不能领取。
    AgentTerm 顶栏的“DSH 协调”打开同一面板。执行完成后检查独立 clone 的提交与测试摘要，
    在面板确认完成后才释放主任务占用。协调 CLI 会显示状态变化并请求 DSH 汇总。
 6. 协调 CLI 退出后，使用 `watch <配置路径> <任务ID>` 重新跟进；使用 `status <配置路径>` 查看状态。
 
-## 第一版明确限制
+## 约定版本与恢复
+
+- 三份内容为 `interfaces`、`tasks`、`acceptance`，各非空且最长 6000 字符，总 JSON 不超过 16 KB。
+  内容为纯文本 Markdown；面板不执行其中的 HTML。接口/任务/验收编号的业务对应由用户确认，
+  程序校验完整性和版本，不宣称已自动证明接口语义正确。
+- `agreements` 表按 task/revision 追加，摘要绑定 specHash、revision、author 和三份内容。
+  面板可查看已保存版本；GET `/v1/tasks/:id/agreements` 返回历史。人工确认绑定 specHash/revision/hash。
+- “重新生成约定”立即撤销排队确认。生成操作有独立 operationId；响应丢失不重复保存，
+  旧生成不能覆盖新生成。drafting 在重启后保留；需人工重新生成，不能凭心跳判定完成。
+  点击重新生成不会自动确认新的约定。已经 assigned 的任务禁止换版，需求变化须提交新任务。
+- coordinate/watch 负责推动 planning；仅开服务和 worker 不会生成约定。生成失败会在面板显示，
+  修复 Claude 配置后人工重试。模型没有编写/验收项目代码；本项只生成规划材料。
+- Claude Code 使用 print JSON + JSON Schema 结构化输出、safe-mode、空工具集、空 MCP 配置、禁用 hooks/skills 和会话持久化；
+  不传模型覆盖。它依据已确认任务/DSH 方案与登记检查生成内容，不读取整个源仓库；
+  信息不足必须标注待确认。此限制不是针对任意恶意程序的系统隔离。
+- worker 协议版本 2 才能领取新任务，启动许可携带约定 hash，执行提示包含完整三份内容；
+  程序通过的结果携带 agreementHash/revision，服务端拒绝不同版本。固定验收命令仍由本机登记，
+  不执行模型生成的命令。文本清单的业务验收仍需后续主 Agent/集成复核及人工确认。
+- 服务数据库从 v1 事务迁移至 v3；旧任务保留原状态和审批语义，不追改已经批准或执行中的任务。
+  新建任务一律采用新协议，客户端不能选择跳过。执行端数据库仍为 v2。
+  升级前应停止旧服务并备份 SQLite（包含 WAL 状态）；旧程序拒绝 v3，回滚需恢复升级前备份，
+  不能让旧程序直接打开新库。当前改动未迁移用户正在运行的第一阶段服务。
+
+## 当前明确限制
 
 - 不确定、失败状态保留占用，不自动修复、不自动重派。面板可在 worker 停止后核实放弃；
   若原生组件被强杀、停止回执没有持久保存，即使 PID 消失也不能释放。保留数据库和执行记录，

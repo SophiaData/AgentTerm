@@ -80,6 +80,16 @@ async function renderResultTask(task: {
   summary?: string | null;
   result?: Record<string, unknown> | null;
   resultHash?: string;
+  workflow?: string;
+  agreement?: {
+    revision: number;
+    hash: string;
+    documents: { interfaces: string; tasks: string; acceptance: string };
+  };
+  agreementRevision?: number;
+  approvedAgreementHash?: string;
+  generationId?: string;
+  attemptId?: string;
 }) {
   document.body.innerHTML =
     '<button id="refresh">刷新</button><p id="error"></p><main id="tasks"></main>';
@@ -110,6 +120,89 @@ async function renderResultTask(task: {
   await waitFor(() => expect(document.querySelector("article")).not.toBeNull());
   return { fetch, poll };
 }
+
+const agreementDocuments = {
+  interfaces: 'API <img src=x onerror="alert(1)">',
+  tasks: "FE-1 / BE-1",
+  acceptance: "AC-1 可判定检查",
+};
+
+it("requires separate proposal approval and displays all agreement documents as text", async () => {
+  const task = { state: "proposed", workflow: "agreement-v1" };
+  const { poll } = await renderResultTask(task);
+  expect(document.querySelector("article button")?.textContent).toBe(
+    "确认拆分方案，生成约定",
+  );
+  task.state = "planning";
+  await poll();
+  expect(document.querySelector("article button")).toBeNull();
+});
+
+it("approval binds the displayed agreement revision and refresh replaces stale approval", async () => {
+  const task = {
+    state: "agreement_review",
+    workflow: "agreement-v1",
+    agreementRevision: 1,
+    agreement: { revision: 1, hash: "first", documents: agreementDocuments },
+  };
+  const { fetch, poll } = await renderResultTask(task);
+  expect(document.querySelector("article")?.textContent).toContain(
+    agreementDocuments.interfaces,
+  );
+  expect(document.querySelector("img")).toBeNull();
+  const button = document.querySelector<HTMLButtonElement>("article button")!;
+  button.focus();
+  await poll();
+  expect(document.activeElement).toBe(button);
+  task.agreementRevision = 2;
+  task.agreement = { ...task.agreement, revision: 2, hash: "second" };
+  await poll();
+  expect(document.querySelector("article button")).not.toBe(button);
+  document.querySelector<HTMLButtonElement>("article button")!.click();
+  await waitFor(() =>
+    expect(fetch).toHaveBeenCalledWith("/v1/tasks/fixture/agreement-approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        specHash: "proposal-version",
+        agreementHash: "second",
+        revision: 2,
+      }),
+    }),
+  );
+});
+
+it("regeneration revokes queued approval using the displayed generation; assigned tasks cannot regenerate", async () => {
+  const task = {
+    state: "queued",
+    workflow: "agreement-v1",
+    generationId: "draft-1",
+    agreementRevision: 1,
+    agreement: { revision: 1, hash: "first", documents: agreementDocuments },
+  };
+  const { fetch, poll } = await renderResultTask(task);
+  const button = document.querySelector<HTMLButtonElement>("article button")!;
+  expect(button.textContent).toContain("撤销开工确认");
+  button.click();
+  await waitFor(() =>
+    expect(fetch).toHaveBeenCalledWith(
+      "/v1/tasks/fixture/agreement-regenerate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          specHash: "proposal-version",
+          revision: 1,
+          agreementHash: "first",
+          generationId: "draft-1",
+        }),
+      },
+    ),
+  );
+  task.state = "assigned";
+  await poll();
+  expect(document.querySelector("article button")).toBeNull();
+});
 
 it.each([
   {

@@ -1,6 +1,7 @@
 import { askDsh, safeDirectory } from "./process.mjs";
 import { client } from "./server.mjs";
 import { demand, identifier, text, projectFingerprint } from "./store.mjs";
+import { askClaude, generateAgreement } from "./agreements.mjs";
 
 export async function coordinate(config, input, ask = askDsh) {
   identifier(input.requestId);
@@ -27,8 +28,8 @@ export async function coordinate(config, input, ask = askDsh) {
     config.dsh,
     safeDirectory(project.repository),
     [
-      "你是 AgentTerm 的 DSH 总协调者。当前仅制定一个任务的执行建议，不执行代码修改，不调用工具，不创建子代理。",
-      "用中文给出简短步骤和验收要点。不要宣称已经完成或通过测试。用户确认后另一个执行器才会开工。",
+      "你是 AgentTerm 的 DSH 总协调者。当前仅制定项目的前后端拆分建议，不执行代码修改，不调用工具，不创建子代理。",
+      "用中文说明前后端职责、依赖及验收要点；不适用的部分明确说明。不要宣称已经完成或通过测试。用户先确认方案，Claude Code 再编写接口、任务和验收约定，约定再次确认后执行器才会开工。",
       `项目：${input.projectId}；固定基线：${input.baseCommit}`,
       `目标：${input.goal}`,
       `范围：${input.scope}`,
@@ -48,6 +49,7 @@ export async function watch(
   signal,
   ask = askDsh,
   notify = (message) => process.stdout.write(message + "\n"),
+  draft = askClaude,
 ) {
   identifier(taskId);
   const api = client(config.url);
@@ -73,6 +75,10 @@ export async function watch(
           : `任务 ${task.id}：${task.state}`,
       );
       last = state;
+    }
+    if (task.state === "planning") {
+      await generateAgreement(config, task, api, draft);
+      continue;
     }
     if (task.resultHash) {
       if (!task.summary) {

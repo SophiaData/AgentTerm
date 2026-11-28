@@ -1,5 +1,31 @@
 # Testing policy
 
+## 2026-11-28 · 第二阶段第一项：开工约定双确认
+
+基于已合并的 PR #105 / `924d475`，增加方案确认→Claude Code 三份约定→约定确认→派发。
+数据库 v1→v3 保留旧任务，新任务强制新协议；旧 worker 不领取新任务。执行仍为单个 Codex 任务，
+前后端独立执行、子代理和三轮返工未在本次实现。
+
+- Node 派发回归合计 24 项通过（17 项既有回归迁移至双确认、7 项约定回归），单线程。
+  覆盖缺约定/未确认拒绝领取、版本绑定、历史保存、生成中断重启、迟到响应、换版撤销排队、
+  已领取锁定、旧数据库兼容、HTTP 回执丢失、watch 恢复以及 Claude 输出结构与禁用工具参数。
+- 真实 Git 夹具检查执行提示含完整约定和 hash，交付结果包含对应 revision/hash；失败验收仍拒绝通过。
+- 面板 DOM 11/11 通过，新增双确认、版本变化后按钮更新、纯文本展示与排队撤销操作；
+  TypeScript、定向 ESLint 通过。移除约定 hash 核对后，对应回归因 Missing expected exception 失败，恢复后通过。
+- 本机 Claude Code 原生入口只生成合成约定，未调用它开发项目。首次简单输入通过；完整方案试跑首次
+  生成未完成，重试获得 success 但正文非有效 JSON。改用 CLI `--json-schema` / structured_output 后，
+  原任务 `462f8015-ff40-47ec-bd03-0d1aa98b342e` 恢复通过，未新建任务绕过失败。
+- 真实 DSH 生成拆分方案，真实 Claude 生成三份约定，程序模拟人工确认，仅用于合成验收；
+  未确认不能领取、服务重启保留约定、换版撤销 queued、旧确认拒绝均通过。第二版是基于真实输出的
+  合成修改，用于确定性版本测试，不冒称第二次真实模型生成。最终 agreement_review，代码执行器启动 0 次。
+- 证据在 `E:/AgentTerm-dispatch/agreement-20261128/smoke-evidence.json`、smoke.sqlite；
+  失败类别保存在 backups/dsh-agreement-gate-20261128/pre-schema-attempts.json，无模型原始错误或凭据。
+- configure_project 只读建议、verify_project（21 文件）与 diff 检查通过；本地未运行完整 Rust 编译。
+  最终提交的三端 16 项质量门与独立只读复核结论以本次 PR 为准，不能用前一 PR 的 CI 代替。
+
+约定语义正确性仍须人工检查；本项不自动扫描整个项目或执行模型生成的验收命令。
+未迁移正在运行的第一阶段服务，未合并、安装或发布本次改动。
+
 ## 2026-11-28 · DSH 派发 AgentTerm 真实面板修复
 
 用户确认方案后，任务 `665b50ea-0b7c-4eb9-a14a-387c3d728117` 从 proposed 进入执行，

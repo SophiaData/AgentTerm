@@ -20,6 +20,43 @@ export function text(value, limit = 8000) {
 export function digest(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
+export function agreementDocuments(value) {
+  demand(value && typeof value === "object", "缺少三份约定");
+  const documents = Object.fromEntries(
+    ["interfaces", "tasks", "acceptance"].map((key) => [
+      key,
+      text(value[key], 6000),
+    ]),
+  );
+  demand(
+    Buffer.byteLength(JSON.stringify(documents)) <= 16000,
+    "约定总长度超过 16 KB",
+  );
+  return documents;
+}
+export function agreementDigest(specHash, revision, documents) {
+  return digest({
+    specHash,
+    revision,
+    author: "claude-code",
+    documents: agreementDocuments(documents),
+  });
+}
+export function requireAgreement(task) {
+  if (task.workflow !== "agreement-v1") return;
+  demand(
+    task.agreement &&
+      task.agreement.revision === task.agreementRevision &&
+      task.approvedAgreementHash === task.agreement.hash &&
+      task.agreement.hash ===
+        agreementDigest(
+          task.specHash,
+          task.agreementRevision,
+          task.agreement.documents,
+        ),
+    "缺少有效的已确认约定",
+  );
+}
 export function projectFingerprint(config) {
   return digest(
     Object.fromEntries(
@@ -72,6 +109,7 @@ export function proposal(input) {
     plan: text(input.plan, 12000),
     coordinator: "dsh",
     executionHash: text(input.executionHash, 64),
+    workflow: "agreement-v1",
   };
   demand(/^[0-9a-f]{40}$/.test(result.baseCommit), "需要固定的 40 位 Git 提交");
   demand(/^[0-9a-f]{64}$/.test(result.executionHash), "需要执行配置摘要");
@@ -83,9 +121,10 @@ export function proposal(input) {
 export class TaskStore {
   constructor(file) {
     this.db = openDatabase(file);
-    const version = this.db.prepare("PRAGMA user_version").get().user_version;
-    demand(version === 0 || version === 1, "不支持的任务数据库版本");
-    this.db.exec(`
+    transaction(this.db, () => {
+      const version = this.db.prepare("PRAGMA user_version").get().user_version;
+      demand([0, 1, 3].includes(version), "不支持的任务数据库版本");
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY, request_id TEXT UNIQUE NOT NULL, spec TEXT NOT NULL,
         spec_hash TEXT NOT NULL, state TEXT NOT NULL, device TEXT, attempt TEXT,
@@ -94,8 +133,20 @@ export class TaskStore {
       ) STRICT;
       CREATE UNIQUE INDEX IF NOT EXISTS one_assignment ON tasks((1))
         WHERE state IN ('assigned','running','awaiting_review','failed','recovery_required');
-      PRAGMA user_version=1;
     `);
+      if (version !== 3)
+        this.db.exec(`
+        ALTER TABLE tasks ADD COLUMN agreement_revision INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE tasks ADD COLUMN approved_agreement_hash TEXT;
+        ALTER TABLE tasks ADD COLUMN generation TEXT;
+        ALTER TABLE tasks ADD COLUMN agreement_error TEXT;
+      `);
+      this.db.exec(`CREATE TABLE IF NOT EXISTS agreements (
+        task_id TEXT NOT NULL, revision INTEGER NOT NULL, hash TEXT NOT NULL,
+        documents TEXT NOT NULL, generation TEXT NOT NULL, created INTEGER NOT NULL,
+        PRIMARY KEY(task_id,revision)
+      ) STRICT; PRAGMA user_version=3;`);
+    });
   }
   close() {
     this.db.close();
@@ -115,7 +166,161 @@ export class TaskStore {
       summary: row.summary,
       createdAt: row.created,
       updatedAt: row.updated,
+      agreementRevision: row.agreement_revision,
+      agreement: this.agreement(row.id, row.agreement_revision),
+      approvedAgreementHash: row.approved_agreement_hash,
+      agreementError: row.agreement_error,
+      generationId: row.generation,
     };
+  }
+  agreement(id, revision) {
+    const row = this.db
+      .prepare("SELECT * FROM agreements WHERE task_id=? AND revision=?")
+      .get(id, revision);
+    return row
+      ? {
+          revision: row.revision,
+          hash: row.hash,
+          documents: JSON.parse(row.documents),
+          author: "claude-code",
+        }
+      : null;
+  }
+  agreementHistory(id) {
+    this.get(id);
+    return this.db
+      .prepare(
+        "SELECT revision FROM agreements WHERE task_id=? ORDER BY revision",
+      )
+      .all(id)
+      .map((row) => this.agreement(id, row.revision));
+  }
+  beginAgreement(id, input) {
+    return transaction(this.db, () => {
+      const task = this.get(id);
+      identifier(input.operationId);
+      demand(
+        task.workflow === "agreement-v1" && task.specHash === input.specHash,
+        "方案版本不匹配",
+      );
+      if (task.state !== "planning") return { granted: false };
+      this.db
+        .prepare(
+          "UPDATE tasks SET state='drafting',generation=?,agreement_error=NULL,updated=? WHERE id=?",
+        )
+        .run(input.operationId, Date.now(), id);
+      return { granted: true };
+    });
+  }
+  saveAgreement(id, input) {
+    const documents = agreementDocuments(input.documents);
+    return transaction(this.db, () => {
+      const task = this.get(id);
+      const row = this.db
+        .prepare("SELECT generation FROM tasks WHERE id=?")
+        .get(id);
+      demand(
+        row.generation === input.operationId &&
+          task.specHash === input.specHash,
+        "约定生成已失效",
+      );
+      if (task.state !== "drafting") {
+        demand(
+          task.agreement &&
+            digest(task.agreement.documents) === digest(documents),
+          "约定已保存，不能覆盖",
+        );
+        return task;
+      }
+      const revision = task.agreementRevision + 1;
+      const hash = agreementDigest(task.specHash, revision, documents);
+      this.db
+        .prepare("INSERT INTO agreements VALUES(?,?,?,?,?,?)")
+        .run(
+          id,
+          revision,
+          hash,
+          JSON.stringify(documents),
+          input.operationId,
+          Date.now(),
+        );
+      this.db
+        .prepare(
+          "UPDATE tasks SET state='agreement_review',agreement_revision=?,approved_agreement_hash=NULL,updated=? WHERE id=?",
+        )
+        .run(revision, Date.now(), id);
+      return this.get(id);
+    });
+  }
+  failAgreement(id, input) {
+    return transaction(this.db, () => {
+      const row = this.db
+        .prepare("SELECT state,generation FROM tasks WHERE id=?")
+        .get(id);
+      demand(row && row.generation === input.operationId, "约定生成已失效");
+      if (row.state === "drafting")
+        this.db
+          .prepare(
+            "UPDATE tasks SET state='planning_failed',agreement_error=?,updated=? WHERE id=?",
+          )
+          .run(
+            "生成未完成；检查 Claude Code 配置后可重新生成。",
+            Date.now(),
+            id,
+          );
+      return this.get(id);
+    });
+  }
+  regenerateAgreement(id, input) {
+    return transaction(this.db, () => {
+      const task = this.get(id);
+      demand(
+        task.workflow === "agreement-v1" &&
+          !task.attemptId &&
+          [
+            "drafting",
+            "planning_failed",
+            "agreement_review",
+            "queued",
+          ].includes(task.state),
+        "当前阶段不能修改约定",
+      );
+      demand(
+        task.specHash === input.specHash &&
+          task.agreementRevision === input.revision &&
+          (task.agreement?.hash ?? null) === input.agreementHash &&
+          task.generationId === input.generationId,
+        "约定版本已变化",
+      );
+      this.db
+        .prepare(
+          "UPDATE tasks SET state='planning',generation=NULL,approved_agreement_hash=NULL,agreement_error=NULL,updated=? WHERE id=?",
+        )
+        .run(Date.now(), id);
+      return this.get(id);
+    });
+  }
+  approveAgreement(id, input) {
+    return transaction(this.db, () => {
+      const task = this.get(id);
+      demand(
+        task.workflow === "agreement-v1" &&
+          ["agreement_review", "queued"].includes(task.state),
+        "约定尚未生成或已开始执行",
+      );
+      demand(
+        task.specHash === input.specHash &&
+          task.agreement?.hash === input.agreementHash &&
+          task.agreementRevision === input.revision,
+        "约定版本已变化，请重新确认",
+      );
+      this.db
+        .prepare(
+          "UPDATE tasks SET state='queued',approved_agreement_hash=?,updated=? WHERE id=?",
+        )
+        .run(task.agreement.hash, Date.now(), id);
+      return this.get(id);
+    });
   }
   get(id) {
     const task = this.view(
@@ -170,14 +375,15 @@ export class TaskStore {
     return transaction(this.db, () => {
       const task = this.get(id);
       demand(task.specHash === hash, "任务建议已变化，请重新核对");
-      demand(["proposed", "queued"].includes(task.state), "该任务不能批准开工");
+      const next = task.workflow === "agreement-v1" ? "planning" : "queued";
+      demand(["proposed", next].includes(task.state), "该任务不能确认方案");
       this.db
-        .prepare("UPDATE tasks SET state='queued', updated=? WHERE id=?")
-        .run(Date.now(), id);
+        .prepare("UPDATE tasks SET state=?, updated=? WHERE id=?")
+        .run(next, Date.now(), id);
       return this.get(id);
     });
   }
-  claim(deviceId, projects) {
+  claim(deviceId, projects, protocolVersion = 1) {
     identifier(deviceId);
     demand(
       Array.isArray(projects) && projects.length > 0 && projects.length <= 32,
@@ -189,11 +395,22 @@ export class TaskStore {
           "SELECT * FROM tasks WHERE attempt IS NOT NULL AND state NOT IN ('accepted','abandoned')",
         )
         .get();
-      if (active) return active.device === deviceId ? this.view(active) : null;
+      const compatible = (row) =>
+        JSON.parse(row.spec).workflow !== "agreement-v1" ||
+        (protocolVersion === 2 &&
+          row.approved_agreement_hash ===
+            this.agreement(row.id, row.agreement_revision)?.hash);
+      if (active)
+        return active.device === deviceId && compatible(active)
+          ? this.view(active)
+          : null;
       const queued = this.db
         .prepare("SELECT * FROM tasks WHERE state='queued' ORDER BY created")
         .all()
-        .find((r) => projects.includes(JSON.parse(r.spec).projectId));
+        .find(
+          (r) =>
+            projects.includes(JSON.parse(r.spec).projectId) && compatible(r),
+        );
       if (!queued) return null;
       this.db
         .prepare(
@@ -227,6 +444,12 @@ export class TaskStore {
       const task = this.get(id);
       this.identify(task, input);
       if (task.state !== "assigned") return { granted: false };
+      if (task.workflow === "agreement-v1")
+        demand(
+          input.agreementHash === task.approvedAgreementHash &&
+            task.agreement?.hash === task.approvedAgreementHash,
+          "启动必须绑定已确认约定",
+        );
       this.db
         .prepare(
           "UPDATE tasks SET state='running',heartbeat=?,updated=? WHERE id=?",
@@ -247,6 +470,12 @@ export class TaskStore {
           ),
       );
       if (result.state === "awaiting_review") {
+        if (task.workflow === "agreement-v1")
+          demand(
+            result.agreementHash === task.approvedAgreementHash &&
+              result.agreementRevision === task.agreementRevision,
+            "交付必须绑定已确认约定",
+          );
         demand(
           /^[0-9a-f]{40}$/.test(result.commit) &&
             Array.isArray(result.checks) &&
@@ -337,6 +566,8 @@ export class WorkerStore {
         demand(
           old.id === task.id &&
             old.specHash === task.specHash &&
+            (old.approvedAgreementHash ?? null) ===
+              (task.approvedAgreementHash ?? null) &&
             old.deviceId === task.deviceId,
           "本机执行记录冲突",
         );
