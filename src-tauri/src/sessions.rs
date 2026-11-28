@@ -669,7 +669,7 @@ pub(crate) fn resolve_missing_cli_sessions(
     skip_ids: &HashSet<String>,
     stores: &CliSessionStores,
 ) -> Vec<(String, String)> {
-    let mut claimed: HashSet<String> = records
+    let claimed: HashSet<String> = records
         .iter()
         .filter_map(|record| record.cli_session_id.clone())
         .collect();
@@ -678,7 +678,7 @@ pub(crate) fn resolve_missing_cli_sessions(
     let mut need_codex = false;
     let mut need_agy = false;
     for r in records.iter() {
-        if r.cli_session_id.is_some() || skip_ids.contains(&r.id) {
+        if r.cli_session_id.is_some() {
             continue;
         }
         if r.tool_id == "codex" {
@@ -713,13 +713,12 @@ pub(crate) fn resolve_missing_cli_sessions(
     };
     let mut claude_cache: HashMap<String, Vec<(String, u64)>> = HashMap::new();
 
-    // Process oldest-first so older records claim their own older session IDs first.
-    let mut indices: Vec<usize> = (0..records.len()).collect();
-    indices.sort_by_key(|&idx| records[idx].started_at_ms);
-
-    let mut newly_bound = Vec::new();
-    for idx in indices {
-        if records[idx].cli_session_id.is_some() || skip_ids.contains(&records[idx].id) {
+    // Include skipped/live records in ambiguity detection. Exiting one tab must
+    // never claim another tab's unbound CLI ID just because it is closer in time.
+    let mut candidates_by_record = vec![Vec::<String>::new(); records.len()];
+    let mut candidate_owners: HashMap<String, usize> = HashMap::new();
+    for idx in 0..records.len() {
+        if records[idx].cli_session_id.is_some() {
             continue;
         }
         let start = records[idx].started_at_ms;
@@ -730,7 +729,7 @@ pub(crate) fn resolve_missing_cli_sessions(
         };
         let norm_proj = normalize_comparable_path(&records[idx].project_path);
 
-        let matched = match records[idx].tool_id.as_str() {
+        let mut candidates: Vec<String> = match records[idx].tool_id.as_str() {
             "claude" => {
                 if let Some(dir) = stores.claude_projects_dir.as_deref() {
                     let entries = claude_cache
@@ -743,10 +742,10 @@ pub(crate) fn resolve_missing_cli_sessions(
                         .filter(|(id, ts)| {
                             !claimed.contains(id) && *ts >= window_start && *ts <= window_end
                         })
-                        .min_by_key(|(_, ts)| ts.abs_diff(start))
                         .map(|(id, _)| id.clone())
+                        .collect()
                 } else {
-                    None
+                    Vec::new()
                 }
             }
             "codex" => codex_candidates
@@ -757,8 +756,8 @@ pub(crate) fn resolve_missing_cli_sessions(
                         && *ts >= window_start
                         && *ts <= window_end
                 })
-                .min_by_key(|(_, _, ts)| ts.abs_diff(start))
-                .map(|(id, _, _)| id.clone()),
+                .map(|(id, _, _)| id.clone())
+                .collect(),
             "agy" => agy_candidates
                 .iter()
                 .filter(|(id, cwd, ts)| {
@@ -767,15 +766,28 @@ pub(crate) fn resolve_missing_cli_sessions(
                         && *ts >= start.saturating_sub(5_000)
                         && *ts <= window_end
                 })
-                .min_by_key(|(_, _, ts)| ts.abs_diff(start))
-                .map(|(id, _, _)| id.clone()),
-            _ => None,
+                .map(|(id, _, _)| id.clone())
+                .collect(),
+            _ => Vec::new(),
         };
+        candidates.sort();
+        candidates.dedup();
+        for id in &candidates {
+            *candidate_owners.entry(id.clone()).or_default() += 1;
+        }
+        candidates_by_record[idx] = candidates;
+    }
 
-        if let Some(cli_id) = matched {
-            claimed.insert(cli_id.clone());
+    let mut newly_bound = Vec::new();
+    for (idx, candidates) in candidates_by_record.into_iter().enumerate() {
+        if skip_ids.contains(&records[idx].id) {
+            continue;
+        }
+        if let [cli_id] = candidates.as_slice()
+            && candidate_owners.get(cli_id) == Some(&1)
+        {
             records[idx].cli_session_id = Some(cli_id.clone());
-            newly_bound.push((records[idx].id.clone(), cli_id));
+            newly_bound.push((records[idx].id.clone(), cli_id.clone()));
         }
     }
     newly_bound
@@ -1447,6 +1459,21 @@ impl SessionManager {
         })
     }
 
+    fn register_acp_session(
+        &self,
+        record: SessionRecord,
+        spawn: impl FnOnce() -> Result<crate::acp::AcpSessionHandle, String>,
+    ) -> Result<(), String> {
+        // Binding/exit callbacks take this same lock. Hold it before spawning
+        // until both Start and the live handle exist, including immediate exits.
+        let mut sessions = self.lock_acp()?;
+        let handle = spawn()?;
+        let id = record.id.clone();
+        self.record_start(record);
+        sessions.insert(id, handle);
+        Ok(())
+    }
+
     fn start(
         &self,
         app: AppHandle,
@@ -1518,6 +1545,18 @@ impl SessionManager {
             let schedule_guard_exit = schedule_guard;
             let reservation_exit = reservation;
 
+            self.register_acp_session(SessionRecord {
+                id: session_id.to_string(),
+                tool_id: tool.id.to_string(),
+                tool_name: tool.name.to_string(),
+                project_path: info.project_path.clone(),
+                title: normalized_title,
+                cli_session_id: cli_session_id.clone(),
+                started_at_ms: now_ms(),
+                ended_at_ms: None,
+                exit_reason: None,
+                output_bytes: None,
+            }, || {
             let handle = crate::acp::spawn_acp_session(
                 info.clone(),
                 &binary,
@@ -1579,19 +1618,8 @@ impl SessionManager {
                 },
             )?;
             handle.emit_snapshot(&app);
-            self.lock_acp()?.insert(session_id.to_string(), handle);
-            self.record_start(SessionRecord {
-                id: session_id.to_string(),
-                tool_id: tool.id.to_string(),
-                tool_name: tool.name.to_string(),
-                project_path: info.project_path.clone(),
-                title: normalized_title,
-                cli_session_id,
-                started_at_ms: now_ms(),
-                ended_at_ms: None,
-                exit_reason: None,
-                output_bytes: None,
-            });
+            Ok(handle)
+            })?;
             return Ok(info);
         }
 
@@ -3397,6 +3425,116 @@ mod tests {
     }
 
     #[test]
+    fn acp_registration_precedes_fast_binding_and_exit_callbacks() {
+        let manager = SessionManager::default();
+        manager
+            .configure_history(history_store("acp-registration"))
+            .unwrap();
+        let info = super::SessionInfo {
+            id: "acp-registration".into(),
+            tool_id: "dsh".into(),
+            tool_name: "DSH".into(),
+            project_path: history_project(),
+            title: None,
+            cli_session_id: None,
+        };
+        let record = super::SessionRecord {
+            id: info.id.clone(),
+            tool_id: info.tool_id.clone(),
+            tool_name: info.tool_name.clone(),
+            project_path: info.project_path.clone(),
+            title: None,
+            cli_session_id: None,
+            started_at_ms: super::now_ms(),
+            ended_at_ms: None,
+            exit_reason: None,
+            output_bytes: None,
+        };
+        let sessions_bind = std::sync::Arc::clone(&manager.acp_sessions);
+        let sessions_exit = std::sync::Arc::clone(&manager.acp_sessions);
+        let history_bind = std::sync::Arc::clone(&manager.history);
+        let history_exit = std::sync::Arc::clone(&manager.history);
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        manager
+            .register_acp_session(record, || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "acp::tests::acp_process_fixture",
+                        "--ignored",
+                        "--nocapture",
+                        "--quiet",
+                    ])
+                    .env("AGENTTERM_ACP_TEST_MODE", "handshake")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped());
+                let handle = crate::acp::spawn_acp_with_command(
+                    info,
+                    command,
+                    None,
+                    None,
+                    crate::acp::AcpHooks {
+                        on_emit: Box::new(|_| {}),
+                        on_cli_session: Box::new(move |cli_id| {
+                            attempt_tx.send(()).unwrap();
+                            let mut sessions = sessions_bind.lock().unwrap();
+                            let active = sessions
+                                .get_mut("acp-registration")
+                                .expect("live record must precede binding");
+                            active.info.cli_session_id = Some(cli_id.clone());
+                            drop(sessions);
+                            history_bind
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .unwrap()
+                                .record_cli_session("acp-registration", &cli_id)
+                                .unwrap();
+                        }),
+                        on_exit: Box::new(move |reason, _, bytes| {
+                            assert!(
+                                sessions_exit
+                                    .lock()
+                                    .unwrap()
+                                    .remove("acp-registration")
+                                    .is_some()
+                            );
+                            history_exit
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .unwrap()
+                                .record_end(
+                                    "acp-registration",
+                                    super::now_ms(),
+                                    Some(reason),
+                                    Some(bytes),
+                                )
+                                .unwrap();
+                            exit_tx.send(()).unwrap();
+                        }),
+                    },
+                )?;
+                // Force the callback to reach the registration lock before spawn
+                // returns. It must wait instead of losing the binding/Start event.
+                attempt_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok(handle)
+            })
+            .unwrap();
+        exit_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(!manager.is_running("acp-registration"));
+        let records = manager.list_history().unwrap();
+        assert_eq!(records[0].cli_session_id.as_deref(), Some("sess_fixture"));
+        assert!(records[0].ended_at_ms.is_some());
+    }
+
+    #[test]
     fn explicit_stop_records_history_end() {
         let manager = SessionManager::default();
         let path = history_store("stop");
@@ -3857,6 +3995,7 @@ mod tests {
         };
         let mut skip_ids = std::collections::HashSet::new();
         skip_ids.insert("s-codex-skip".to_string());
+        let unresolved = records.clone();
         let bound = super::resolve_missing_cli_sessions(&mut records, &skip_ids, &stores);
         assert!(bound.iter().any(|(id, cid)| id == "s-agy" && cid == agy_u1));
         assert!(
@@ -3876,6 +4015,47 @@ mod tests {
         );
         assert!(!bound.iter().any(|(id, _)| id == "s-claude-empty"));
         assert!(!bound.iter().any(|(id, _)| id == "s-codex-skip"));
+
+        // B exits while A is still live. Even a single candidate must not be
+        // assigned to B when A's unbound record can also own it.
+        let closed = unresolved
+            .iter()
+            .find(|r| r.id == "s-codex")
+            .unwrap()
+            .clone();
+        let mut live = closed.clone();
+        live.id = "s-codex-live".into();
+        live.started_at_ms = t3 - 5_000;
+        live.ended_at_ms = None;
+        let mut overlapping = vec![live, closed.clone()];
+        let skip_live = std::collections::HashSet::from(["s-codex-live".to_string()]);
+        assert!(
+            super::resolve_missing_cli_sessions(&mut overlapping, &skip_live, &stores).is_empty()
+        );
+        assert!(overlapping.iter().all(|r| r.cli_session_id.is_none()));
+        // Record ordering and the exit of both tabs must not resolve ambiguity.
+        overlapping.reverse();
+        overlapping[1].ended_at_ms = Some(t3 + 30_000);
+        assert!(
+            super::resolve_missing_cli_sessions(&mut overlapping, &Default::default(), &stores)
+                .is_empty()
+        );
+
+        // Two candidates in one window are also ambiguous, even if one is closer.
+        std::fs::write(
+            codex_dir.join("rollout-2026-11-27-other.jsonl"),
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"other-codex\",\"timestamp\":\"2026-11-27T03:00:01.000Z\",\"cwd\":\"{escaped_proj}\"}}}}\n"),
+        ).unwrap();
+        let mut multiple_candidates = vec![closed];
+        assert!(
+            super::resolve_missing_cli_sessions(
+                &mut multiple_candidates,
+                &Default::default(),
+                &stores
+            )
+            .is_empty()
+        );
+        assert!(multiple_candidates[0].cli_session_id.is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }

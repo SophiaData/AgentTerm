@@ -129,8 +129,19 @@ const AcpComposer = memo(function AcpComposer({
   const promptHistoryRef = useRef<string[]>([]);
   const historyIndexRef = useRef(-1);
   const savedDraftRef = useRef("");
+  const draftRevisionRef = useRef(0);
+  const sessionEpochRef = useRef(0);
+  const sendingRef = useRef(false);
+
+  function updateDraft(value: string) {
+    draftRevisionRef.current += 1;
+    setDraft(value);
+  }
 
   useEffect(() => {
+    sessionEpochRef.current += 1;
+    sendingRef.current = false;
+    draftRevisionRef.current += 1;
     promptHistoryRef.current = [];
     historyIndexRef.current = -1;
     savedDraftRef.current = "";
@@ -270,14 +281,14 @@ const AcpComposer = memo(function AcpComposer({
   function applySlashItem(item: SlashItem) {
     setPopupDismissedKey(null);
     if (item.local === "clear") {
-      setDraft("");
+      updateDraft("");
       setCaretPos(0);
       setPendingImages([]);
       onActionError(null);
       return;
     }
     if (item.local === "stop") {
-      setDraft("");
+      updateDraft("");
       setCaretPos(0);
       if (modelBusy && running) {
         void onCancelTurn();
@@ -285,13 +296,13 @@ const AcpComposer = memo(function AcpComposer({
       return;
     }
     if (item.local === "model") {
-      setDraft("");
+      updateDraft("");
       setCaretPos(0);
       onFocusConfig();
       return;
     }
     if (item.local === "copy") {
-      setDraft("");
+      updateDraft("");
       setCaretPos(0);
       if (lastAssistantText) {
         void copyToClipboard(lastAssistantText);
@@ -301,7 +312,7 @@ const AcpComposer = memo(function AcpComposer({
       return;
     }
     const filled = `/${item.name} `;
-    setDraft(filled);
+    updateDraft(filled);
     setCaretPos(filled.length);
     inputRef.current?.focus();
   }
@@ -313,7 +324,7 @@ const AcpComposer = memo(function AcpComposer({
     const inserted = `@${filePath} `;
     const nextDraft = `${before}${inserted}${after}`;
     const nextCaret = before.length + inserted.length;
-    setDraft(nextDraft);
+    updateDraft(nextDraft);
     setCaretPos(nextCaret);
     setFileMatches([]);
     setPopupDismissedKey(null);
@@ -328,7 +339,12 @@ const AcpComposer = memo(function AcpComposer({
 
   async function submitPrompt() {
     const text = draft.trim();
-    if ((!text && pendingImages.length === 0) || !canSend) return;
+    if ((!text && pendingImages.length === 0) || !canSend || sendingRef.current)
+      return;
+    sendingRef.current = true;
+    const submittedRevision = draftRevisionRef.current;
+    const submittedEpoch = sessionEpochRef.current;
+    const submittedImageIds = new Set(pendingImages.map((image) => image.id));
     if (text) {
       const history = promptHistoryRef.current;
       if (history[history.length - 1] !== text) {
@@ -345,15 +361,22 @@ const AcpComposer = memo(function AcpComposer({
     setSending(true);
     try {
       const ok = await onSendPrompt(text, imagesToSend);
-      if (ok) {
-        setDraft("");
-        setCaretPos(0);
-        setPendingImages([]);
-        setFileMatches([]);
-        setPopupDismissedKey(null);
+      if (ok && sessionEpochRef.current === submittedEpoch) {
+        if (draftRevisionRef.current === submittedRevision) {
+          updateDraft("");
+          setCaretPos(0);
+          setFileMatches([]);
+          setPopupDismissedKey(null);
+        }
+        setPendingImages((images) =>
+          images.filter((image) => !submittedImageIds.has(image.id)),
+        );
       }
     } finally {
-      setSending(false);
+      if (sessionEpochRef.current === submittedEpoch) {
+        sendingRef.current = false;
+        setSending(false);
+      }
     }
   }
 
@@ -449,7 +472,7 @@ const AcpComposer = memo(function AcpComposer({
       } else if (historyIndexRef.current > 0) {
         historyIndexRef.current -= 1;
       }
-      setDraft(history[historyIndexRef.current] ?? "");
+      updateDraft(history[historyIndexRef.current] ?? "");
     } else if (
       event.key === "ArrowDown" &&
       !event.shiftKey &&
@@ -463,10 +486,10 @@ const AcpComposer = memo(function AcpComposer({
       event.preventDefault();
       if (historyIndexRef.current < history.length - 1) {
         historyIndexRef.current += 1;
-        setDraft(history[historyIndexRef.current] ?? "");
+        updateDraft(history[historyIndexRef.current] ?? "");
       } else {
         historyIndexRef.current = -1;
-        setDraft(savedDraftRef.current);
+        updateDraft(savedDraftRef.current);
       }
     }
   }
@@ -590,7 +613,7 @@ const AcpComposer = memo(function AcpComposer({
           disabled={!running || phase !== "ready" || busy}
           onChange={(event) => {
             const nextVal = event.target.value;
-            setDraft(nextVal);
+            updateDraft(nextVal);
             setCaretPos(event.target.selectionStart ?? nextVal.length);
             setPopupIndex(0);
             setPopupDismissedKey(null);
