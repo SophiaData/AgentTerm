@@ -1,4 +1,5 @@
 mod acp;
+pub mod dispatch_bridge;
 mod journal;
 mod project_files;
 mod projects;
@@ -55,6 +56,7 @@ pub fn run() {
         .manage(schedule_mcp::ScheduleMcp::default())
         .manage(updates::UpdateManager::default())
         .invoke_handler(tauri::generate_handler![
+            dispatch_bridge::open_dispatch_dashboard,
             tools::detect_tools,
             projects::list_projects,
             projects::add_project,

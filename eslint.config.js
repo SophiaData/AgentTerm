@@ -13,4 +13,26 @@ export default tseslint.config(
       sourceType: "module",
     },
   },
+  {
+    files: ["services/dispatch/**/*.{js,mjs}"],
+    extends: [js.configs.recommended],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: {
+        process: "readonly",
+        console: "readonly",
+        Buffer: "readonly",
+        URL: "readonly",
+        fetch: "readonly",
+        AbortSignal: "readonly",
+        AbortController: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        document: "readonly",
+      },
+    },
+  },
 );
