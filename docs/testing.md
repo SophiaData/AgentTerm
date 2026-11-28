@@ -1,5 +1,28 @@
 # Testing policy
 
+## 2026-11-28 · DSH 派发 AgentTerm 真实面板修复
+
+用户确认方案后，任务 `665b50ea-0b7c-4eb9-a14a-387c3d728117` 从 proposed 进入执行，
+基线 `865d909ccad98156e82dc85e2cf8f37bbe3cd038`。真实 Codex 在独立 clone 只修改
+`services/dispatch/dashboard.js`、`src/DshDispatchDashboard.test.ts`，提交
+`09e45533bcdb5bee0e65c36c3809615c3a0f8b7c`；主分支工作树接入为 `7f65835`，
+随后仅调整测试断言折行并补交付记录。PR #105 尚未合并。
+
+- 固定外部验收先在基线得到 2 failed / 1 passed，修复后 3/3 passed；覆盖汇总与交付证据共存、
+  失败原因保留、无汇总显示、防 HTML 注入与验收结果摘要绑定。该验收脚本不在执行允许修改范围内。
+- 仓库面板回归 8/8 passed（单 worker），TypeScript、定向 ESLint 通过；初次格式检查发现一处折行，
+  主代理只修该格式。完整质量门以 [PR #105](https://github.com/SophiaData/AgentTerm/pull/105) 最新检查为准。
+- 共享浏览器读取真实任务面板：同时存在“DSH 汇总”“原始执行结果”，完整 commit、workspace、
+  验收命令与原始结果 JSON 均可读，原始文本与接口 result 一致；没有点击最终验收按钮。
+- attemptId `685c6588-b051-4d1f-af8e-5528c46de068`；进程证据中 Codex 只启动一次，交付 clone 干净。
+  worker 已停止，任务仍为 awaiting_review，主任务占用保留，等待用户确认。
+- DSH 已保存汇总，但把“一条验收命令”误称“一条测试”，也对独立 clone 路径提出不必要疑问；
+  程序证据和本节明确 3 个固定用例，人工可同时查看原始结果。本轮不扩展修改协调提示词。
+- 运行证据：`E:/AgentTerm-dispatch/agentterm-pilot-20261128/run-evidence.json`；固定检查输出在同目录
+  `fixed-check-output.txt`。本次按用户更新后的 D2 顺序进行只读复核，结果随 PR 正文记录。
+
+本轮未改全局模型/权限配置、未发布或安装；成功执行不代替用户最终验收和代码合并授权。
+
 ## 2026-11-28 · DSH 本机协调第一阶段
 
 协调者 DSH 使用 DeepSeek，Codex 按用户本轮授权使用账号默认模型；未修改全局模型配置。

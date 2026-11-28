@@ -193,7 +193,9 @@ it("keeps acceptance bound to the displayed result hash after summary and result
   const { fetch, poll } = await renderResultTask(task);
   task.summary = "DSH：交付完成，等待验收";
   await poll();
-  expect(document.querySelector("article")?.textContent).toContain(task.summary);
+  expect(document.querySelector("article")?.textContent).toContain(
+    task.summary,
+  );
   expect(document.querySelector("article pre:last-of-type")?.textContent).toBe(
     JSON.stringify(completedResult, null, 2),
   );
