@@ -5,7 +5,7 @@
 用户确认方案后，任务 `665b50ea-0b7c-4eb9-a14a-387c3d728117` 从 proposed 进入执行，
 基线 `865d909ccad98156e82dc85e2cf8f37bbe3cd038`。真实 Codex 在独立 clone 只修改
 `services/dispatch/dashboard.js`、`src/DshDispatchDashboard.test.ts`，提交
-`09e45533bcdb5bee0e65c36c3809615c3a0f8b7c`；主分支工作树接入为 `7f65835`，
+`09e45533bcdb5bee0e65c36c3809615c3a0f8b7c`；PR 分支工作树接入为 `7f65835`，
 随后仅调整测试断言折行并补交付记录。PR #105 尚未合并。
 
 - 固定外部验收先在基线得到 2 failed / 1 passed，修复后 3/3 passed；覆盖汇总与交付证据共存、
