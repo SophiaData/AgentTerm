@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { TaskStore, WorkerStore, projectFingerprint } from "./store.mjs";
 import { startServer, client } from "./server.mjs";
 import { Worker, executeTask, workerLock } from "./worker.mjs";
-import { run, askDsh } from "./process.mjs";
+import { run, askDsh, standaloneEnvironment } from "./process.mjs";
 import { coordinate, watch } from "./coordinator.mjs";
 
 const fixtureRoot = fileURLToPath(new URL("./fixtures/", import.meta.url));
@@ -44,6 +44,23 @@ function result() {
   };
 }
 const projects = { demo: { repository: "/synthetic" } };
+
+test("独立 CLI 不继承桌面会话 IPC，模型和工作目录沙箱仍保留", () => {
+  const input = {
+    CODEX_WINDOWS_REGISTERED_CORE: "desktop-fixture",
+    CODEX_APP_TOOLS_PIPE_PATH: "fixture-pipe",
+    CODEX_THREAD_ID: "fixture-thread",
+    CODEX_HOME: "fixture-profile",
+    CODEX_PERMISSION_PROFILE: "workspace",
+    PATH: "fixture-path",
+  };
+  assert.deepEqual(standaloneEnvironment(input), {
+    CODEX_HOME: "fixture-profile",
+    CODEX_PERMISSION_PROFILE: "workspace",
+    PATH: "fixture-path",
+  });
+  assert.equal(input.CODEX_THREAD_ID, "fixture-thread");
+});
 
 test("任务建议幂等、人工确认绑定摘要，离线队列跨服务重启保存", () => {
   const file = join(root(), "server.sqlite");
@@ -518,6 +535,14 @@ test("真实 Git 独立目录、执行器完成事件与验收结果绑定提交
   const bridge = async (_, action, request) => {
     assert.equal(action, "exec");
     const isAgent = request.binary === "fixture-agent";
+    if (isAgent) {
+      assert.equal(
+        request.args[request.args.indexOf("--sandbox") + 1],
+        "workspace-write",
+      );
+      if (process.platform === "win32")
+        assert.ok(request.args.includes('windows.sandbox="unelevated"'));
+    }
     const response = await run(
       isAgent ? process.execPath : request.binary,
       isAgent ? [join(fixtureRoot, "executor.mjs")] : request.args,

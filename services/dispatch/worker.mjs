@@ -41,6 +41,11 @@ export function validateProject(config) {
     "执行模型名称无效",
   );
   demand(
+    config.windowsSandbox === undefined ||
+      ["unelevated", "elevated"].includes(config.windowsSandbox),
+    "Windows 沙箱模式无效",
+  );
+  demand(
     Array.isArray(config.allowedPaths) && config.allowedPaths.length > 0,
     "需要登记允许修改的相对路径",
   );
@@ -106,7 +111,13 @@ export async function executeTask(task, config, bridge) {
       timeoutSeconds: 300,
     });
     if (!result.ok) {
-      const error = new Error(`执行未通过：${result.reason}`);
+      const stage =
+        program === config.codex
+          ? "Codex"
+          : program === config.git
+            ? "Git"
+            : "验收";
+      const error = new Error(`${stage}执行未通过：${result.reason}`);
       error.uncertain = result.reason !== "NonZero";
       throw error;
     }
@@ -157,6 +168,9 @@ export async function executeTask(task, config, bridge) {
         : []),
       "--sandbox",
       "workspace-write",
+      ...(process.platform === "win32"
+        ? ["-c", `windows.sandbox="${config.windowsSandbox || "unelevated"}"`]
+        : []),
       "-c",
       'approval_policy="never"',
       "-C",

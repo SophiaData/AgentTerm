@@ -11,6 +11,7 @@
       "git": "C:/Program Files/Git/cmd/git.exe",
       "codex": "E:/YOUR_NATIVE_CODEX_PATH/codex.exe",
       "model": "default",
+      "windowsSandbox": "unelevated",
       "allowedPaths": ["src/", "test/"],
       "checks": [
         {

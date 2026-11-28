@@ -10,6 +10,10 @@ const labels = {
   abandoned: "已放弃，记录保留",
 };
 let busy = false;
+let displayed = "";
+const disconnected = (task) =>
+  ["assigned", "running"].includes(task.state) &&
+  Date.now() - task.heartbeatAt > 30000;
 async function refresh() {
   if (busy) return;
   busy = true;
@@ -17,6 +21,19 @@ async function refresh() {
     const response = await fetch("/v1/tasks");
     if (!response.ok) throw new Error("无法读取任务");
     const { tasks } = await response.json();
+    const version = JSON.stringify(
+      tasks.map((task) => [
+        task.id,
+        task.specHash,
+        task.state,
+        task.resultHash,
+        task.summary,
+        disconnected(task),
+      ]),
+    );
+    document.getElementById("error").textContent = "";
+    if (displayed === version) return;
+    displayed = version;
     const main = document.getElementById("tasks");
     main.replaceChildren();
     if (!tasks.length)
@@ -27,10 +44,7 @@ async function refresh() {
       title.textContent = task.goal;
       const status = document.createElement("p");
       status.textContent = labels[task.state] || task.state;
-      if (
-        ["assigned", "running"].includes(task.state) &&
-        Date.now() - task.heartbeatAt > 30000
-      ) {
+      if (disconnected(task)) {
         status.textContent += " · 本机暂时失联，保留原任务，不重复派发";
       }
       const plan = document.createElement("pre");

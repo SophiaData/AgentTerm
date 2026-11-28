@@ -57,6 +57,7 @@ export function nativeBridge(binary) {
   return async (task, action, details = {}) => {
     try {
       const result = await run(binary, [], {
+        env: standaloneEnvironment(),
         input: JSON.stringify({
           action,
           taskId: task.id,
@@ -72,6 +73,27 @@ export function nativeBridge(binary) {
       throw error;
     }
   };
+}
+export function standaloneEnvironment(source = process.env) {
+  const env = { ...source };
+  // The standalone npm CLI and native companion do not have the desktop app's
+  // MSIX identity or tool broker. Do not inherit another session's private IPC.
+  // Model/auth/proxy variables stay intact; workspace sandbox is explicit.
+  for (const key of [
+    "CODEX_WINDOWS_REGISTERED_CORE",
+    "CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY",
+    "CODEX_APP_TOOLS_PIPE_PATH",
+    "CODEX_APP_RUNTIME_CLI_PATH",
+    "CODEX_TECTONIC_PATH",
+    "CODEX_MCP_NODE_PATH",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "CODEX_TOOL_CALL_ID",
+    "CODEX_TASK_WORKSPACE_VERIFYING_IDENTITY",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+  ])
+    delete env[key];
+  return env;
 }
 export function dshCommand(binary) {
   demand(isAbsolute(binary) && existsSync(binary), "DSH 可执行路径无效");

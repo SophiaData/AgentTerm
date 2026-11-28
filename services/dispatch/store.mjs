@@ -29,6 +29,7 @@ export function projectFingerprint(config) {
         "git",
         "codex",
         "model",
+        "windowsSandbox",
         "allowedPaths",
         "checks",
       ].map((key) => [key, config[key] ?? null]),

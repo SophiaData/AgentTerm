@@ -3,13 +3,28 @@
 ## 2026-11-28 · DSH 本机协调第一阶段
 
 协调者 DSH 使用 DeepSeek，Codex 按用户本轮授权使用账号默认模型；未修改全局模型配置。
-Node 定向回归 16/16 通过（单线程）：持久队列、双连接互斥、一次性许可、回执丢失补传、
+Node 定向回归 17/17 通过（单线程）：独立 CLI 环境、持久队列、双连接互斥、一次性许可、回执丢失补传、
 执行端重启、结果版本、原生停止门禁接口、ACP 夹具与真实 Git 隔离交付。
 真实 Git 用例同时验证失败验收、配置变更拒绝、验收篡改工作区拒绝及源仓库不变。
 临时把服务端启动许可改成可重复发放后，对应回归因 `true !== false` 失败；恢复后通过。
 前端入口定向 1 passed、TypeScript、ESLint、Rust fmt、模板验证与 diff 检查已通过。
-DSH 真实 ACP 连通通过；Codex 默认模型在只读合成探针中返回 `turn.completed`。
-这两项仅为连通证据；完整原生链路、Rust 构建及三端质量门当前待 GitHub 检查。
+应用初版 `8659ad3` 的 [三端质量门 46106595030](https://github.com/SophiaData/AgentTerm/actions/runs/46106595030)
+全部通过 16 项检查；后端 Windows/macOS/Linux 254/256/257 passed、各 4 ignored（既有子进程入口），TUI 18/20/20。
+Windows 原生组件 SHA-256 `cc7ead726f67fe2e894bb0dc3861449741b064e380a24e0b5cbf586b34c1337a`。
+随后实机发现独立 Codex 未启用 Windows 沙箱后端时降为只读，继承桌面 IPC 又导致 Core 包身份错误；
+单次配置 unelevated 并隔离桌面环境后真实写入成功，未修改全局配置、模型或关闭沙箱。
+最终补丁三端检查以 [PR #105](https://github.com/SophiaData/AgentTerm/pull/105) 当前提交为准。
+
+Windows 完整合成验收（Node 24.18.0 / Codex CLI 0.172.0 / DSH DeepSeek）：
+
+- 首轮失败被固定断言捕获；DSH 汇报失败，停止 worker 后核对原生停止记录，人工测试入口放弃，保留失败结果。
+- 第二轮任务 `5506da24-b189-42f3-81b3-864cbc83da6b`：DSH 建议→面板按钮事件确认→真实 Codex→提交 `6236064359c63406aadafddb7f6c9e4d25826e8e`→固定验收。
+- 基线 `76b5c63db3d0beda6eef10f95065f0b9ffd53f31`；变更仅 `src/value.txt`，内容字节 `646f6e650a`，提交与工作区核对一致且干净。
+- 执行中关闭任务服务，执行端先存 `finished / delivered=0`；恢复后 `delivered=1`，attemptId 仍为 `ba35a0db-36c3-4707-8e30-c76f32070994`，进程身份记录中 Codex 启动次数为 1。
+- DSH 汇总保存后，通过页面按钮事件确认合成任务，最终 accepted，主任务账本回到 idle。运行证据在 `E:/AgentTerm-dispatch/acceptance-20261128/acceptance-evidence.json`。
+- 共享浏览器后台标签的普通点击等待稳定超时，实际用按钮 DOM 事件完成；不把此项写成物理点击或完整桌面交互通过。刷新保留原按钮避免焦点丢失，新增对应 DOM 回归。
+
+用户真实项目、长任务、远程认证/服务器部署、开机自启、前后端多 Agent 与三轮返工仍不在本阶段验收范围。
 主代理按仓库规则串行自审，未调用独立评审代理，不记录独立 cc PASS。
 
 ## 2026-11-28 · PR #103 复审修复
