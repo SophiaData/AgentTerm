@@ -4,7 +4,7 @@ import { isAcpTool } from "../acp/types";
 import { displayPath } from "../projects/displayPath";
 import TerminalView from "./TerminalView";
 import { SESSION_TITLE_MAX_CHARS, normalizeManualTitle } from "./sessionNaming";
-import { sessionTitle, type SessionInfo } from "./types";
+import { agentBadgeLabel, sessionTitle, type SessionInfo } from "./types";
 import type { ThemeId } from "../theme";
 import type { RenameResult } from "./useLauncher";
 import { activityLabel, type SessionActivity } from "./useSessionActivity";
@@ -146,6 +146,13 @@ export default function SessionPanel({
               {label}
             </button>
           )}
+          <span
+            className="session-agent-tag"
+            data-agent={session.toolId}
+            title={session.toolName}
+          >
+            {agentBadgeLabel(session.toolId, session.toolName)}
+          </span>
           <span
             className={`badge ${
               !running

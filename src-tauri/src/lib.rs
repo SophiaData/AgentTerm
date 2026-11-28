@@ -76,6 +76,8 @@ pub fn run() {
             acp::acp_send_prompt,
             acp::acp_cancel_turn,
             acp::acp_respond_permission,
+            acp::acp_set_config_option,
+            acp::acp_search_project_files,
             task_commands::task_ledger_initialize,
             task_commands::task_ledger_snapshot,
             task_commands::claim_main_task,

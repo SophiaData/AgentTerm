@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -30,6 +31,7 @@ import {
   recentClosedHistory,
 } from "./terminal/sessionHistory";
 import { useLauncher, type ActiveSession } from "./terminal/useLauncher";
+import { agentBadgeLabel } from "./terminal/types";
 import {
   activityLabel,
   useSessionActivity,
@@ -144,6 +146,7 @@ export default function App() {
     useState<PreparedUpdateStatus | null>(null);
   const [restoringUpdates, setRestoringUpdates] = useState(false);
   const [taskNotice, setTaskNotice] = useState<string | null>(null);
+  const [historyExpanded, setHistoryExpanded] = useState(false);
   const activity = useSessionActivity(launcher.sessions);
   const [draft, setDraft] = useState(emptyPlan);
   const selectedProject =
@@ -156,12 +159,31 @@ export default function App() {
     ? projects.projects.find((p) => p.path === currentSession.info.projectPath)
     : selectedProject;
   const projectBusy = projects.loading || projects.busy || launcher.busy;
-  const activeSessionIds = new Set(launcher.sessions.map((s) => s.info.id));
-  const recentHistory = recentClosedHistory(history.records, activeSessionIds);
-  const runningCount = launcher.sessions.filter(
-    (s) => s.running && !s.statusUnknown,
-  ).length;
-  const unknownCount = launcher.sessions.filter((s) => s.statusUnknown).length;
+  const activeSessionIds = useMemo(
+    () => new Set(launcher.sessions.map((s) => s.info.id)),
+    [launcher.sessions],
+  );
+  const closedHistory = useMemo(
+    () =>
+      recentClosedHistory(
+        history.records,
+        activeSessionIds,
+        history.records.length,
+      ),
+    [history.records, activeSessionIds],
+  );
+  const recentHistory = useMemo(
+    () => (historyExpanded ? closedHistory : closedHistory.slice(0, 20)),
+    [historyExpanded, closedHistory],
+  );
+  const runningCount = useMemo(
+    () => launcher.sessions.filter((s) => s.running && !s.statusUnknown).length,
+    [launcher.sessions],
+  );
+  const unknownCount = useMemo(
+    () => launcher.sessions.filter((s) => s.statusUnknown).length,
+    [launcher.sessions],
+  );
   const hasSidePanel =
     recordsOpen || scheduleOpen || (filesOpen && !!fileProject);
   const historyReloaded = useRef(false);
@@ -433,8 +455,8 @@ export default function App() {
     if (existingProject) setProjectId(existingProject.id);
     const started = await launcher.start(project, tool, {
       resume,
-      cliSessionId: item.cliSessionId ?? undefined,
-      title: item.title ?? undefined,
+      cliSessionId: resume ? (item.cliSessionId ?? undefined) : undefined,
+      title: resume ? (item.title ?? undefined) : undefined,
     });
     if (started) {
       await updateRecovery.consumeSession(item.id);
@@ -492,7 +514,14 @@ export default function App() {
         title={displayPath(session.info.projectPath)}
       >
         <span className={`session-dot${dotClass}`} aria-hidden="true" />
-        <span>{session.label}</span>
+        <span
+          className="session-agent-tag"
+          data-agent={session.info.toolId}
+          title={session.info.toolName}
+        >
+          {agentBadgeLabel(session.info.toolId, session.info.toolName)}
+        </span>
+        <span className="workspace-session-label">{session.label}</span>
         <small>
           {activityLabel(state, session.running, session.statusUnknown)}
         </small>
@@ -1003,6 +1032,16 @@ export default function App() {
                     }`}
                     aria-hidden="true"
                   />
+                  <span
+                    className="session-agent-tag"
+                    data-agent={session.info.toolId}
+                    title={session.info.toolName}
+                  >
+                    {agentBadgeLabel(
+                      session.info.toolId,
+                      session.info.toolName,
+                    )}
+                  </span>
                   <span className="workspace-tab-label">{session.label}</span>
                   {session.running &&
                   !session.statusUnknown &&
@@ -1376,7 +1415,20 @@ export default function App() {
                 <section className="workspace-history" aria-label="最近会话">
                   <div className="workspace-history-heading">
                     <h2>最近会话</h2>
-                    <span>按原项目与工具新开</span>
+                    <div className="workspace-history-heading-actions">
+                      <span>按原项目与工具新开</span>
+                      {closedHistory.length > 20 ? (
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          onClick={() => setHistoryExpanded((open) => !open)}
+                        >
+                          {historyExpanded
+                            ? "收起"
+                            : `展开全部（${closedHistory.length}）`}
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
                   {history.error ? (
                     <div className="workspace-history-error">
@@ -1415,7 +1467,19 @@ export default function App() {
                               className="workspace-history-item"
                             >
                               <div className="workspace-history-meta">
-                                <strong>{historyDisplayTitle(record)}</strong>
+                                <div className="workspace-history-title-row">
+                                  <span
+                                    className="session-agent-tag"
+                                    data-agent={record.toolId}
+                                    title={record.toolName}
+                                  >
+                                    {agentBadgeLabel(
+                                      record.toolId,
+                                      record.toolName,
+                                    )}
+                                  </span>
+                                  <strong>{historyDisplayTitle(record)}</strong>
+                                </div>
                                 <span title={displayPath(record.projectPath)}>
                                   {historySubtitleText(record)}
                                 </span>
@@ -1433,15 +1497,11 @@ export default function App() {
                                       launcher.busy ||
                                       tools.loading ||
                                       !reopenTool ||
-                                      (resume &&
-                                        record.toolId === "dsh" &&
-                                        !record.cliSessionId)
+                                      (resume && !record.cliSessionId)
                                     }
                                     title={
-                                      resume &&
-                                      record.toolId === "dsh" &&
-                                      !record.cliSessionId
-                                        ? "该 ACP 会话未生成可恢复标识"
+                                      resume && !record.cliSessionId
+                                        ? "该会话未记录可恢复标识，可使用右侧「再次打开」"
                                         : reasonTitle
                                     }
                                     onClick={() => {

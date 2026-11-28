@@ -51,7 +51,7 @@ export function formatSessionTime(timestampMs: number): string {
 export function recentClosedHistory(
   records: SessionHistoryRecord[],
   activeSessionIds: ReadonlySet<string>,
-  limit = 5,
+  limit = 20,
 ): SessionHistoryRecord[] {
   return records
     .filter((record) => !activeSessionIds.has(record.id))

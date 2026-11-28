@@ -31,6 +31,12 @@ const mocks = vi.hoisted(() => ({
     loadAddon: vi.fn(),
     dispose: vi.fn(),
     scrollToBottom: vi.fn(),
+    scrollLines: vi.fn(),
+    refresh: vi.fn(),
+    buffer: { active: { viewportY: 12, baseY: 20 } },
+    onScroll: vi.fn<(cb: () => void) => { dispose: () => void }>(() => ({
+      dispose: vi.fn(),
+    })),
     onData: vi.fn<(cb: (text: string) => void) => { dispose: () => void }>(
       () => ({ dispose: vi.fn() }),
     ),
@@ -79,6 +85,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.initOptions = null;
   mocks.terminal.options = { disableStdin: true };
+  mocks.terminal.buffer = { active: { viewportY: 20, baseY: 20 } };
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -103,37 +110,47 @@ afterEach(() => {
 });
 
 describe("terminal clipboard wiring", () => {
-  it("connects the copy/paste buttons and xterm key handler to native clipboard", async () => {
+  const sendKey = (
+    handler: (event: KeyboardEvent) => boolean,
+    key: string,
+    init: KeyboardEventInit = {},
+  ) =>
+    handler(
+      new KeyboardEvent("keydown", {
+        key,
+        cancelable: true,
+        ...init,
+      }),
+    );
+
+  it("connects the xterm key handler to native clipboard without redundant toolbar buttons", async () => {
     render(<TerminalView {...props} />);
     await waitFor(() =>
       expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce(),
     );
+    expect(screen.queryByRole("button", { name: "简洁模式" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "复制" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "粘贴" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "输入终端" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "回到底部" })).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+
     expect(mocks.readText).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "复制" }));
+    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+      .calls[0][0] as (event: KeyboardEvent) => boolean;
+    expect(sendKey(handler, "c", { ctrlKey: true })).toBe(false);
     await waitFor(() =>
       expect(mocks.writeText).toHaveBeenCalledExactlyOnceWith("合成选中文字"),
     );
-    fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+    expect(sendKey(handler, "v", { ctrlKey: true })).toBe(false);
     await waitFor(() =>
       expect(mocks.terminal.paste).toHaveBeenCalledExactlyOnceWith(
         "合成粘贴文本\n第二行",
       ),
     );
-    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
-      .calls[0][0] as (event: KeyboardEvent) => boolean;
-    expect(
-      handler(
-        new KeyboardEvent("keydown", {
-          key: "v",
-          ctrlKey: true,
-          cancelable: true,
-        }),
-      ),
-    ).toBe(false);
-    await waitFor(() => expect(mocks.terminal.paste).toHaveBeenCalledTimes(2));
   });
 
-  it("keeps copy available after exit while disabling paste", async () => {
+  it("keeps copy available after exit while ignoring paste", async () => {
     vi.mocked(connectSession).mockImplementation((_id, _bridge, callbacks) => {
       callbacks.phase("exited", null);
       return { send: vi.fn(), dispose: vi.fn(), ready: Promise.resolve() };
@@ -142,11 +159,10 @@ describe("terminal clipboard wiring", () => {
     await waitFor(() =>
       expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce(),
     );
-    expect(
-      (screen.getByRole("button", { name: "粘贴" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: "复制" }));
+    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+      .calls[0][0] as (event: KeyboardEvent) => boolean;
+    expect(sendKey(handler, "v", { ctrlKey: true })).toBe(false);
+    expect(sendKey(handler, "c", { ctrlKey: true })).toBe(false);
     await waitFor(() => expect(mocks.writeText).toHaveBeenCalledOnce());
     expect(mocks.readText).not.toHaveBeenCalled();
   });
@@ -157,7 +173,9 @@ describe("terminal clipboard wiring", () => {
     await waitFor(() =>
       expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce(),
     );
-    fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+      .calls[0][0] as (event: KeyboardEvent) => boolean;
+    sendKey(handler, "v", { ctrlKey: true });
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("粘贴失败");
     fireEvent.click(screen.getByRole("button", { name: "关闭" }));
@@ -168,7 +186,9 @@ describe("terminal clipboard wiring", () => {
     mocks.readText.mockRejectedValueOnce(new Error("no text"));
     render(<TerminalView {...props} />);
     await waitFor(() => expect(mocks.terminal.onData).toHaveBeenCalledOnce());
-    fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+    const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+      .calls[0][0] as (event: KeyboardEvent) => boolean;
+    sendKey(handler, "v", { ctrlKey: true });
     await screen.findByRole("alert");
     const onDataHandler = mocks.terminal.onData.mock.calls[0][0] as (
       text: string,
@@ -188,8 +208,10 @@ describe("terminal clipboard wiring", () => {
         await Promise.resolve();
       });
       expect(mocks.terminal.attachCustomKeyEventHandler).toHaveBeenCalledOnce();
+      const handler = mocks.terminal.attachCustomKeyEventHandler.mock
+        .calls[0][0] as (event: KeyboardEvent) => boolean;
       await act(async () => {
-        fireEvent.click(screen.getByRole("button", { name: "粘贴" }));
+        sendKey(handler, "v", { ctrlKey: true });
         await Promise.resolve();
       });
       expect(screen.getByRole("alert").textContent).toContain("粘贴失败");
@@ -214,5 +236,62 @@ describe("terminal clipboard wiring", () => {
       ),
     );
     expect(connectSession).toHaveBeenCalledOnce();
+  });
+
+  it("forces buffer, DOM viewport, and refresh to bottom on button click and tab reveal", async () => {
+    const rafQueue: FrameRequestCallback[] = [];
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((cb: FrameRequestCallback) => {
+        rafQueue.push(cb);
+        return rafQueue.length;
+      }),
+    );
+    const flushRaf = () => {
+      let guard = 0;
+      while (rafQueue.length > 0 && guard < 10) {
+        guard += 1;
+        const batch = rafQueue.splice(0, rafQueue.length);
+        for (const cb of batch) cb(0);
+      }
+    };
+
+    mocks.terminal.buffer = { active: { viewportY: 5, baseY: 18 } };
+    const { container, rerender } = render(
+      <TerminalView {...props} visible={false} />,
+    );
+    await waitFor(() => expect(mocks.terminal.onScroll).toHaveBeenCalledOnce());
+    flushRaf();
+
+    const host = container.querySelector(".terminal-host")!;
+    const viewport = document.createElement("div");
+    viewport.className = "xterm-viewport";
+    Object.defineProperty(viewport, "scrollHeight", {
+      value: 480,
+      configurable: true,
+    });
+    viewport.scrollTop = 40;
+    host.appendChild(viewport);
+
+    fireEvent.click(screen.getByRole("button", { name: "回到底部" }));
+    expect(mocks.terminal.scrollLines).toHaveBeenCalledWith(13);
+    expect(mocks.terminal.scrollToBottom).toHaveBeenCalled();
+    expect(viewport.scrollTop).toBe(480);
+    expect(screen.queryByRole("button", { name: "回到底部" })).toBeNull();
+
+    mocks.terminal.refresh.mockClear();
+    mocks.terminal.scrollLines.mockClear();
+    mocks.terminal.scrollToBottom.mockClear();
+    mocks.terminal.buffer = { active: { viewportY: 5, baseY: 18 } };
+    viewport.scrollTop = 10;
+
+    rerender(<TerminalView {...props} visible={true} />);
+    await waitFor(() => expect(rafQueue.length).toBeGreaterThan(0));
+    flushRaf();
+
+    expect(mocks.terminal.scrollLines).toHaveBeenCalledWith(13);
+    expect(mocks.terminal.scrollToBottom).toHaveBeenCalled();
+    expect(mocks.terminal.refresh).toHaveBeenCalled();
+    expect(viewport.scrollTop).toBe(480);
   });
 });

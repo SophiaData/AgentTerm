@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::session_history::{
-    SessionHistory, SessionRecord, is_valid_cli_session_id, normalize_session_title, now_ms,
+    SessionHistory, SessionRecord, is_valid_cli_session_id, is_valid_uuid, normalize_session_title,
+    now_ms,
 };
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -383,24 +384,435 @@ fn build_tool_launch_args(
         }
         "codex" => {
             if resume {
-                let mut args = vec!["resume".to_string(), "--last".to_string()];
+                let mut args = if let Some(id) = cli_session_id {
+                    vec!["resume".to_string(), id.to_string()]
+                } else {
+                    vec!["resume".to_string(), "--last".to_string()]
+                };
                 args.extend(bridge_args);
-                Ok((None, args))
+                Ok((cli_session_id.map(str::to_string), args))
             } else {
                 Ok((None, bridge_args))
             }
         }
         "agy" => {
             if resume {
-                let mut args = vec!["--continue".to_string()];
+                let mut args = if let Some(id) = cli_session_id {
+                    vec!["--resume".to_string(), id.to_string()]
+                } else {
+                    vec!["--continue".to_string()]
+                };
                 args.extend(bridge_args);
-                Ok((None, args))
+                Ok((cli_session_id.map(str::to_string), args))
             } else {
                 Ok((None, bridge_args))
             }
         }
         "dsh" => Ok((cli_session_id.map(str::to_string), bridge_args)),
         _ => Err(format!("不支持的工具：{tool_id}")),
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CliSessionStores {
+    pub claude_projects_dir: Option<PathBuf>,
+    pub codex_sessions_dir: Option<PathBuf>,
+    pub agy_history_jsonl: Option<PathBuf>,
+}
+
+impl CliSessionStores {
+    pub fn from_env() -> Self {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
+        match home {
+            Some(root) => Self {
+                claude_projects_dir: Some(root.join(".claude").join("projects")),
+                codex_sessions_dir: Some(root.join(".codex").join("sessions")),
+                agy_history_jsonl: Some(
+                    root.join(".gemini")
+                        .join("antigravity-cli")
+                        .join("history.jsonl"),
+                ),
+            },
+            None => Self::default(),
+        }
+    }
+}
+
+fn normalize_comparable_path(path: &str) -> String {
+    let stripped = strip_windows_verbatim(std::path::Path::new(path));
+    let mut text = stripped.to_string_lossy().replace('/', "\\");
+    while text.len() > 3 && text.ends_with('\\') {
+        text.pop();
+    }
+    if !cfg!(windows) {
+        text = stripped.to_string_lossy().trim_end_matches('/').to_string();
+        if text.is_empty() && stripped.as_os_str() == "/" {
+            text = "/".to_string();
+        }
+    } else {
+        text = text.to_ascii_lowercase();
+    }
+    text
+}
+
+fn encode_claude_project_dir(project_path: &str) -> String {
+    let clean = strip_windows_verbatim(std::path::Path::new(project_path));
+    clean
+        .to_string_lossy()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn parse_rfc3339_ms(raw: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .and_then(|dt| u64::try_from(dt.timestamp_millis()).ok())
+}
+
+fn system_time_ms(time: std::time::SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_millis() as u64)
+}
+
+fn read_claude_session_candidates(
+    claude_projects_dir: &std::path::Path,
+    project_path: &str,
+) -> Vec<(String, u64)> {
+    let encoded = encode_claude_project_dir(project_path);
+    let project_dir = claude_projects_dir.join(encoded);
+    let Ok(entries) = std::fs::read_dir(project_dir) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_valid_uuid(stem) {
+            continue;
+        }
+        let mut timestamp_ms = None;
+        if let Ok(file) = std::fs::File::open(&path) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().take(20).map_while(Result::ok) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                    && let Some(ts) = value.get("timestamp").and_then(|v| v.as_str())
+                    && let Some(ms) = parse_rfc3339_ms(ts)
+                {
+                    timestamp_ms = Some(ms);
+                    break;
+                }
+            }
+        }
+        if timestamp_ms.is_none()
+            && let Ok(meta) = entry.metadata()
+        {
+            timestamp_ms = meta
+                .created()
+                .ok()
+                .and_then(system_time_ms)
+                .or_else(|| meta.modified().ok().and_then(system_time_ms));
+        }
+        if let Some(ms) = timestamp_ms {
+            candidates.push((stem.to_string(), ms));
+        }
+    }
+    candidates
+}
+
+fn collect_codex_files(
+    dir: &std::path::Path,
+    depth: usize,
+    min_modified_ms: Option<u64>,
+    out: &mut Vec<PathBuf>,
+) {
+    const MAX_CODEX_FILES: usize = 2000;
+    if depth > 4 || out.len() >= MAX_CODEX_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_CODEX_FILES {
+            break;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codex_files(&path, depth + 1, min_modified_ms, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            if let Some(min_ms) = min_modified_ms
+                && let Ok(meta) = entry.metadata()
+                && let Ok(modified) = meta.modified()
+                && let Some(mod_ms) = system_time_ms(modified)
+                && mod_ms < min_ms
+            {
+                continue;
+            }
+            out.push(path);
+        }
+    }
+}
+
+fn read_codex_session_candidates(
+    codex_sessions_dir: &std::path::Path,
+    min_modified_ms: Option<u64>,
+) -> Vec<(String, String, u64)> {
+    let mut files = Vec::new();
+    collect_codex_files(codex_sessions_dir, 0, min_modified_ms, &mut files);
+    let mut candidates = Vec::new();
+    for path in files {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut first_line = String::new();
+        if BufReader::new(file.take(64 * 1024))
+            .read_line(&mut first_line)
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&first_line) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let Some(id) = payload.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !is_valid_cli_session_id("codex", id) {
+            continue;
+        }
+        let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(ts_ms) = payload
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339_ms)
+        else {
+            continue;
+        };
+        candidates.push((id.to_string(), normalize_comparable_path(cwd), ts_ms));
+    }
+    candidates
+}
+
+fn read_agy_session_candidates(agy_history_jsonl: &std::path::Path) -> Vec<(String, String, u64)> {
+    let Ok(file) = std::fs::File::open(agy_history_jsonl) else {
+        return Vec::new();
+    };
+    let mut earliest_by_id: HashMap<String, (String, u64)> = HashMap::new();
+    for line in BufReader::new(file.take(crate::journal::HARD_READ_LIMIT))
+        .lines()
+        .map_while(Result::ok)
+    {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(id) = value.get("conversationId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !is_valid_cli_session_id("agy", id) {
+            continue;
+        }
+        let Some(workspace) = value.get("workspace").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(ts_ms) = value.get("timestamp").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let norm_ws = normalize_comparable_path(workspace);
+        earliest_by_id
+            .entry(id.to_string())
+            .and_modify(|existing| {
+                if ts_ms < existing.1 {
+                    *existing = (norm_ws.clone(), ts_ms);
+                }
+            })
+            .or_insert((norm_ws, ts_ms));
+    }
+    earliest_by_id
+        .into_iter()
+        .map(|(id, (ws, ts))| (id, ws, ts))
+        .collect()
+}
+
+pub(crate) fn resolve_missing_cli_sessions(
+    records: &mut [SessionRecord],
+    skip_ids: &HashSet<String>,
+    stores: &CliSessionStores,
+) -> Vec<(String, String)> {
+    let claimed: HashSet<String> = records
+        .iter()
+        .filter_map(|record| record.cli_session_id.clone())
+        .collect();
+
+    let mut min_codex_start: Option<u64> = None;
+    let mut need_codex = false;
+    let mut need_agy = false;
+    for r in records.iter() {
+        if r.cli_session_id.is_some() {
+            continue;
+        }
+        if r.tool_id == "codex" {
+            need_codex = true;
+            let start_bound = r.started_at_ms.saturating_sub(15_000);
+            min_codex_start = Some(match min_codex_start {
+                Some(prev) => prev.min(start_bound),
+                None => start_bound,
+            });
+        } else if r.tool_id == "agy" {
+            need_agy = true;
+        }
+    }
+
+    let codex_candidates = if need_codex {
+        stores
+            .codex_sessions_dir
+            .as_deref()
+            .map(|dir| read_codex_session_candidates(dir, min_codex_start))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let agy_candidates = if need_agy {
+        stores
+            .agy_history_jsonl
+            .as_deref()
+            .map(read_agy_session_candidates)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut claude_cache: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+
+    // Include skipped/live records in ambiguity detection. Exiting one tab must
+    // never claim another tab's unbound CLI ID just because it is closer in time.
+    let mut candidates_by_record = vec![Vec::<String>::new(); records.len()];
+    let mut candidate_owners: HashMap<String, usize> = HashMap::new();
+    for idx in 0..records.len() {
+        if records[idx].cli_session_id.is_some() {
+            continue;
+        }
+        let start = records[idx].started_at_ms;
+        let window_start = start.saturating_sub(15_000);
+        let window_end = match records[idx].ended_at_ms {
+            Some(ended) => ended.saturating_add(5_000).max(start),
+            None => start.saturating_add(120_000),
+        };
+        let norm_proj = normalize_comparable_path(&records[idx].project_path);
+
+        let mut candidates: Vec<String> = match records[idx].tool_id.as_str() {
+            "claude" => {
+                if let Some(dir) = stores.claude_projects_dir.as_deref() {
+                    let entries = claude_cache
+                        .entry(records[idx].project_path.clone())
+                        .or_insert_with(|| {
+                            read_claude_session_candidates(dir, &records[idx].project_path)
+                        });
+                    entries
+                        .iter()
+                        .filter(|(id, ts)| {
+                            !claimed.contains(id) && *ts >= window_start && *ts <= window_end
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            "codex" => codex_candidates
+                .iter()
+                .filter(|(id, cwd, ts)| {
+                    !claimed.contains(id)
+                        && *cwd == norm_proj
+                        && *ts >= window_start
+                        && *ts <= window_end
+                })
+                .map(|(id, _, _)| id.clone())
+                .collect(),
+            "agy" => agy_candidates
+                .iter()
+                .filter(|(id, cwd, ts)| {
+                    !claimed.contains(id)
+                        && *cwd == norm_proj
+                        && *ts >= start.saturating_sub(5_000)
+                        && *ts <= window_end
+                })
+                .map(|(id, _, _)| id.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        candidates.sort();
+        candidates.dedup();
+        for id in &candidates {
+            *candidate_owners.entry(id.clone()).or_default() += 1;
+        }
+        candidates_by_record[idx] = candidates;
+    }
+
+    let mut newly_bound = Vec::new();
+    for (idx, candidates) in candidates_by_record.into_iter().enumerate() {
+        if skip_ids.contains(&records[idx].id) {
+            continue;
+        }
+        if let [cli_id] = candidates.as_slice()
+            && candidate_owners.get(cli_id) == Some(&1)
+        {
+            records[idx].cli_session_id = Some(cli_id.clone());
+            newly_bound.push((records[idx].id.clone(), cli_id.clone()));
+        }
+    }
+    newly_bound
+}
+
+fn resolve_single_session_on_exit(history: &SessionHistory, exit_id: &str) {
+    let Ok(mut records) = history.list() else {
+        return;
+    };
+    let Some(target) = records.iter().find(|item| item.id == exit_id) else {
+        return;
+    };
+    if target.cli_session_id.is_some() || !matches!(target.tool_id.as_str(), "codex" | "agy") {
+        return;
+    }
+    let skip_ids: HashSet<String> = records
+        .iter()
+        .filter(|item| item.id != exit_id)
+        .map(|item| item.id.clone())
+        .collect();
+    let stores = CliSessionStores::from_env();
+    for (id, cli_id) in resolve_missing_cli_sessions(&mut records, &skip_ids, &stores) {
+        if id == exit_id {
+            let _ = history.record_cli_session(&id, &cli_id);
+        }
     }
 }
 
@@ -920,6 +1332,7 @@ pub struct SessionManager {
     /// are served. Recording is best-effort: a history write failure must not
     /// orphan a running CLI, so callers keep the session and log the failure.
     history: Arc<Mutex<Option<SessionHistory>>>,
+    checked_history_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Default for SessionManager {
@@ -931,6 +1344,7 @@ impl Default for SessionManager {
             finished: Arc::new(Mutex::new(HashMap::new())),
             finished_acp: Arc::new(Mutex::new(HashMap::new())),
             history: Arc::new(Mutex::new(None)),
+            checked_history_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -978,26 +1392,53 @@ impl SessionManager {
     }
 
     fn record_end(&self, id: &str, reason: Option<String>, output_bytes: Option<u64>) {
-        let recorded = self
-            .history
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .map(|history| history.record_end(id, now_ms(), reason, output_bytes));
-        if let Some(Err(error)) = recorded {
+        let history = self.history.lock().ok().and_then(|guard| guard.clone());
+        let Some(history) = history else {
+            return;
+        };
+        if let Err(error) = history.record_end(id, now_ms(), reason, output_bytes) {
             eprintln!("AgentTerm could not persist session end for {id}: {error}");
         }
+        resolve_single_session_on_exit(&history, id);
     }
 
     pub fn list_history(&self) -> Result<Vec<SessionRecord>, String> {
-        let guard = self
-            .history
-            .lock()
-            .map_err(|_| "会话历史暂时不可用，请重试".to_string())?;
-        match guard.as_ref() {
-            Some(history) => history.list(),
-            None => Err("会话历史尚未配置".to_string()),
+        let history = {
+            let guard = self
+                .history
+                .lock()
+                .map_err(|_| "会话历史暂时不可用，请重试".to_string())?;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "会话历史尚未配置".to_string())?
+        };
+        let mut records = history.list()?;
+        let live_ids: HashSet<String> = self
+            .lock()?
+            .keys()
+            .chain(self.lock_acp()?.keys())
+            .cloned()
+            .collect();
+        let mut skip_ids = live_ids.clone();
+        if let Ok(checked) = self.checked_history_ids.lock() {
+            skip_ids.extend(checked.iter().cloned());
         }
+        let stores = CliSessionStores::from_env();
+        let resolved = resolve_missing_cli_sessions(&mut records, &skip_ids, &stores);
+        for (id, cli_id) in resolved {
+            if let Err(error) = history.record_cli_session(&id, &cli_id) {
+                eprintln!("AgentTerm could not bind resolved CLI session id for {id}: {error}");
+            }
+        }
+        if let Ok(mut checked) = self.checked_history_ids.lock() {
+            for record in &records {
+                if !live_ids.contains(&record.id) {
+                    checked.insert(record.id.clone());
+                }
+            }
+        }
+        Ok(records)
     }
 
     fn reserve_start(&self, id: &str) -> Result<SessionReservation, String> {
@@ -1016,6 +1457,21 @@ impl SessionManager {
             pending: Arc::clone(&self.starting),
             id: id.to_owned(),
         })
+    }
+
+    fn register_acp_session(
+        &self,
+        record: SessionRecord,
+        spawn: impl FnOnce() -> Result<crate::acp::AcpSessionHandle, String>,
+    ) -> Result<(), String> {
+        // Binding/exit callbacks take this same lock. Hold it before spawning
+        // until both Start and the live handle exist, including immediate exits.
+        let mut sessions = self.lock_acp()?;
+        let handle = spawn()?;
+        let id = record.id.clone();
+        self.record_start(record);
+        sessions.insert(id, handle);
+        Ok(())
     }
 
     fn start(
@@ -1089,6 +1545,18 @@ impl SessionManager {
             let schedule_guard_exit = schedule_guard;
             let reservation_exit = reservation;
 
+            self.register_acp_session(SessionRecord {
+                id: session_id.to_string(),
+                tool_id: tool.id.to_string(),
+                tool_name: tool.name.to_string(),
+                project_path: info.project_path.clone(),
+                title: normalized_title,
+                cli_session_id: cli_session_id.clone(),
+                started_at_ms: now_ms(),
+                ended_at_ms: None,
+                exit_reason: None,
+                output_bytes: None,
+            }, || {
             let handle = crate::acp::spawn_acp_session(
                 info.clone(),
                 &binary,
@@ -1150,19 +1618,8 @@ impl SessionManager {
                 },
             )?;
             handle.emit_snapshot(&app);
-            self.lock_acp()?.insert(session_id.to_string(), handle);
-            self.record_start(SessionRecord {
-                id: session_id.to_string(),
-                tool_id: tool.id.to_string(),
-                tool_name: tool.name.to_string(),
-                project_path: info.project_path.clone(),
-                title: normalized_title,
-                cli_session_id,
-                started_at_ms: now_ms(),
-                ended_at_ms: None,
-                exit_reason: None,
-                output_bytes: None,
-            });
+            Ok(handle)
+            })?;
             return Ok(info);
         }
 
@@ -1330,14 +1787,18 @@ impl SessionManager {
                     }
                     if let Ok(history_guard) = history_writer.lock()
                         && let Some(history) = history_guard.as_ref()
-                        && let Err(error) = history.record_end(
+                    {
+                        if let Err(error) = history.record_end(
                             &exit_id,
                             now_ms(),
                             Some(reason.clone()),
                             archived_bytes,
-                        )
-                    {
-                        eprintln!("AgentTerm could not persist session end for {exit_id}: {error}");
+                        ) {
+                            eprintln!(
+                                "AgentTerm could not persist session end for {exit_id}: {error}"
+                            );
+                        }
+                        resolve_single_session_on_exit(history, &exit_id);
                     }
                     break reason;
                 }
@@ -1440,14 +1901,30 @@ impl SessionManager {
         app: &AppHandle,
         session_id: &str,
         text: &str,
+        images: &[crate::acp::AcpImageInput],
     ) -> Result<(), String> {
         let guard = self.lock_acp()?;
         let session = guard
             .get(session_id)
             .ok_or_else(|| "ACP 会话不存在或已结束".to_string())?;
-        let result = session.send_prompt(text);
+        let result = session.send_prompt(text, images);
         session.emit_snapshot(app);
         result
+    }
+
+    pub fn acp_search_project_files(
+        &self,
+        session_id: &str,
+        query: &str,
+    ) -> Result<Vec<String>, String> {
+        let project_path = {
+            let guard = self.lock_acp()?;
+            let session = guard
+                .get(session_id)
+                .ok_or_else(|| "ACP 会话不存在或已结束".to_string())?;
+            session.project_path()
+        };
+        crate::acp::search_project_files_in_dir(&project_path, query)
     }
 
     pub fn acp_cancel_turn(&self, session_id: &str) -> Result<(), String> {
@@ -1470,6 +1947,22 @@ impl SessionManager {
             .get(session_id)
             .ok_or_else(|| "ACP 会话不存在或已结束".to_string())?;
         let result = session.respond_permission(request_id, option_id);
+        session.emit_snapshot(app);
+        result
+    }
+
+    pub fn acp_set_config_option(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        let guard = self.lock_acp()?;
+        let session = guard
+            .get(session_id)
+            .ok_or_else(|| "ACP 会话不存在或已结束".to_string())?;
+        let result = session.set_config_option(config_id, value);
         session.emit_snapshot(app);
         result
     }
@@ -2932,6 +3425,116 @@ mod tests {
     }
 
     #[test]
+    fn acp_registration_precedes_fast_binding_and_exit_callbacks() {
+        let manager = SessionManager::default();
+        manager
+            .configure_history(history_store("acp-registration"))
+            .unwrap();
+        let info = super::SessionInfo {
+            id: "acp-registration".into(),
+            tool_id: "dsh".into(),
+            tool_name: "DSH".into(),
+            project_path: history_project(),
+            title: None,
+            cli_session_id: None,
+        };
+        let record = super::SessionRecord {
+            id: info.id.clone(),
+            tool_id: info.tool_id.clone(),
+            tool_name: info.tool_name.clone(),
+            project_path: info.project_path.clone(),
+            title: None,
+            cli_session_id: None,
+            started_at_ms: super::now_ms(),
+            ended_at_ms: None,
+            exit_reason: None,
+            output_bytes: None,
+        };
+        let sessions_bind = std::sync::Arc::clone(&manager.acp_sessions);
+        let sessions_exit = std::sync::Arc::clone(&manager.acp_sessions);
+        let history_bind = std::sync::Arc::clone(&manager.history);
+        let history_exit = std::sync::Arc::clone(&manager.history);
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        manager
+            .register_acp_session(record, || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "acp::tests::acp_process_fixture",
+                        "--ignored",
+                        "--nocapture",
+                        "--quiet",
+                    ])
+                    .env("AGENTTERM_ACP_TEST_MODE", "handshake")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped());
+                let handle = crate::acp::spawn_acp_with_command(
+                    info,
+                    command,
+                    None,
+                    None,
+                    crate::acp::AcpHooks {
+                        on_emit: Box::new(|_| {}),
+                        on_cli_session: Box::new(move |cli_id| {
+                            attempt_tx.send(()).unwrap();
+                            let mut sessions = sessions_bind.lock().unwrap();
+                            let active = sessions
+                                .get_mut("acp-registration")
+                                .expect("live record must precede binding");
+                            active.info.cli_session_id = Some(cli_id.clone());
+                            drop(sessions);
+                            history_bind
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .unwrap()
+                                .record_cli_session("acp-registration", &cli_id)
+                                .unwrap();
+                        }),
+                        on_exit: Box::new(move |reason, _, bytes| {
+                            assert!(
+                                sessions_exit
+                                    .lock()
+                                    .unwrap()
+                                    .remove("acp-registration")
+                                    .is_some()
+                            );
+                            history_exit
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .unwrap()
+                                .record_end(
+                                    "acp-registration",
+                                    super::now_ms(),
+                                    Some(reason),
+                                    Some(bytes),
+                                )
+                                .unwrap();
+                            exit_tx.send(()).unwrap();
+                        }),
+                    },
+                )?;
+                // Force the callback to reach the registration lock before spawn
+                // returns. It must wait instead of losing the binding/Start event.
+                attempt_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok(handle)
+            })
+            .unwrap();
+        exit_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(!manager.is_running("acp-registration"));
+        let records = manager.list_history().unwrap();
+        assert_eq!(records[0].cli_session_id.as_deref(), Some("sess_fixture"));
+        assert!(records[0].ended_at_ms.is_some());
+    }
+
+    #[test]
     fn explicit_stop_records_history_end() {
         let manager = SessionManager::default();
         let path = history_store("stop");
@@ -3170,11 +3773,290 @@ mod tests {
         assert_eq!(codex_id, None);
         assert_eq!(codex_resume, vec!["resume", "--last", "-c", "foo=bar"]);
 
+        let (codex_exact_id, codex_exact_resume) = super::build_tool_launch_args(
+            "codex",
+            vec!["-c".into(), "foo=bar".into()],
+            Some("01a21ba5-7c2b-76c3-97c2-df4cdde2362f"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_exact_id.as_deref(),
+            Some("01a21ba5-7c2b-76c3-97c2-df4cdde2362f")
+        );
+        assert_eq!(
+            codex_exact_resume,
+            vec![
+                "resume",
+                "01a21ba5-7c2b-76c3-97c2-df4cdde2362f",
+                "-c",
+                "foo=bar"
+            ]
+        );
+
         let (agy_id, agy_resume) =
             super::build_tool_launch_args("agy", vec![], None, true).unwrap();
         assert_eq!(agy_id, None);
         assert_eq!(agy_resume, vec!["--continue"]);
 
+        let (agy_exact_id, agy_exact_resume) = super::build_tool_launch_args(
+            "agy",
+            vec![],
+            Some("a83b21f1-fe05-4b49-a65a-db1e6d29da59"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            agy_exact_id.as_deref(),
+            Some("a83b21f1-fe05-4b49-a65a-db1e6d29da59")
+        );
+        assert_eq!(
+            agy_exact_resume,
+            vec!["--resume", "a83b21f1-fe05-4b49-a65a-db1e6d29da59"]
+        );
+
         assert!(super::build_tool_launch_args("claude", vec![], Some("bad-id"), true).is_err());
+    }
+
+    #[test]
+    fn resolves_distinct_cli_session_ids_for_claude_codex_and_agy() {
+        let root = std::env::temp_dir().join(format!(
+            "agentterm-resolve-cli-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let (proj, plain_proj, claude_dir_name) = if cfg!(windows) {
+            (
+                r"\\?\E:\Demo".to_string(),
+                r"E:\Demo".to_string(),
+                "E--Demo",
+            )
+        } else {
+            ("/Demo".to_string(), "/Demo".to_string(), "-Demo")
+        };
+        let escaped_proj = plain_proj.replace('\\', "\\\\");
+        let claude_dir = root.join("claude-projects").join(claude_dir_name);
+        let codex_dir = root
+            .join("codex-sessions")
+            .join("2026")
+            .join("11")
+            .join("27");
+        let agy_history = root.join("agy-history.jsonl");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        let claude_u1 = "11111111-1111-4111-8111-111111111111";
+        let claude_u2 = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(
+            claude_dir.join(format!("{claude_u1}.jsonl")),
+            "{\"type\":\"user\",\"timestamp\":\"2026-11-27T01:00:02.000Z\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            claude_dir.join(format!("{claude_u2}.jsonl")),
+            "{\"type\":\"user\",\"timestamp\":\"2026-11-27T02:00:03.000Z\"}\n",
+        )
+        .unwrap();
+
+        let codex_u1 = "33333333-3333-4333-8333-333333333333";
+        std::fs::write(
+            codex_dir.join(format!("rollout-2026-11-27-{codex_u1}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-11-27T03:00:04.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{codex_u1}\",\"timestamp\":\"2026-11-27T03:00:04.000Z\",\"cwd\":\"{escaped_proj}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let codex_skip = "55555555-5555-4555-8555-555555555555";
+        std::fs::write(
+            codex_dir.join(format!("rollout-2026-11-27-{codex_skip}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-11-27T05:00:04.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{codex_skip}\",\"timestamp\":\"2026-11-27T05:00:04.000Z\",\"cwd\":\"{escaped_proj}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-11-27T00:00:00Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        let t1 = chrono::DateTime::parse_from_rfc3339("2026-11-27T01:00:00Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        let t2 = chrono::DateTime::parse_from_rfc3339("2026-11-27T02:00:00Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        let t3 = chrono::DateTime::parse_from_rfc3339("2026-11-27T03:00:00Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        let t4 = chrono::DateTime::parse_from_rfc3339("2026-11-27T04:00:00Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        let t5 = chrono::DateTime::parse_from_rfc3339("2026-11-27T05:00:00Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+
+        let agy_u1 = "44444444-4444-4444-8444-444444444444";
+        std::fs::write(
+            &agy_history,
+            format!(
+                concat!(
+                    "{{\"display\":\"later-turn\",\"timestamp\":{},\"workspace\":\"{}\",\"conversationId\":\"{}\"}}\n",
+                    "{{\"display\":\"hello\",\"timestamp\":{},\"workspace\":\"{}\",\"conversationId\":\"{}\"}}\n"
+                ),
+                t4 + 90_000,
+                escaped_proj,
+                agy_u1,
+                t4 + 2_000,
+                escaped_proj,
+                agy_u1,
+            ),
+        )
+        .unwrap();
+
+        let mut records = vec![
+            super::SessionRecord {
+                id: "s-codex-skip".into(),
+                tool_id: "codex".into(),
+                tool_name: "Codex".into(),
+                project_path: proj.clone(),
+                title: None,
+                cli_session_id: None,
+                started_at_ms: t5,
+                ended_at_ms: Some(t5 + 20_000),
+                exit_reason: Some("已停止".into()),
+                output_bytes: None,
+            },
+            super::SessionRecord {
+                id: "s-agy".into(),
+                tool_id: "agy".into(),
+                tool_name: "Agy".into(),
+                project_path: plain_proj.clone(),
+                title: None,
+                cli_session_id: None,
+                started_at_ms: t4,
+                ended_at_ms: Some(t4 + 20_000),
+                exit_reason: Some("已停止".into()),
+                output_bytes: None,
+            },
+            super::SessionRecord {
+                id: "s-codex".into(),
+                tool_id: "codex".into(),
+                tool_name: "Codex".into(),
+                project_path: proj.clone(),
+                title: None,
+                cli_session_id: None,
+                started_at_ms: t3,
+                ended_at_ms: Some(t3 + 20_000),
+                exit_reason: Some("已停止".into()),
+                output_bytes: None,
+            },
+            super::SessionRecord {
+                id: "s-claude-2".into(),
+                tool_id: "claude".into(),
+                tool_name: "Claude Code".into(),
+                project_path: proj.clone(),
+                title: None,
+                cli_session_id: None,
+                started_at_ms: t2,
+                ended_at_ms: Some(t2 + 20_000),
+                exit_reason: Some("已停止".into()),
+                output_bytes: None,
+            },
+            super::SessionRecord {
+                id: "s-claude-1".into(),
+                tool_id: "claude".into(),
+                tool_name: "Claude Code".into(),
+                project_path: proj.clone(),
+                title: None,
+                cli_session_id: None,
+                started_at_ms: t1,
+                ended_at_ms: Some(t1 + 20_000),
+                exit_reason: Some("已停止".into()),
+                output_bytes: None,
+            },
+            super::SessionRecord {
+                id: "s-claude-empty".into(),
+                tool_id: "claude".into(),
+                tool_name: "Claude Code".into(),
+                project_path: proj,
+                title: None,
+                cli_session_id: None,
+                started_at_ms: t0,
+                ended_at_ms: Some(t0 + 5_000),
+                exit_reason: Some("已停止".into()),
+                output_bytes: None,
+            },
+        ];
+
+        let stores = super::CliSessionStores {
+            claude_projects_dir: Some(root.join("claude-projects")),
+            codex_sessions_dir: Some(root.join("codex-sessions")),
+            agy_history_jsonl: Some(agy_history),
+        };
+        let mut skip_ids = std::collections::HashSet::new();
+        skip_ids.insert("s-codex-skip".to_string());
+        let unresolved = records.clone();
+        let bound = super::resolve_missing_cli_sessions(&mut records, &skip_ids, &stores);
+        assert!(bound.iter().any(|(id, cid)| id == "s-agy" && cid == agy_u1));
+        assert!(
+            bound
+                .iter()
+                .any(|(id, cid)| id == "s-codex" && cid == codex_u1)
+        );
+        assert!(
+            bound
+                .iter()
+                .any(|(id, cid)| id == "s-claude-1" && cid == claude_u1)
+        );
+        assert!(
+            bound
+                .iter()
+                .any(|(id, cid)| id == "s-claude-2" && cid == claude_u2)
+        );
+        assert!(!bound.iter().any(|(id, _)| id == "s-claude-empty"));
+        assert!(!bound.iter().any(|(id, _)| id == "s-codex-skip"));
+
+        // B exits while A is still live. Even a single candidate must not be
+        // assigned to B when A's unbound record can also own it.
+        let closed = unresolved
+            .iter()
+            .find(|r| r.id == "s-codex")
+            .unwrap()
+            .clone();
+        let mut live = closed.clone();
+        live.id = "s-codex-live".into();
+        live.started_at_ms = t3 - 5_000;
+        live.ended_at_ms = None;
+        let mut overlapping = vec![live, closed.clone()];
+        let skip_live = std::collections::HashSet::from(["s-codex-live".to_string()]);
+        assert!(
+            super::resolve_missing_cli_sessions(&mut overlapping, &skip_live, &stores).is_empty()
+        );
+        assert!(overlapping.iter().all(|r| r.cli_session_id.is_none()));
+        // Record ordering and the exit of both tabs must not resolve ambiguity.
+        overlapping.reverse();
+        overlapping[1].ended_at_ms = Some(t3 + 30_000);
+        assert!(
+            super::resolve_missing_cli_sessions(&mut overlapping, &Default::default(), &stores)
+                .is_empty()
+        );
+
+        // Two candidates in one window are also ambiguous, even if one is closer.
+        std::fs::write(
+            codex_dir.join("rollout-2026-11-27-other.jsonl"),
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"other-codex\",\"timestamp\":\"2026-11-27T03:00:01.000Z\",\"cwd\":\"{escaped_proj}\"}}}}\n"),
+        ).unwrap();
+        let mut multiple_candidates = vec![closed];
+        assert!(
+            super::resolve_missing_cli_sessions(
+                &mut multiple_candidates,
+                &Default::default(),
+                &stores
+            )
+            .is_empty()
+        );
+        assert!(multiple_candidates[0].cli_session_id.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

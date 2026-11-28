@@ -32,6 +32,21 @@ export function sessionTitle(session: SessionInfo): string {
   return `${folder} · ${session.toolName}`;
 }
 
+export function agentBadgeLabel(toolId: string, toolName?: string): string {
+  switch (toolId) {
+    case "claude":
+      return "Claude";
+    case "codex":
+      return "Codex";
+    case "agy":
+      return "Agy";
+    case "dsh":
+      return "DSH";
+    default:
+      return toolName?.trim() || toolId;
+  }
+}
+
 export function newSessionId(): string {
   const crypto = globalThis.crypto;
   if (typeof crypto?.randomUUID === "function") {
