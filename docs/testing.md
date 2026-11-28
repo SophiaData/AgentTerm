@@ -22,13 +22,15 @@ Rust fmt、差异检查及 `verify_project.py` 通过。临时去掉草稿版本
 前端各 23 文件 / 196 passed；Rust 后端 Windows 252、macOS 254、Linux 255 passed，
 各 4 ignored；TUI 分别 18、20、20 passed；模板契约各 15 项通过。
 新增停止、登记竞态、审批与历史关联回归均在三端通过。
-[修复草稿 PR #104](https://github.com/SophiaData/AgentTerm/pull/104) 基于 PR #103 分支；
-后续仅文档提交不改变上述应用代码，最终 head 的自动检查在 PR 页面核对。
+[修复 PR #104](https://github.com/SophiaData/AgentTerm/pull/104) 最终提交 `923fa98` 的
+[三端检查 46044460574](https://github.com/SophiaData/AgentTerm/actions/runs/46044460574) 也全部成功。
+用户随后明确授权合并；#104 已于 2026-11-28 合入 #103 分支，合并提交 `df5d8fe` 的文件
+与 `923fa98` 一致。最终进入 main 的提交与三端检查见 [PR #103](https://github.com/SophiaData/AgentTerm/pull/103)。
 
 主代理串行审查实际差异与对应证据通过；这不是独立评审或独立 cc PASS。新增 ignored 用例仅作为
 父测试调用的本地子进程入口。测试使用合成数据，不读取真实 CLI 对话。
 历史绑定仍依赖目录与时间候选，有歧义时保留未绑定；不声称能证明进程级来源。
-真实 CLI、桌面交互、打包与安装未验；本轮不合并、不发布。
+真实 CLI、桌面交互、打包与安装未验；合并授权不扩大为发布或安装授权。
 
 ## 2026-11-26 审查遗留项闭环
 
