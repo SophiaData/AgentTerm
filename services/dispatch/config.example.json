@@ -1,0 +1,23 @@
+{
+  "url": "http://127.0.0.1:47321",
+  "deviceId": "windows-desktop",
+  "stateDirectory": "E:/AgentTerm-dispatch/state",
+  "bridge": "E:/AgentTerm-dispatch/bin/agentterm-dispatch-bridge.exe",
+  "dsh": "C:/Users/YOUR_USER/AppData/Local/Programs/DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd",
+  "projects": {
+    "demo": {
+      "repository": "E:/AgentTerm-dispatch/demo",
+      "workspaceRoot": "E:/AgentTerm-dispatch/workspaces",
+      "git": "C:/Program Files/Git/cmd/git.exe",
+      "codex": "E:/YOUR_NATIVE_CODEX_PATH/codex.exe",
+      "model": "default",
+      "allowedPaths": ["src/", "test/"],
+      "checks": [
+        {
+          "program": "E:/nodejs/node.exe",
+          "args": ["--test", "--test-concurrency=1"]
+        }
+      ]
+    }
+  }
+}
