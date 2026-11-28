@@ -52,12 +52,20 @@ async function refresh() {
       const identity = document.createElement("small");
       identity.textContent = `项目 ${task.projectId} · 基线 ${task.baseCommit.slice(0, 8)} · 任务 ${task.id}`;
       card.append(title, status, plan, identity);
-      if (task.result) {
-        const result = document.createElement("pre");
-        result.textContent =
-          task.summary || JSON.stringify(task.result, null, 2);
-        card.append(result);
+      if (task.summary) {
+        const summaryTitle = document.createElement("h3");
+        summaryTitle.textContent = "DSH 汇总";
+        const summary = document.createElement("pre");
+        summary.textContent = task.summary;
+        card.append(summaryTitle, summary);
       }
+      const resultTitle = document.createElement("h3");
+      resultTitle.textContent = "原始执行结果";
+      const result = document.createElement("pre");
+      result.textContent = task.result
+        ? JSON.stringify(task.result, null, 2)
+        : "暂无执行结果。";
+      card.append(resultTitle, result);
       const action =
         task.state === "proposed"
           ? "approve"
