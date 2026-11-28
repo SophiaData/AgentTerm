@@ -122,11 +122,3 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 7
-
-      - name: Upload native dispatch companion for local acceptance
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: dispatch-windows-${{ github.event.pull_request.head.sha || github.sha }}
-          path: src-tauri/target/debug/agentterm-dispatch-bridge.exe
-          if-no-files-found: error
-          retention-days: 7
