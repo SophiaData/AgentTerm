@@ -15,11 +15,9 @@
     "check": "node scripts/check_project.mjs",
     "test": "vitest run --maxWorkers=1 --no-file-parallelism",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src services/dispatch --max-warnings=0",
-    "dispatch:test": "node --test --test-concurrency=1 services/dispatch/dispatch.test.mjs services/dispatch/agreements.test.mjs",
-    "dispatch": "node services/dispatch/cli.mjs",
-    "format": "prettier --write README.md CLAUDE.md CHANGELOG.md docs src services/dispatch scripts/*.mjs index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json",
-    "format:check": "prettier --check README.md CLAUDE.md CHANGELOG.md docs src services/dispatch scripts/*.mjs index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json"
+    "lint": "eslint src --max-warnings=0",
+    "format": "prettier --write README.md CLAUDE.md CHANGELOG.md docs src scripts/*.mjs index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json",
+    "format:check": "prettier --check README.md CLAUDE.md CHANGELOG.md docs src scripts/*.mjs index.html package.json vite.config.ts tsconfig.json eslint.config.js src-tauri/*.json"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.5",

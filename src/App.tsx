@@ -18,7 +18,6 @@ import {
   type ThemeId,
 } from "./theme";
 import TaskWorkbench from "./TaskWorkbench";
-import DshDispatchButton from "./DshDispatchButton";
 import ProjectFiles from "./files/ProjectFiles";
 import ScheduledTasks from "./schedule/ScheduledTasks";
 import { displayPath } from "./projects/displayPath";
@@ -963,7 +962,6 @@ export default function App() {
             >
               {recordsOpen ? "收起任务记录" : "任务记录"}
             </button>
-            <DshDispatchButton />
           </div>
         </header>
         {launcher.sessions.length ? (

@@ -30,10 +30,6 @@
       "argv": ["pnpm", "test"]
     },
     {
-      "category": "test",
-      "argv": ["pnpm", "dispatch:test"]
-    },
-    {
       "category": "lint",
       "argv": [
         "cargo",
@@ -59,17 +55,6 @@
     {
       "category": "test",
       "argv": ["cargo", "test", "--manifest-path", "src-tauri/Cargo.toml"]
-    },
-    {
-      "category": "build",
-      "argv": [
-        "cargo",
-        "build",
-        "--manifest-path",
-        "src-tauri/Cargo.toml",
-        "--bin",
-        "agentterm-dispatch-bridge"
-      ]
     },
     {
       "category": "build",

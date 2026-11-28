@@ -1,5 +1,58 @@
 # Testing policy
 
+## 2026-11-28 · 从 AgentTerm 撤下 DSH 协调功能
+
+本次仅撤下 #105/#106 的协调功能；应用与构建配置恢复到引入前的 `26bb5486` 基线，
+保留原有 CLI/DSH ACP 会话、任务记录、定时任务和进程管理。移除专属测试及 companion 构建后，
+质量门从 16 项回到原有 14 项，不减少保留功能的测试。
+
+- 备份：`backups/remove-dsh-coordination-20261128`；已逐文件核对摘要，撤下文件移入回收站。
+  协调设计稿另有 Git 分支 `codex/dsh-workflow-plan` 和本次备份，不再作为 AgentTerm 交付内容。
+- 旧协调服务 PID 51248 的路径/启动时间匹配原记录；接口只有已验收任务、无 worker，账本 idle。
+  服务已停止，运行数据库、任务结果及已安装桌面保留。没有用清库处理未知状态。
+- 本机 `pnpm exec vitest run src/App.test.tsx src/terminal/useLauncher.test.ts src/terminal/SessionWorkspace.test.tsx --maxWorkers=1 --no-file-parallelism`：3 文件、40/40 通过。
+  TypeScript、App ESLint、定向格式、configure_project 只读建议、verify_project（21 文件）及 diff 检查通过。
+- 7 个接入/构建文件逐字节等于引入前基线；21 个协调专用文件已移出。ACP、session、TaskWorkbench、账本和进程管理直接依赖未改。
+  本次为功能撤回，没有新行为实现或新增镜像测试。完整三端质量门和顺序只读复核以撤回 PR 最新提交结果为准。
+
+下方 DSH 协调、双确认和安装记录均是撤回前版本的历史证据，不代表当前源码仍提供协调功能。
+当前安装版 `e62b99a` 仍有旧入口，需另行构建和安装新包才会反映本次撤回。
+
+## 2026-11-28 · e62b99a Windows 安装与启动
+
+- 用户“能安装吗”授权后，核对旧实例身份、全部子进程仅为 WebView、共享账本 idle。
+  关闭窗口只隐藏到托盘；再次核对空闲后结束旧进程。旧程序及快捷方式已备份到 `backups/windows-install-20261128`，原程序目录保留。
+- 已校验的 NSIS 包使用 `/S /UPDATE /D=E:\AgentTerm\app-e62b99a` 安装，退出码 0；安装登记与程序版本均为 `0.2.0-rc.18`。
+  安装后程序 SHA-256 为 `ffb72e705a90696da178b968b910f73ec24800c73f90a86887ca3b05fa601437`。
+  与同构建 npm EXE 逐字节比较，仅偏移 10970024–10970026 的 Tauri 包类型标记由 `UNK` 变为 `NSS`；其余字节完全一致。
+- 安装器保留旧快捷方式目标，已备份后把桌面和开始菜单两处 AgentTerm 入口更新到新目录，并回读确认。
+  新实例 PID 41916、程序路径匹配，窗口可见且正常响应；Windows UI Automation 只定位 `DSH 协调` 按钮，确认可见且可用。
+- 安装证据：`E:/AgentTerm-packages/20261128-e62b99a/install-evidence.json`。
+  本次只验收安装、启动及入口呈现，没有启动真实代码任务、升级 DSH 服务数据库、发布或把原生对话全流程标为通过。
+
+## 2026-11-28 · e62b99a 本机验证与 Windows 测试包
+
+产物源码固定为 main `e62b99afd612d2102f0c2ad9bc05ce52fc31c9bf`，版本仍为 `0.2.0-rc.18`；
+目录名携带提交，不能与较早 rc.18 包混同。本段为后补验证记录，不改变应用构建提交。
+
+- 本机 `pnpm dispatch:test`：24/24 通过；面板和桌面入口两文件 Vitest：12/12 通过，单 worker、无文件并行。
+  版本一致性检查通过。完整三端16项检查使用已完成的 [main CI 46144133504](https://github.com/SophiaData/AgentTerm/actions/runs/46144133504)，本地未完整编译 Rust。
+- [Windows 构建 46145466765](https://github.com/SophiaData/AgentTerm/actions/runs/46145466765) desktop、TUI 全成功；
+  下载 NSIS 安装包、桌面 npm 包与 TUI。npm 内桌面程序提取后核对平台/版本、PE x64；NSIS 为正常 x86 引导程序。
+- 三份 GitHub 构建 ZIP 与平台提供的 SHA-256 一致，解压文件与验证后的 ZIP 字节一致。
+  配套原生组件来自同一提交的 Windows 质量门 artifact 15263088003（debug 构建），归档摘要也通过核对。
+- 独立 DSH 运行目录含服务源码、原生组件、配置示例、启动脚本与说明，无 npm 安装步骤、无账号凭据。
+  运行 ZIP 解压内容和五项交付文件 SHA-256 全匹配；TUI 本机 `--version` 返回 `agentterm 0.2.0-rc.18`。
+- 从配套运行目录导入服务/worker，实际下载的原生组件监督 Git、合成 Node 执行器和固定外部断言；
+  完成双确认→独立 clone→提交→验收→确认释放。任务 `e1e9f5dc-888a-4b20-b6d1-b5b3aed4bc46` 最终 accepted，
+  执行器启动一次，结果绑定约定版本，源仓库未改，真实主任务账本回到 idle/revision16。
+  此次执行器是合成 Node 夹具，不声称新增真实模型调用。旧任务记录保留，没有迁移既有数据库。
+- 本机旧 AgentTerm 实例仍运行，未结束用户会话、未覆盖安装、未启动新桌面或声称 GUI/安装验收通过。
+  原生闭环日志和证据在 `E:/AgentTerm-packages/20261128-e62b99a/native-smoke/evidence.json`；
+  交付目录 `E:/AgentTerm-packages/20261128-e62b99a/release` 含五项产物、SHA256SUMS.txt 和 release-manifest.json。
+
+本轮仅测试和打包，没有 GitHub Release、安装、远程部署或开机自启。交付清单与独立复核另存同一打包目录。
+
 ## 2026-11-28 · 第二阶段第一项：开工约定双确认
 
 基于已合并的 PR #105 / `924d475`，增加方案确认→Claude Code 三份约定→约定确认→派发。
